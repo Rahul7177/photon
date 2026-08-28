@@ -1301,6 +1301,17 @@ export class PhotonController {
     this.safePost({ type: "decision", payload: decision });
     this.pushPlan();
     this.updateStatusBar();
+    // Phase 0.1 harness exercise — keep legacy AgentEngine as active path; harness behind flag logs parity
+    if (vscode.workspace.getConfiguration("photon").get<boolean>("experimental.harness", false)) {
+      try {
+        const hs: any = (this.durableSessions as any).get?.(this.session.id) ?? this.durableSessions.create(this.session.id as any, { workspaceName: vscode.workspace.workspaceFolders?.[0]?.name });
+        const tid = randomUUID();
+        hs.append("turn/start", { turnId: tid, at: Date.now() } as any);
+        hs.append("user/message", { id: randomUUID(), content: text.slice(0,120), source: { kind: "user" }, createdAt: Date.now() } as any);
+        this.output.appendLine(`[harness] turn/start ${tid} model=${plan.model} ctx=${plan.numCtx} events=${hs.allEvents().length}`);
+        hs.append("turn/end", { turnId: tid, reason: "stop", at: Date.now() } as any);
+      } catch (e) { this.output.appendLine(`[harness] exercise failed: ${(e as Error).message}`); }
+    }
 
     // Pin the target session for this turn so a mid-stream session switch
     // can't cause late callbacks to land in the wrong conversation.
@@ -1817,5 +1828,14 @@ export class PhotonController {
       this.output.appendLine(`Active plan: ${JSON.stringify(this.plan, null, 2)}`);
     }
     this.output.show(true);
+  }
+
+  /** Public method for Chat Participant to send a prompt directly */
+  async sendPrompt(text: string, attachments?: Attachment[]): Promise<void> {
+    if (this.turnAbort && !this.turnAbort.signal.aborted) {
+      this.safePost({ type: "status", payload: { kind: "running", detail: "Queued — will run after current turn." } });
+      return;
+    }
+    await this.runPrompt(text, attachments);
   }
 }

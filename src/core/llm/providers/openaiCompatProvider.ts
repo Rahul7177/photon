@@ -311,7 +311,7 @@ function guessTier(id: string): "small" | "medium" | "large" {
 function guessCapabilities(id: string): string[] {
   const n = id.toLowerCase();
   const caps: string[] = [];
-  if (/vision|visual|vl|vision|4o|gpt-4|gemini|pixtral|llava|multimodal|image|gemma.*3|gemma.*4/.test(n)) caps.push("vision");
+  if (/vision|visual|vl|vision|4o|gpt-4|gemini|pixtral|llava|multimodal|image|gemma.*3/.test(n)) caps.push("vision");
   if (/audio|whisper|speech|voxtral|ultravox|audio/.test(n)) caps.push("audio");
   if (/video|veo/.test(n)) caps.push("video");
   if (/r1|o1|o3|thinking|reasoning|qwq|qwen3|deepseek-r|magistral|nemotron.*think/.test(n)) caps.push("thinking");

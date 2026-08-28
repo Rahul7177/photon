@@ -27,8 +27,7 @@ const VISION_HINTS = [
   "llama-vision",
   "qwen2-vl",
   "qwen2.5-vl",
-  "gemma3",
-  "gemma", // Gemma 3+ is multimodal (covers ggml-org/gemma-*)
+  "gemma3", // only Gemma 3+ is multimodal
   "granite3.2-vision",
   "pixtral",
   "vision",

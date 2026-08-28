@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 import { ChatViewProvider } from "./host/ChatViewProvider";
+import { PhotonController } from "./host/PhotonController";
+import { registerChatParticipant } from "./host/LmProvider";
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Photon");
@@ -11,6 +13,10 @@ export function activate(context: vscode.ExtensionContext): void {
       webviewOptions: { retainContextWhenHidden: true },
     })
   );
+
+  // Chat Participant: @photon in Copilot Chat panel
+  const participant = registerChatParticipant(context, provider.controller);
+  context.subscriptions.push(participant);
 
   context.subscriptions.push(
     vscode.commands.registerCommand("photon.openChat", () => {

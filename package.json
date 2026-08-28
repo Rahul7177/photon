@@ -110,13 +110,20 @@
         },
         "photon.defaultMode": {
           "type": "string",
-          "enum": ["chat", "plan", "agent"],
+          "enum": [
+            "chat",
+            "plan",
+            "agent"
+          ],
           "default": "chat",
           "description": "Default interaction mode."
         },
         "photon.interfaceMode": {
           "type": "string",
-          "enum": ["local", "cloud"],
+          "enum": [
+            "local",
+            "cloud"
+          ],
           "default": "local",
           "description": "Engine stack: local = Ollama models with adaptive tuning; cloud = direct provider APIs with native tool calling, no adaptive limits, and no local models."
         },
@@ -137,7 +144,13 @@
         },
         "photon.intelligence.level": {
           "type": "string",
-          "enum": ["auto", "max", "high", "medium", "low"],
+          "enum": [
+            "auto",
+            "max",
+            "high",
+            "medium",
+            "low"
+          ],
           "enumDescriptions": [
             "Auto — pick the level from the model + machine.",
             "Maximum — fully refined prompts, all tools, longest output. For capable models.",
@@ -150,7 +163,10 @@
         },
         "photon.webSearch.provider": {
           "type": "string",
-          "enum": ["duckduckgo", "none"],
+          "enum": [
+            "duckduckgo",
+            "none"
+          ],
           "default": "duckduckgo",
           "description": "Provider used by the web_search tool."
         },
@@ -199,6 +215,11 @@
           "default": false,
           "description": "Enable Blackbox AI cloud models. Set your API key in the Photon settings panel (stored securely in VS Code secrets)."
         },
+        "photon.experimental.harness": {
+          "type": "boolean",
+          "default": false,
+          "description": "Experimental: run turns through the harness AgentLoop + SessionRegistry (event-sourced) instead of the legacy AgentEngine. Keeps the same tools, plan, and webview. Restart required."
+        },
         "photon.providers.custom": {
           "type": "array",
           "default": [],
@@ -206,17 +227,37 @@
           "items": {
             "type": "object",
             "properties": {
-              "id": { "type": "string", "description": "Unique provider id (used as the model prefix, e.g. 'openrouter')." },
-              "label": { "type": "string", "description": "Display name in the UI." },
-              "baseUrl": { "type": "string", "description": "Base URL of the /chat/completions endpoint, e.g. 'https://openrouter.ai/api/v1'." },
-              "apiKey": { "type": "string", "description": "API key. Prefer leaving empty and entering it in the settings panel (stored in secrets)." },
+              "id": {
+                "type": "string",
+                "description": "Unique provider id (used as the model prefix, e.g. 'openrouter')."
+              },
+              "label": {
+                "type": "string",
+                "description": "Display name in the UI."
+              },
+              "baseUrl": {
+                "type": "string",
+                "description": "Base URL of the /chat/completions endpoint, e.g. 'https://openrouter.ai/api/v1'."
+              },
+              "apiKey": {
+                "type": "string",
+                "description": "API key. Prefer leaving empty and entering it in the settings panel (stored in secrets)."
+              },
               "models": {
                 "type": "array",
                 "description": "Model catalog. Each: { name, label?, contextLength?, toolTrained?, vision? }.",
-                "items": { "type": "object" }
+                "items": {
+                  "type": "object"
+                }
               },
-              "extraHeaders": { "type": "object", "description": "Extra HTTP headers to send." },
-              "keyInBody": { "type": "boolean", "description": "Send the API key in the request body instead of an Authorization header." }
+              "extraHeaders": {
+                "type": "object",
+                "description": "Extra HTTP headers to send."
+              },
+              "keyInBody": {
+                "type": "boolean",
+                "description": "Send the API key in the request body instead of an Authorization header."
+              }
             }
           }
         }
@@ -242,6 +283,7 @@
     "@vscode/vsce": "^3.9.2",
     "concurrently": "^9.0.0",
     "esbuild": "^0.24.0",
+    "tsx": "^4.23.12",
     "typescript": "^5.6.0",
     "vite": "^5.4.0"
   },
