@@ -1,0 +1,252 @@
+{
+  "name": "photon",
+  "displayName": "Photon",
+  "description": "Agentic coding with small local LLMs via Ollama or llama.cpp — tuned so low-end models actually cope.",
+  "version": "0.1.0",
+  "publisher": "photon",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Machine Learning",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "ollama",
+    "local llm",
+    "ai",
+    "chat",
+    "agent",
+    "copilot"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "photon",
+          "title": "Photon",
+          "icon": "media/photon-activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "photon": [
+        {
+          "id": "photon.chat",
+          "name": "Photon",
+          "type": "webview",
+          "icon": "media/photon-activity.svg",
+          "contextualTitle": "Photon"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "photon.openChat",
+        "title": "Photon: Open Chat",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "photon.newSession",
+        "title": "Photon: New Chat",
+        "icon": "$(add)"
+      },
+      {
+        "command": "photon.refreshModels",
+        "title": "Photon: Refresh Ollama Models",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "photon.runDiagnostics",
+        "title": "Photon: Run Machine + Model Diagnostics"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "photon.newSession",
+          "when": "view == photon.chat",
+          "group": "navigation@1"
+        },
+        {
+          "command": "photon.refreshModels",
+          "when": "view == photon.chat",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Photon",
+      "properties": {
+        "photon.ollama.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Base URL of the Ollama server."
+        },
+        "photon.ollama.requestTimeoutMs": {
+          "type": "number",
+          "default": 180000,
+          "description": "Idle timeout (ms): how long to wait between streamed tokens before giving up. Not a cap on total generation time — slow models can run as long as they keep producing output."
+        },
+        "photon.llamacpp.baseUrl": {
+          "type": "string",
+          "default": "http://localhost:8080",
+          "description": "Base URL of the llama.cpp server (without /v1). llama.cpp exposes an OpenAI-compatible API at <baseUrl>/v1/chat/completions."
+        },
+        "photon.providers.llamacpp.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable llama.cpp local models (OpenAI-compatible at photon.llamacpp.baseUrl). No API key required."
+        },
+        "photon.defaultModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model selected by default. Empty = first available model."
+        },
+        "photon.defaultMode": {
+          "type": "string",
+          "enum": ["chat", "plan", "agent"],
+          "default": "chat",
+          "description": "Default interaction mode."
+        },
+        "photon.interfaceMode": {
+          "type": "string",
+          "enum": ["local", "cloud"],
+          "default": "local",
+          "description": "Engine stack: local = Ollama models with adaptive tuning; cloud = direct provider APIs with native tool calling, no adaptive limits, and no local models."
+        },
+        "photon.context.reserveOutputTokens": {
+          "type": "number",
+          "default": 1024,
+          "description": "Tokens reserved for the model's reply when budgeting the context window."
+        },
+        "photon.tools.autoApprove": {
+          "type": "boolean",
+          "default": false,
+          "description": "Auto-approve tool actions (file edits, terminal). When false, Photon asks before side effects."
+        },
+        "photon.adaptive.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Let Photon auto-tune settings, prompt shape, and tool protocol to the machine + model."
+        },
+        "photon.intelligence.level": {
+          "type": "string",
+          "enum": ["auto", "max", "high", "medium", "low"],
+          "enumDescriptions": [
+            "Auto — pick the level from the model + machine.",
+            "Maximum — fully refined prompts, all tools, longest output. For capable models.",
+            "High — elaborated prompts and multi-file workflow guidance.",
+            "Medium — standard prompts and instructions.",
+            "Low — compact prompts and few tools for weak models / tight context."
+          ],
+          "default": "auto",
+          "description": "How much prompt/tool machinery Photon gives the model. Higher = smarter but heavier on context."
+        },
+        "photon.webSearch.provider": {
+          "type": "string",
+          "enum": ["duckduckgo", "none"],
+          "default": "duckduckgo",
+          "description": "Provider used by the web_search tool."
+        },
+        "photon.index.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Index the workspace locally (offline, via a local Ollama embedding model) so Photon can retrieve relevant code for a request. Requires the embedding model below to be pulled."
+        },
+        "photon.index.embeddingModel": {
+          "type": "string",
+          "default": "nomic-embed-text",
+          "description": "Local Ollama model used to embed workspace code for indexing. Pull it with: ollama pull nomic-embed-text"
+        },
+        "photon.providers.gemini.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable Google Gemini cloud models. Set your API key in the Photon settings panel (stored securely in VS Code secrets)."
+        },
+        "photon.providers.claude.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable Anthropic Claude cloud models. Set your API key in the Photon settings panel (stored securely in VS Code secrets)."
+        },
+        "photon.providers.nvidia.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable NVIDIA NIM cloud models. Set your API key in the Photon settings panel (stored securely in VS Code secrets)."
+        },
+        "photon.providers.openai.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable OpenAI cloud models (GPT-4o, o-series). Set your API key in the Photon settings panel (stored securely in VS Code secrets)."
+        },
+        "photon.providers.openrouter.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable OpenRouter cloud models. Set your API key in the Photon settings panel (stored securely in VS Code secrets)."
+        },
+        "photon.providers.opencode.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable OpenCode Zen cloud models. Set your API key in the Photon settings panel (stored securely in VS Code secrets)."
+        },
+        "photon.providers.blackbox.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable Blackbox AI cloud models. Set your API key in the Photon settings panel (stored securely in VS Code secrets)."
+        },
+        "photon.providers.custom": {
+          "type": "array",
+          "default": [],
+          "description": "Custom OpenAI-compatible endpoints (OpenRouter, Groq, OpenAI, etc.). Each entry: { id, label, baseUrl, apiKey?, models?, extraHeaders?, keyInBody? }.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "type": "string", "description": "Unique provider id (used as the model prefix, e.g. 'openrouter')." },
+              "label": { "type": "string", "description": "Display name in the UI." },
+              "baseUrl": { "type": "string", "description": "Base URL of the /chat/completions endpoint, e.g. 'https://openrouter.ai/api/v1'." },
+              "apiKey": { "type": "string", "description": "API key. Prefer leaving empty and entering it in the settings panel (stored in secrets)." },
+              "models": {
+                "type": "array",
+                "description": "Model catalog. Each: { name, label?, contextLength?, toolTrained?, vision? }.",
+                "items": { "type": "object" }
+              },
+              "extraHeaders": { "type": "object", "description": "Extra HTTP headers to send." },
+              "keyInBody": { "type": "boolean", "description": "Send the API key in the request body instead of an Authorization header." }
+            }
+          }
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "npm run build:webview && npm run build:ext",
+    "build:ext": "node esbuild.mjs --production",
+    "build:webview": "vite build",
+    "watch": "node esbuild.mjs --watch",
+    "watch:webview": "vite build --watch",
+    "dev": "concurrently -k -n ext,web \"npm:watch\" \"npm:watch:webview\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p webview-ui/tsconfig.json",
+    "package": "npm run build && vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "@types/vscode": "^1.90.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "@vscode/vsce": "^3.9.2",
+    "concurrently": "^9.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0",
+    "vite": "^5.4.0"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

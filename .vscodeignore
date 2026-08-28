@@ -1,0 +1,16 @@
+.vscode/**
+webview-ui/**
+src/**
+node_modules/**
+esbuild.mjs
+vite.config.ts
+tsconfig*.json
+**/*.map
+**/*.ts
+Usecase.md
+deepseek-harness/**
+docs/**
+photon-*.md
+product_info.md
+!dist/**
+!media/**
