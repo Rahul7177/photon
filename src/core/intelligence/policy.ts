@@ -1,4 +1,16 @@
-import type { AdaptivePlan, BenchResult, ComplexityAssessment, ModelCapabilityProfile, ModelInfo, TaskAnalysis, ToolCall, ToolSpec, VerificationKind, VerificationPlan } from "../../shared/types";
+import type { AdaptivePlan, BenchResult, ComplexityAssessment, ModelCapabilityProfile, ModelInfo, ModelTier, TaskAnalysis, ToolCall, ToolSpec, VerificationKind, VerificationPlan } from "../../shared/types";
+
+const LOCAL_CORE_TOOLS = [
+  "list_dir",
+  "find_files",
+  "search_code",
+  "read_file",
+  "edit_file",
+  "write_file",
+  "get_diagnostics",
+  "run_command",
+] as const;
+const LOCAL_EXTENDED_TOOLS = ["code_outline", "move_path", "todo_write", "think", "web_search", "web_fetch"] as const;
 
 export function analyzeTask(prompt:string,mode:"chat"|"plan"|"agent",attachmentCount=0):TaskAnalysis{
   const text=(prompt??"").toLowerCase();
@@ -53,10 +65,42 @@ function taskPassRate(bench:BenchResult,id:string,fallback:number){const t=bench
 function clampProfile(p:ModelCapabilityProfile):ModelCapabilityProfile{const out={...p};for(const k of Object.keys(out) as (keyof ModelCapabilityProfile)[])out[k]=Math.max(0,Math.min(1,Number(out[k])));return out;}
 
 export function rankTools(specs:ToolSpec[],task:TaskAnalysis,phase:"orient"|"edit"|"verify"|"final",previousFailures=new Map<string,number>()):ToolSpec[]{const verification=new Set(task.verification);return[...specs].sort((a,b)=>scoreTool(b,task,phase,verification,previousFailures)-scoreTool(a,task,phase,verification,previousFailures));}
-function scoreTool(tool:ToolSpec,task:TaskAnalysis,phase:string,verification:Set<VerificationKind>,failures:Map<string,number>):number{let score=100-tool.priority;const tags=new Set(tool.tags??[]);const risk=tool.risk??(tool.sideEffecting?"workspace_write":"read");if(phase==="orient"&&(tags.has("read")||tags.has("search")||tags.has("navigate")||tags.has("web")))score+=35;if(phase==="edit"&&(tags.has("write")||risk==="workspace_write"))score+=40;if(phase==="verify"&&(tags.has("verify")||tool.name==="run_command"))score+=45;if(task.risk==="destructive"&&(risk==="destructive"||risk==="execute"))score-=30;if(task.verification.length&&(tool.verifyAfter??[]).some(v=>verification.has(v)))score+=15;if((failures.get(tool.name)??0)>=2)score+=5;return score;}
+function scoreTool(tool:ToolSpec,task:TaskAnalysis,phase:string,verification:Set<VerificationKind>,failures:Map<string,number>):number{let score=100-tool.priority;const tags=new Set(tool.tags??[]);const risk=tool.risk??(tool.sideEffecting?"workspace_write":"read");if(phase==="orient"&&(tags.has("read")||tags.has("search")||tags.has("navigate")||tags.has("web")))score+=35;if(phase==="edit"&&(tags.has("write")||risk==="workspace_write"))score+=40;if(phase==="verify"&&(tags.has("verify")||tool.name==="run_command"||tool.name==="get_diagnostics"))score+=45;if(task.risk==="destructive"&&(risk==="destructive"||risk==="execute"))score-=30;if(task.verification.length&&(tool.verifyAfter??[]).some(v=>verification.has(v)))score+=15;if((failures.get(tool.name)??0)>=2)score+=5;return score;}
+
+/** Select the tools the model should actually see. Intelligence controls the
+ * amount of scaffolding and the size of the working set, never workspace access.
+ * Low-end local models get a stable core toolbox first so ranking cannot hide
+ * editing/writing/verification behind discovery helpers. */
+export function selectToolSpecs(specs:ToolSpec[],plan:AdaptivePlan,phase:"orient"|"edit"|"verify"|"final"):ToolSpec[]{
+  let usable=plan.mode==="plan"?specs.filter(s=>!s.sideEffecting):[...specs];
+  if(plan.mode==="chat")return usable.filter(s=>s.name==="web_search"||s.name==="web_fetch").slice(0,Math.max(1,plan.maxTools));
+  const byName=new Map(usable.map(s=>[s.name,s]));
+  const core=LOCAL_CORE_TOOLS.map(n=>byName.get(n)).filter((s):s is ToolSpec=>!!s);
+  const extended=LOCAL_EXTENDED_TOOLS.map(n=>byName.get(n)).filter((s):s is ToolSpec=>!!s);
+  const ranked=rankTools(usable,plan.task??analyzeTask("",plan.mode),phase);
+  const ordered:ToolSpec[]=[];const push=(s:ToolSpec)=>{if(!ordered.some(x=>x.name===s.name))ordered.push(s);};
+  for(const s of core)push(s);
+  const levelRank:Record<string,number>={low:0,medium:1,high:2,max:3};
+  const extraCount=levelRank[plan.intelligence]??0;
+  if(extraCount>=1)for(const s of extended)push(s);
+  for(const s of ranked)push(s);
+  return ordered.slice(0,Math.max(1,plan.maxTools));
+}
+
+/** Native JSON tool calling is an optimization, not the local fallback path.
+ * A local model must demonstrate both tool-call and schema reliability before
+ * Photon trusts its provider-native tool interface. Without a benchmark result,
+ * local models stay on the tolerant Photon block protocol. */
+export function shouldUseNativeToolProtocol(model:ModelInfo,capabilities:ModelCapabilityProfile,bench:BenchResult|undefined,intelligence:import("../../shared/types").IntelligenceLevel):boolean{
+  const isLocal=!model.provider||model.provider==="ollama"||model.provider==="llamacpp";
+  if(!isLocal)return true;
+  if(intelligence==="low")return false;
+  return!!bench&&bench.toolCallReliability>=.80&&capabilities.schemaAdherence>=.82&&capabilities.toolCalling>=.82;
+}
+
 export function executionFingerprint(call:ToolCall,mutationEpoch:number):string{return`${call.name}|${JSON.stringify(stableNormalize(call.args))}|epoch:${mutationEpoch}`;}
 function stableNormalize(value:unknown):unknown{if(Array.isArray(value))return value.map(stableNormalize);if(value&&typeof value==="object")return Object.fromEntries(Object.entries(value as Record<string,unknown>).sort(([a],[b])=>a.localeCompare(b)).map(([k,v])=>[k,stableNormalize(v)]));return value;}
 export function canRunInParallel(a:ToolSpec,b:ToolSpec):boolean{const ar=a.risk??(a.sideEffecting?"workspace_write":"read");const br=b.risk??(b.sideEffecting?"workspace_write":"read");return(a.concurrency??"serial")==="safe_parallel"&&(b.concurrency??"serial")==="safe_parallel"&&ar==="read"&&br==="read";}
-export function buildExecutionPolicy(task:TaskAnalysis,capability:ModelCapabilityProfile,maxSteps:number,maxTools:number):AdaptivePlan["executionPolicy"]{const concurrency=capability.toolCalling>=.78&&capability.recovery>=.60?4:capability.toolCalling>=.60?2:1;const reasoningBudget=task.reasoning==="high"?Math.round(3072+Math.max(0,capability.reasoning-.7)*3400):task.reasoning==="medium"?Math.round(768+Math.max(0,capability.reasoning-.65)*1200):0;const visibleBudget=task.reasoning==="high"?4096:task.reasoning==="medium"?2048:1024;const generationBudgetTokens=Math.max(512,Math.min(8192,visibleBudget+reasoningBudget));return{maxConcurrent:task.risk==="destructive"?1:Math.min(concurrency,4),allowParallelReads:task.risk!=="destructive",serializeMutations:true,generationBudgetTokens,stepBudget:Math.max(8,Math.min(200,Math.max(maxSteps,task.estimatedSteps*3,maxTools*2)))}}
+export function buildExecutionPolicy(task:TaskAnalysis,capability:ModelCapabilityProfile,maxSteps:number,maxTools:number):AdaptivePlan["executionPolicy"]{const concurrency=capability.toolCalling>=.78&&capability.recovery>=.60?4:capability.toolCalling>=.60?2:1;const reasoningBudget=task.reasoning==="high"?Math.round(3072+Math.max(0,capability.reasoning-.7)*3400):task.reasoning==="medium"?Math.round(768+Math.max(0,capability.reasoning-.65)*1200):0;const visibleBudget=task.reasoning==="high"?4096:task.reasoning==="medium"?2048:1536;const generationBudgetTokens=Math.max(512,Math.min(8192,visibleBudget+reasoningBudget));return{maxConcurrent:task.risk==="destructive"?1:Math.min(concurrency,4),allowParallelReads:task.risk!=="destructive",serializeMutations:true,generationBudgetTokens,stepBudget:Math.max(8,Math.min(200,Math.max(maxSteps,task.estimatedSteps*3,maxTools*2)))}}
 export function buildVerificationPlan(task:TaskAnalysis):VerificationPlan{return{required:[...new Set(task.verification)],completed:[],evidence:[]};}
 export function recoveryDirective(result:{status?:string;recovery?:{action?:string;hints?:string[]};output:string}):string|undefined{const action=result.recovery?.action;if(!action)return undefined;const prefix:Record<string,string>={reread:"Re-read the affected file before retrying the operation.",search:"Search for the correct path, symbol, or current text before retrying.",repair:"Re-check the tool schema and correct the arguments before retrying.",verify:"Run the relevant verification step before making another change.",retry:"Retry once after inspecting the reported error.",ask_user:"Ask the user for the missing information or approval."};return`${prefix[action]??"Diagnose the tool failure before continuing."}${result.recovery?.hints?.length?` Hints: ${result.recovery.hints.join("; ")}`:""}\nTool output: ${result.output}`;}
