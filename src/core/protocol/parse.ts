@@ -49,8 +49,8 @@ function collectPipeUnclosed(text:string,findSpec:(name:string)=>ToolSpec|undefi
   const inner=m[1].trim();const rough=parseBody(inner);const rawCall=(rough.call as string)||(rough.name as string)||(rough.tool as string);
   const cand=rawCall?rawCall.replace(/^call:/i,"").trim():"";
   if(cand&&known(cand)){
-    const body=parseBody(inner,findSpec(cand));const args={...body};delete(args.call);delete(args.name);delete(args.tool);
-    claim({name:cand,args,start:m.index,end:text.length,explicit:true});return;
+    const body=parseBody(inner,findSpec(cand));delete(body.call);delete(body.name);delete(body.tool);
+    claim({name:cand,args:body,start:m.index,end:text.length,explicit:true});return;
   }
   const found=inner.match(/\b(?:list_dir|list_files|read_file|write_file|write_to_file|edit_file|replace_in_file|find_files|find_file|search_code|search_files|get_diagnostics|code_outline|run_command|execute_command|move_path|todo_write|todo|think|web_search|web_fetch)\b/i);
   if(found&&known(found[0]))claim({name:found[0],args:parseBody(inner,findSpec(found[0])),start:m.index,end:text.length,explicit:true});
@@ -100,7 +100,7 @@ function jsonToCall(obj:unknown):{name:string;args:Record<string,unknown>}|null{
 function safeJson(s:string):unknown{try{return JSON.parse(s.trim());}catch{return null;}}
 const MAX_BRACE_ATTEMPTS=200;
 function scanBalancedJson(text:string,onObject:(obj:unknown,start:number,end:number)=>void):void{let i=0,scanned=0,attempts=0;while(i<text.length&&scanned<50&&attempts<MAX_BRACE_ATTEMPTS){if(text[i]==="{"){attempts++;const end=matchBrace(text,i);if(end!==-1){const obj=safeJson(text.slice(i,end+1));if(obj)onObject(obj,i,end+1);scanned++;i=end+1;continue;}}i++;}}
-function matchBrace(text:string,start:number):number{let depth=0,inStr=false,esc=false;for(let i=start;i<text.length;i++){const c=text[i];if(inStr){if(esc)esc=false;else if(c==="\\")esc=false;else if(c==='"')inStr=false;else if(c==="\\")esc=true;}else if(c==='"')inStr=true;else if(c==="{")depth++;else if(c=== "}"){depth--;if(depth===0)return i;}}return-1;}
+function matchBrace(text:string,start:number):number{let depth=0,inStr=false,esc=false;for(let i=start;i<text.length;i++){const c=text[i];if(inStr){if(esc)esc=false;else if(c==="\\")esc=true;else if(c==='"')inStr=false;}else if(c==='"')inStr=true;else if(c==="{")depth++;else if(c=== "}"){depth--;if(depth===0)return i;}}return-1;}
 
 function parseBody(body:string,spec?:ToolSpec):Record<string,string>{
   const args:Record<string,string>={};const lines=body.replace(/\r\n/g,"\n").split("\n");
@@ -109,10 +109,8 @@ function parseBody(body:string,spec?:ToolSpec):Record<string,string>{
   while(i<lines.length){
     const segments=splitAssignments(lines[i],expected);
     if(!segments.length){i++;continue;}
-    for(let s=0;s<segments.length;s++){
-      const {key,value}=segments[s];let val=value.trim();
-      const isMulti=MULTILINE_KEYS.test(key);
-      const marker=/^\|[-+]?$/.test(val);
+    for(const {key,value} of segments){
+      let val=value.trim();const isMulti=MULTILINE_KEYS.test(key);const marker=/^\|[-+]?$/.test(val);
       if((marker||val==="")&&isMulti){
         let j=i+1;while(j<lines.length&&lines[j].trim()==="")j++;
         const fence=lines[j]?.match(/^\s*(```+|~~~+)(.*)$/);
@@ -121,7 +119,7 @@ function parseBody(body:string,spec?:ToolSpec):Record<string,string>{
         while(j<lines.length){if(/^\s*\[\/TOOL\]/i.test(lines[j]))break;const next=splitAssignments(lines[j],expected);if(next.length&&next[0].key.toLowerCase()!==key.toLowerCase())break;collected.push(lines[j]);j++;}
         val=collected.join("\n").replace(/^\n+|\n+$/g,"");i=j-1;args[key]=val;continue;
       }
-      if(val.startsWith("```")&&isMulti){let j=i;const opening=val.match(/^(```+|~~~+)(.*)$/);if(opening){const mark=opening[1];const first=opening[2].trimStart();const collected:string[]=[];if(first)collected.push(first);j=i+1;while(j<lines.length&&!lines[j].trimStart().startsWith(mark)){collected.push(lines[j]);j++;}val=collected.join("\n");i=j-1;args[key]=val;continue;}}
+      if(val.startsWith("```")&&isMulti){const opening=val.match(/^(```+|~~~+)(.*)$/);if(opening){const mark=opening[1];const first=opening[2].trimStart();const collected:string[]=[];if(first)collected.push(first);let j=i+1;while(j<lines.length&&!lines[j].trimStart().startsWith(mark)){collected.push(lines[j]);j++;}val=collected.join("\n");i=j-1;args[key]=val;continue;}}
       args[key]=stripQuotes(val);
     }
     i++;
@@ -132,7 +130,7 @@ function parseBody(body:string,spec?:ToolSpec):Record<string,string>{
 function splitAssignments(line:string,expected:Set<string>):{key:string;value:string}[]{
   const out:{key:string;value:string}[]=[];const re=/(?:^|\s)([a-zA-Z0-9_-]+)\s*[:=]\s*/g;const matches=[...line.matchAll(re)].filter(m=>!expected.size||expected.has(m[1].toLowerCase()));
   if(!matches.length)return[];
-  for(let i=0;i<matches.length;i++){const m=matches[i];const start=(m.index??0)+(m[0].startsWith(" ")?1:0);const valueStart=(m.index??0)+m[0].length;const end=i+1<matches.length?(matches[i+1].index??line.length):line.length;out.push({key:m[1],value:line.slice(valueStart,end).trim()});void start;}
+  for(let i=0;i<matches.length;i++){const m=matches[i];const valueStart=(m.index??0)+m[0].length;const end=i+1<matches.length?(matches[i+1].index??line.length):line.length;out.push({key:m[1],value:line.slice(valueStart,end).trim()});}
   return out;
 }
 function stripQuotes(v:string):string{return v.length>=2&&((v.startsWith('"')&&v.endsWith('"'))||(v.startsWith("'")&&v.endsWith("'")))?v.slice(1,-1):v;}
