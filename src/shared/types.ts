@@ -10,6 +10,8 @@ export interface GenerationStats{tps:number;totalTokens:number;elapsedMs:number;
 export interface LlamaCppSettings{ctx?:number;ngl?:number|"all";fit?:boolean;np?:number;fa?:boolean;ctk?:string;ctv?:string;extraArgs?:string;}
 export interface PerModelConfig{numCtx?:number;llamacpp?:LlamaCppSettings;sampling?:{temp?:number;topP?:number;seed?:number};note?:string;}
 export type ModelTier="tiny"|"small"|"medium"|"large";export type IntelligenceLevel="low"|"medium"|"high"|"max";export type IntelligenceSetting="auto"|IntelligenceLevel;
+/** User-facing reasoning control. Auto leaves the model/provider's default policy in place. */
+export type ThinkingLevel="off"|"low"|"medium"|"high"|"xtrahigh";export type ThinkingSetting="auto"|ThinkingLevel;
 export interface MachineProfile{totalRamBytes:number;freeRamBytes:number;cpuCores:number;cpuModel:string;platform:string;arch:string;gpu?:{name:string;vramBytes?:number;vendor?:string};tier:"low"|"mid"|"high";}
 export type ToolRisk="read"|"workspace_write"|"execute"|"network"|"destructive";export type ToolConcurrency="safe_parallel"|"serial";export type ToolIdempotency="idempotent"|"stateful"|"non_idempotent";export type VerificationKind="diagnostics"|"tests"|"build"|"lint"|"runtime";
 export interface JsonSchema{type?:"object"|"array"|"string"|"number"|"integer"|"boolean"|"null";description?:string;enum?:unknown[];const?:unknown;default?:unknown;properties?:Record<string,JsonSchema>;required?:string[];additionalProperties?:boolean|JsonSchema;items?:JsonSchema;anyOf?:JsonSchema[];oneOf?:JsonSchema[];nullable?:boolean;}
