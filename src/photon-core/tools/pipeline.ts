@@ -1,6 +1,6 @@
 import type { Tool, ToolContext, ToolResult } from "../../core/tools/types";
 import type { AdaptivePlan, ToolCall, ToolSpec } from "../../shared/types";
-import { canRunInParallel, rankTools, recoveryDirective, selectToolSpecs } from "../../core/intelligence/policy";
+import { canRunInParallel, recoveryDirective, selectToolSpecs } from "../../core/intelligence/policy";
 
 export type ToolPreExecuteEvent={call:ToolCall;tool:Tool;cancel?:(reason:string)=>void};
 export type ToolPostExecuteEvent={call:ToolCall;result:ToolResult};
@@ -18,7 +18,6 @@ export class ToolPipeline{
   onPostExecute(fn:(e:ToolPostExecuteEvent)=>void):()=>void{this.postListeners.add(fn);return()=>this.postListeners.delete(fn);}
 
   specsForPlan(plan:AdaptivePlan):ToolSpec[]{
-    const task=plan.task??{scope:"single_file",reasoning:"medium",risk:"low",verification:[],ambiguity:"low",estimatedSteps:1};
     const phase=plan.mode==="plan"?"orient":plan.mode==="chat"?"final":"orient";
     return selectToolSpecs(this.specs(),plan,phase);
   }
@@ -32,32 +31,18 @@ export class ToolPipeline{
     if(cancelled)return{ok:false,status:"permission_denied",retryable:false,output:cancelled};
     let result:ToolResult;
     try{result=await tool.execute(call.args,ctx);}catch(e){result={ok:false,status:"execution_error",retryable:true,recovery:{action:"retry"},output:(e as Error).message};}
-    if(!result.ok&&!result.recovery){ result.recovery={action:result.retryable?"retry":"ask_user"}; }
+    if(!result.ok&&!result.recovery){result.recovery={action:result.retryable?"retry":"ask_user"};}
     for(const fn of this.postListeners)fn({call,result});
     return result;
   }
 
   async executeMany(calls:ToolCall[],ctx:ToolContext,maxConcurrent=4):Promise<Map<string,ToolResult>>{
-    const results=new Map<string,ToolResult>();
-    const pending=[...calls];
-    while(pending.length){
-      const wave:ToolCall[]=[];
-      const first=pending.shift()!; wave.push(first);
-      const firstSpec=this.tools.get(first.name)?.spec;
-      if(firstSpec){
-        for(let i=0;i<pending.length&&wave.length<maxConcurrent;){
-          const candidate=pending[i]; const spec=this.tools.get(candidate.name)?.spec;
-          if(spec&&canRunInParallel(firstSpec,spec)&&wave.every(c=>{const s=this.tools.get(c.name)?.spec;return!!s&&canRunInParallel(s,spec);})){
-            wave.push(candidate);pending.splice(i,1);
-          }else i++;
-        }
-      }
-      const waveResults=await Promise.all(wave.map(c=>this.execute(c,ctx)));
-      wave.forEach((c,i)=>results.set(c.id,waveResults[i]));
-      if(wave.length>1&&waveResults.some(r=>!r.ok))break;
+    const results=new Map<string,ToolResult>();const pending=[...calls];
+    while(pending.length){const wave:ToolCall[]=[];const first=pending.shift()!;wave.push(first);const firstSpec=this.tools.get(first.name)?.spec;
+      if(firstSpec)for(let i=0;i<pending.length&&wave.length<maxConcurrent;){const candidate=pending[i];const spec=this.tools.get(candidate.name)?.spec;if(spec&&canRunInParallel(firstSpec,spec)&&wave.every(c=>{const s=this.tools.get(c.name)?.spec;return!!s&&canRunInParallel(s,spec);})){wave.push(candidate);pending.splice(i,1);}else i++;}
+      const waveResults=await Promise.all(wave.map(c=>this.execute(c,ctx)));wave.forEach((c,i)=>results.set(c.id,waveResults[i]));if(wave.length>1&&waveResults.some(r=>!r.ok))break;
     }
     return results;
   }
-
   recoveryHint(result:ToolResult):string|undefined{return result.recovery?recoveryDirective(result):undefined;}
 }
