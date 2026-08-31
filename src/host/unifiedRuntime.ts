@@ -1,10 +1,8 @@
-import * as vscode from "vscode";
 import { AgentEngine } from "../core/agent/engine";
 import { runUnifiedTurn } from "../core/agent/unifiedEngine";
-import { buildExecutionPolicy, buildVerificationPlan, capabilityForModel } from "../core/intelligence/policy";
-import { buildWorkspaceMap } from "../core/tools/workspaceMap";
 import { PhotonController } from "./PhotonController";
-import type { AdaptivePlan, ChatMessage, ToolCall } from "../shared/types";
+import type { AdaptivePlan, ChatMessage, ThinkingSetting, ToolCall } from "../shared/types";
+import type { ProviderManager } from "../core/llm/providerManager";
 
 interface UnifiedEmitter {
   onAssistantStart(id:string):void; onDelta(id:string,delta:string):void; onContent(id:string,content:string):void; onAssistantCancel(id:string):void;
@@ -13,8 +11,17 @@ interface UnifiedEmitter {
   onDone(id:string,notice?:string):void; onError(message:string):void;
 }
 
-/** Replace the legacy facades with the canonical core runtime while keeping controller APIs stable. */
-export function installUnifiedRuntime():void {
+const THINKING_KEY="photon.thinkingSetting";
+
+/**
+ * Keep the existing local unified runtime, but NEVER replace the dedicated
+ * cloud engine. The cloud engine owns its native tool loop and must remain
+ * isolated from local adaptive orchestration.
+ *
+ * This bridge only adds the shared thinking-setting plumbing used by both
+ * engines through ProviderManager.
+ */
+export function installUnifiedRuntime():void{
   const localProto=AgentEngine.prototype as any;
   if(!localProto.__photonUnified){
     localProto.runTurn=function(session:ChatMessage|any,plan:AdaptivePlan,emitter:UnifiedEmitter,signal:AbortSignal){
@@ -23,31 +30,51 @@ export function installUnifiedRuntime():void {
     };
     localProto.__photonUnified=true;
   }
-  const cloudProto=PhotonController.prototype as any;
-  if(!cloudProto.__photonUnifiedCloud){
-    cloudProto.runCloudTurn=async function(session:any,plan:AdaptivePlan,emitter:UnifiedEmitter,signal:AbortSignal){
-      const self=this as any;
-      const model=self.models?.find((m:any)=>m.name===plan.model);
-      const task=plan.task??self.lastDecision?.complexity?.task??{scope:"single_file",reasoning:"medium",risk:"low",verification:[],ambiguity:"low",estimatedSteps:1};
-      const caps=plan.modelCapabilities??capabilityForModel(model??{name:plan.model});
-      const enriched:AdaptivePlan={
-        ...plan,
-        task,
-        modelCapabilities:caps,
-        executionPolicy:plan.executionPolicy??buildExecutionPolicy(task,caps,plan.mode==="agent"?100:plan.mode==="plan"?50:1,plan.maxTools),
-        verification:plan.verification??buildVerificationPlan(task),
-      };
-      const root=vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-      return runUnifiedTurn(session,enriched,emitter,signal,{
-        provider:self.providers,
-        tools:self.registry.all(),
-        workspaceName:vscode.workspace.workspaceFolders?.[0]?.name,
-        workspaceMap:()=>buildWorkspaceMap(root),
-        retrieveContext:(q:string,s:AbortSignal)=>self.index?.retrieveContext(q,s),
-        buildToolContext:(s:AbortSignal)=>self.buildToolContext(s),
-        reserveOutputTokens:1024,
-      });
+
+  const controllerProto=PhotonController.prototype as any;
+  if(!controllerProto.__photonThinkingWired){
+    const originalInitialize=controllerProto.initialize;
+    controllerProto.initialize=async function(){
+      const stored=(this.context?.globalState?.get?.(THINKING_KEY) as ThinkingSetting|undefined)??"auto";
+      this.thinkingLevel=stored;
+      await originalInitialize.call(this);
     };
-    cloudProto.__photonUnifiedCloud=true;
+
+    const originalHandle=controllerProto.handleMessage;
+    controllerProto.handleMessage=async function(msg:any){
+      const result=await originalHandle.call(this,msg);
+      if(msg?.type==="setThinkingSetting"){
+        const level=msg.payload.level as ThinkingSetting;
+        this.thinkingLevel=level;
+        await this.context.globalState.update(THINKING_KEY,level);
+        this.recomputePlan?.();
+        this.pushPlan?.();
+        this.pushConfig?.();
+      }else if(msg?.type==="setThinkingLevel"){
+        const level=msg.payload.level as ThinkingSetting;
+        this.thinkingLevel=level;
+        await this.context.globalState.update(THINKING_KEY,level);
+        this.recomputePlan?.();
+        this.pushPlan?.();
+        this.pushConfig?.();
+      }else if(msg?.type==="setThinkingEnabled"){
+        const level:ThinkingSetting=msg.payload.enabled?"medium":"off";
+        this.thinkingLevel=level;
+        await this.context.globalState.update(THINKING_KEY,level);
+        this.recomputePlan?.();
+        this.pushPlan?.();
+        this.pushConfig?.();
+      }
+      return result;
+    };
+
+    const originalRunPrompt=controllerProto.runPrompt;
+    controllerProto.runPrompt=async function(text:string,attachments:any[]|undefined){
+      const manager=this.providers as ProviderManager|undefined;
+      manager?.setThinkingLevel?.((this.thinkingLevel??"auto") as ThinkingSetting);
+      return originalRunPrompt.call(this,text,attachments);
+    };
+
+    controllerProto.__photonThinkingWired=true;
   }
 }
