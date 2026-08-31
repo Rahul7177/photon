@@ -25,6 +25,18 @@ export class ToolPipeline{
   async execute(call:ToolCall,ctx:ToolContext):Promise<ToolResult>{
     const tool=this.tools.get(call.name);
     if(!tool)return{ok:false,status:"invalid_args",retryable:false,recovery:{action:"repair"},output:`Unknown tool "${call.name}". Available tools: ${this.specs().map(s=>s.name).join(", ")}`};
+
+    // Never let a malformed weak-model write silently create an empty or
+    // placeholder file. The Photon block parser accepts `content: |` as a
+    // multiline marker, so an empty payload here means the model omitted the
+    // actual content. Return a repairable error instead of touching disk.
+    if(call.name==="write_file"){
+      const content=typeof call.args.content==="string"?call.args.content:"";
+      if(!content.trim()||/^\|[-+]?$/.test(content.trim())){
+        return{ok:false,status:"invalid_args",retryable:false,recovery:{action:"repair",hints:["write_file content is empty. Use `content: |` followed by the complete file contents on subsequent lines, ending with [/TOOL]. Do not pass the literal `|` as content."]},output:"Cannot write file: content is empty or only a multiline marker."};
+      }
+    }
+
     let cancelled:string|undefined;
     const preEvent:ToolPreExecuteEvent={call,tool,cancel:r=>cancelled=r};
     for(const fn of this.preListeners){let nextCalled=false;await fn(preEvent,async()=>{nextCalled=true;});if(!nextCalled){cancelled??="blocked by policy";break;}if(cancelled)break;}
