@@ -6,7 +6,9 @@ import { ToolCard } from "./ToolCard";
 export function Message({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
   const attachments = message.attachments ?? [];
-  const hasContent = message.content && message.content.length > 0;
+  // Whitespace-only streamed/tool-call messages must not create an empty
+  // full-width assistant bubble. Tool cards remain visible independently.
+  const hasContent = Boolean(message.content?.trim());
   const isStreaming = message.streaming === true;
 
   return (
