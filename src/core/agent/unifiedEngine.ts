@@ -8,9 +8,8 @@ import { renderToolInstructionsV2, toNativeToolsV2, renderToolResultV2 } from ".
 import { executionFingerprint, recoveryDirective, buildVerificationPlan, isFreshInfoRequest, selectToolSpecs } from "../intelligence/policy";
 import { ToolPipeline } from "../../photon-core/tools/pipeline";
 import type { LLMProvider } from "../llm/types";
-import type { Tool, ToolContext } from "../tools/types";
 
-export interface UnifiedEngineDeps { provider:LLMProvider;tools:Tool[];workspaceName?:string;workspaceMap?:()=>Promise<string|undefined>;retrieveContext?:(query:string,signal:AbortSignal)=>Promise<string|undefined>;buildToolContext:(signal:AbortSignal)=>ToolContext;reserveOutputTokens?:number; }
+export interface UnifiedEngineDeps { provider:LLMProvider;tools:import("../tools/types").Tool[];workspaceName?:string;workspaceMap?:()=>Promise<string|undefined>;retrieveContext?:(query:string,signal:AbortSignal)=>Promise<string|undefined>;buildToolContext:(signal:AbortSignal)=>import("../tools/types").ToolContext;reserveOutputTokens?:number; }
 export interface UnifiedEmitter { onAssistantStart(id:string):void;onDelta(id:string,delta:string):void;onContent(id:string,content:string):void;onAssistantCancel(id:string):void;onPhase(phase:"thinking"|"working",detail?:string):void;onToolCall(id:string,call:ToolCall):void;onToolUpdate(id:string,call:ToolCall):void;onUsage(usage:import("../../shared/types").TokenUsage):void;onGenerationStats(stats:import("../../shared/types").GenerationStats|null):void;onDone(id:string,notice?:string):void;onError(message:string):void; }
 const MAX_OUTPUT_CHARS=200_000;const MAX_CONTINUATIONS=3;
 const EMPTY_RETRIES_BY_LEVEL:Record<string,number>={low:5,medium:3,high:2,max:2};
@@ -39,13 +38,13 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
   }
 
   const baseBudget=Math.max(512,Math.min(plan.maxOutputTokens||2048,plan.executionPolicy?.generationBudgetTokens??plan.maxOutputTokens??2048));
-  const availableTools=()=>selectToolSpecs(deps.tools.map(t=>t.spec),plan,phase()).filter(t=>!(plan.toolProtocol==="native"&&(plan.modelCapabilities?.reasoning??0)>=.82&&t.name==="think"));
-  const toolSpecs=availableTools();const toolInstructions=renderToolInstructionsV2(toolSpecs,plan);const system=buildSystemPrompt({mode:plan.mode,plan,toolInstructions,workspaceName:deps.workspaceName,workspaceMap,retrievedContext:retrieved});const systemMsg:LLMMessage={role:"system",content:system};
   let mutationEpoch=0;const executed=new Set<string>();let noProgress=0;let emptyRetries=0;let continuations=0;let mutationOccurred=false;
   const maxSteps=plan.executionPolicy?.stepBudget??(plan.mode==="agent"?100:plan.mode==="plan"?50:8);let reasoningLevel=reasoningLevelForTask(task);
 
   for(let step=0;step<maxSteps&&!signal.aborted;step++){
-    const currentPhase=phase();const specs=availableTools();const factor=currentPhase==="orient"?.75:currentPhase==="edit"?1:.85;const budgetTokens=Math.max(512,Math.min(plan.maxOutputTokens||2048,Math.floor(baseBudget*factor)));
+    const currentPhase=phase();const specs=selectToolSpecs(deps.tools.map(t=>t.spec),plan,currentPhase).filter(t=>!(plan.toolProtocol==="native"&&(plan.modelCapabilities?.reasoning??0)>=.82&&t.name==="think"));
+    const toolInstructions=renderToolInstructionsV2(specs,plan);const system=buildSystemPrompt({mode:plan.mode,plan,toolInstructions,workspaceName:deps.workspaceName,workspaceMap,retrievedContext:retrieved});const systemMsg:LLMMessage={role:"system",content:system};
+    const factor=currentPhase==="orient"?.75:currentPhase==="edit"?1:.85;const budgetTokens=Math.max(512,Math.min(plan.maxOutputTokens||2048,Math.floor(baseBudget*factor)));
     emitter.onPhase("thinking");const history=historyToLLM(session.messages,plan);const fit=fitToWindow(systemMsg,history,Math.max(512,plan.numCtx-budgetTokens),plan.numCtx,plan.model,plan.toolProtocol==="photon-block");emitter.onUsage(fit.usage);
     const id=randomUUID();emitter.onAssistantStart(id);let raw="";const nativeCalls:{id?:string;name:string;args:Record<string,unknown>;thoughtSignature?:string}[]=[];let doneReason:string|undefined;
     try{for await(const chunk of deps.provider.chatStream({model:plan.model,messages:fit.messages.slice(1),options:{num_ctx:plan.numCtx,temperature:plan.temperature,top_p:plan.topP,num_predict:budgetTokens,thinkingLevel:reasoningLevel},tools:plan.toolProtocol==="native"&&specs.length?toNativeToolsV2(specs):undefined},signal)){if(chunk.message?.content){raw+=chunk.message.content;emitter.onDelta(id,chunk.message.content);}for(const tc of chunk.message?.tool_calls??[])nativeCalls.push({id:tc.id,name:tc.function.name,args:tc.function.arguments??{},thoughtSignature:tc.thoughtSignature});if(chunk.done_reason)doneReason=chunk.done_reason;if(raw.length>MAX_OUTPUT_CHARS){doneReason="length";break;}}}catch(e){if(signal.aborted){emitter.onDone(id);return;}emitter.onAssistantCancel(id);emitter.onError(`Model error: ${(e as Error).message}`);return;}
@@ -55,19 +54,15 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
     if(!calls.length&&onlyReasoning){emitter.onAssistantCancel(id);if((isLengthCutoff(doneReason)||isReasoningOnly(raw))&&reasoningLevel!=="off"){reasoningLevel="off";emptyRetries=0;injectUser(session,"Answer directly and efficiently. Do not spend time on extended reasoning; use the available tool if one is required, then provide the result.");continue;}emptyRetries++;const maxEmpty=EMPTY_RETRIES_BY_LEVEL[plan.intelligence]??2;if(emptyRetries<=maxEmpty){const hint=plan.intelligence==="low"?"Call exactly ONE tool using [TOOL tool_name] format with the required arguments, then wait.":"Continue the task. If work remains, call the next tool; otherwise provide the final answer.";injectUser(session,hint);continue;}emitter.onError("The model returned an empty response repeatedly.");return;}
     emptyRetries=0;
 
-    if(!calls.length){
-      const cut=isLengthCutoff(doneReason)||hasUnclosedFence(cleanedRaw);if(cut&&continuations<MAX_CONTINUATIONS){continuations++;emitter.onDone(id);if(reasoningLevel!=="off")reasoningLevel="off";injectUser(session,"The reply was cut off. Continue exactly where you stopped; do not repeat completed work.");continue;}
-      if(plan.mode!=="chat"&&mutationOccurred&&[...required].some(v=>!verification.has(v))&&continuations<MAX_CONTINUATIONS){continuations++;emitter.onDone(id);injectUser(session,`Verification is still required before finishing: ${[...required].filter(v=>!verification.has(v)).join(", ")}. Run the appropriate verification tool.`);continue;}
-      emitter.onDone(id);return;
-    }
+    if(!calls.length){const cut=isLengthCutoff(doneReason)||hasUnclosedFence(cleanedRaw);if(cut&&continuations<MAX_CONTINUATIONS){continuations++;emitter.onDone(id);if(reasoningLevel!=="off")reasoningLevel="off";injectUser(session,"The reply was cut off. Continue exactly where you stopped; do not repeat completed work.");continue;}if(plan.mode!=="chat"&&mutationOccurred&&[...required].some(v=>!verification.has(v))&&continuations<MAX_CONTINUATIONS){continuations++;emitter.onDone(id);injectUser(session,`Verification is still required before finishing: ${[...required].filter(v=>!verification.has(v)).join(", ")}. Run the appropriate verification tool.`);continue;}emitter.onDone(id);return;}
 
     const executable=calls.filter(c=>c.status!=="error");if(!executable.length){noProgress++;emitter.onDone(id);const maxNoProgress=NO_PROGRESS_BY_LEVEL[plan.intelligence]??3;const hint=plan.intelligence==="low"?`Fix the tool call. Use exactly: [TOOL tool_name]\\narg: value\\n[/TOOL]. Error: ${calls.map(c=>c.error??"invalid call").join("; ")}`:`Correct the invalid tool call and retry. ${calls.map(c=>c.error??"invalid call").join("; ")}`;injectUser(session,hint);if(noProgress>=maxNoProgress){emitter.onError("Stopped after repeated invalid tool calls.");return;}continue;}
     const fresh=executable.filter(c=>{const key=executionFingerprint(c,mutationEpoch);if(executed.has(key))return false;executed.add(key);return true;});if(!fresh.length){noProgress++;emitter.onDone(id);const maxNoProgress=NO_PROGRESS_BY_LEVEL[plan.intelligence]??3;if(noProgress>=maxNoProgress)return;injectUser(session,plan.intelligence==="low"?"That exact tool call already ran. Read its result and choose the next different action.":"That exact operation already ran at the current workspace state. Choose a different next step.");continue;}
 
     const toolCtx=deps.buildToolContext(signal);const results=await pipeline.executeMany(fresh,toolCtx,plan.executionPolicy?.maxConcurrent??1);let ran=false;
     for(const call of fresh){
-      const result=results.get(call.id);if(!result)continue;ran=true;const spec=deps.tools.find(t=>t.spec.name===call.name)?.spec;
-      if(spec?.sideEffecting&&result.ok){mutationEpoch++;mutationOccurred=true;workflowPhase="verify";}
+      const result=results.get(call.id);if(!result)continue;ran=true;const toolSpec=deps.tools.find(t=>t.spec.name===call.name)?.spec;
+      if(toolSpec?.sideEffecting&&result.ok){mutationEpoch++;mutationOccurred=true;workflowPhase="verify";}
       if((call.name==="web_search"||call.name==="web_fetch")&&result.ok)webEvidence=true;
       if(call.name==="get_diagnostics"){if(result.ok){verification.add("diagnostics");workflowPhase=requirementsComplete(required,verification)?"final":"verify";}else workflowPhase="edit";}
       if(call.name==="run_command"&&result.ok){const cmd=String(call.args.command??"").toLowerCase();if(/\b(test|vitest|jest|mocha|pytest|cargo test|go test)\b/.test(cmd))verification.add("tests");if(/\b(build|tsc|compile|bundle)\b/.test(cmd))verification.add("build");if(/\b(eslint|lint|prettier)\b/.test(cmd))verification.add("lint");if(/\b(run|start|serve|runtime)\b/.test(cmd))verification.add("runtime");workflowPhase=requirementsComplete(required,verification)?"final":"verify";}
