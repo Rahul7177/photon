@@ -4,7 +4,18 @@ export function renderToolInstructionsV2(tools:ToolSpec[],plan:AdaptivePlan):str
   if(!tools.length)return"";
   const list=tools.map(t=>renderSpec(t,plan.intelligence)).join("\n");
   const concurrency=plan.executionPolicy?.allowParallelReads&&(plan.executionPolicy.maxConcurrent??1)>1?"Independent read/search calls may be emitted together; mutations remain ordered.":"Call one tool, wait for its result, then continue.";
-  return["TOOLS:","[TOOL tool_name]","arg_name: value","[/TOOL]",`- ${concurrency}`,"- Use only listed tools and exact argument names.","- After every result, decide the NEXT step from the result; do not restart or repeat a successful call.","- Read before editing; verify after changes.",list].join("\n");
+  return[
+    "TOOLS:",
+    "[TOOL tool_name]",
+    "arg_name: value",
+    "[/TOOL]",
+    `- ${concurrency}`,
+    "- Use only listed tools and exact argument names.",
+    "- For multiline string arguments such as content, find, or replace, use `content: |` (or the equivalent key) and put the raw lines below it until the closing [/TOOL]. Do NOT use the literal pipe character as the content.",
+    "- After every result, decide the NEXT step from the result; do not restart or repeat a successful call.",
+    "- Read before editing; verify after changes.",
+    list,
+  ].join("\n");
 }
 
 function renderSpec(t:ToolSpec,level:IntelligenceLevel):string{
