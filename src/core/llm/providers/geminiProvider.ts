@@ -4,6 +4,26 @@ import { fetchWithRetry, streamSse, tryJson } from "../sse";
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
 
+type GeminiInputFunction = {
+  function: {
+    name: string;
+    description?: string;
+    parameters?: unknown;
+  };
+};
+
+export function toGeminiFunctionDeclaration(tool: GeminiInputFunction): {
+  name: string;
+  description?: string;
+  parametersJsonSchema?: unknown;
+} {
+  return {
+    name: tool.function.name,
+    description: tool.function.description,
+    parametersJsonSchema: tool.function.parameters,
+  };
+}
+
 /** Auth headers for the Generative Language API — key stays out of URLs. */
 function geminiHeaders(apiKey: string): Record<string, string> {
   return { "x-goog-api-key": apiKey };
@@ -162,18 +182,7 @@ export class GeminiProvider implements LLMProvider {
     if (req.tools?.length) {
       body.tools = [
         {
-          functionDeclarations: (req.tools as { function: { name: string; description?: string; parameters?: unknown } }[]).map(
-            (t) => ({
-              name: t.function.name,
-              description: t.function.description,
-              // Gemini's function-calling `parameters` field uses the protobuf
-              // Schema type and rejects JSON-Schema-only keywords such as
-              // `additionalProperties`. Photon keeps the richer canonical
-              // schema, so send it through Gemini's JSON-Schema escape hatch.
-              // `parametersJsonSchema` is mutually exclusive with `parameters`.
-              parametersJsonSchema: t.function.parameters,
-            })
-          ),
+          functionDeclarations: (req.tools as GeminiInputFunction[]).map(toGeminiFunctionDeclaration),
         },
       ];
     }
