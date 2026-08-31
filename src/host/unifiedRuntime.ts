@@ -103,12 +103,12 @@ function classifyCloudToolPolicy(mode:unknown,text:string):CloudToolPolicy{
 
   // Deterministic guard: greetings, thanks and other social acknowledgements
   // must never make a cloud model inspect the workspace.
-  if(/^(hi|hello|hey|hiya|yo|thanks|thank you|thx|ok|okay|great|cool|nice|good morning|good afternoon|good evening)[\\s,!.?]*$/i.test(t)){
+  if(/^(hi|hello|hey|hiya|yo|thanks|thank you|thx|ok|okay|great|cool|nice|good morning|good afternoon|good evening)[\s,!.?]*$/i.test(t)){
     return "none";
   }
 
-  const workspaceIntent=/\\b(file|files|folder|directory|workspace|repo|repository|codebase|code|class|function|symbol|bug|error|stack trace|edit|modify|change|implement|refactor|debug|fix|write|read|search files|list files|build|test|compile|lint|run command)\\b/i.test(t);
-  const externalIntent=/\\b(weather|temperature|forecast|news|current|today|tonight|latest|live|recent|price|prices|stock|stocks|market|release|version|time|date|traffic)\\b/i.test(t);
+  const workspaceIntent=/\b(file|files|folder|directory|workspace|repo|repository|codebase|code|class|function|symbol|bug|error|stack trace|edit|modify|change|implement|refactor|debug|fix|write|read|search files|list files|build|test|compile|lint|run command)\b/i.test(t);
+  const externalIntent=/\b(weather|temperature|forecast|news|current|today|tonight|latest|live|recent|price|prices|stock|stocks|market|release|version|time|date|traffic)\b/i.test(t);
 
   if(externalIntent && !workspaceIntent)return "web";
   if(mode==="chat" && !workspaceIntent)return "none";
