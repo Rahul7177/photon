@@ -1,5 +1,5 @@
 import type { AdaptivePlan, BenchResult, IntelligenceLevel, IntelligenceSetting, MachineProfile, Mode, ModelInfo, ModelTier, TaskAnalysis } from "../../shared/types";
-import { analyzeTask, buildExecutionPolicy, buildVerificationPlan, capabilityForModel, isFreshInfoRequest } from "../intelligence/policy";
+import { analyzeTask, buildExecutionPolicy, buildVerificationPlan, capabilityForModel, isFreshInfoRequest, shouldUseNativeToolProtocol } from "../intelligence/policy";
 
 export interface OrchestratorInput{model:ModelInfo;machine:MachineProfile|null;mode:Mode;prompt?:string;userNumCtx?:number;intelligence:IntelligenceSetting;reserveOutputTokens:number;adaptiveEnabled:boolean;cloudNativeTools?:boolean;task?:TaskAnalysis;bench?:BenchResult;}
 interface LevelProfile{maxTools:number;allowParallelTools:boolean;outputCap:number;chatTemp:number;taskTemp:number;}
@@ -30,15 +30,11 @@ export function buildPlan(input:OrchestratorInput):AdaptivePlan{
   if(input.userNumCtx&&input.userNumCtx>0){numCtx=input.userNumCtx;rationale.push(`Context pinned to ${numCtx} by user.`);}
 
   const isCloud=!!model.provider&&model.provider!=="ollama"&&model.provider!=="llamacpp";
-  // Native tool calling only works reliably when the model is explicitly
-  // tool-trained (e.g. Qwen-2.5-Coder, Llama-3.1-Tool) or is a capable cloud
-  // model. Non-tool-trained local models silently ignore the JSON schema in
-  // the API body and respond with plain text — so we MUST use block protocol
-  // for them and keep tool instructions in the system prompt.
-  const canNative=model.toolTrained===true||(isCloud&&capabilities.toolCalling>=.50);
-  let toolProtocol:AdaptivePlan["toolProtocol"]='photon-block';
-  if(canNative&&((!isCloud&&adaptiveEnabled)||(isCloud&&(input.cloudNativeTools??true))))toolProtocol='native';
-  rationale.push(toolProtocol==="native"?"Native tool calling enabled.":"Using Photon block protocol with tool instructions in system prompt.");
+  const nativeEligible=shouldUseNativeToolProtocol(model,capabilities,input.bench,level);
+  let toolProtocol:AdaptivePlan["toolProtocol"]="photon-block";
+  if(nativeEligible&&(isCloud?(input.cloudNativeTools??true):true))toolProtocol="native";
+  if(!isCloud&&level==="low")rationale.push("Low-end local strategy: Photon block protocol with a stable core toolbox and guided sequential execution.");
+  else rationale.push(toolProtocol==="native"?"Native tool calling enabled by measured model/provider reliability.":"Using Photon block protocol with tool instructions in system prompt.");
 
   const allowParallelTools=profile.allowParallelTools&&task.risk!=="destructive";
   const maxTools=profile.maxTools;
@@ -61,8 +57,6 @@ export function buildPlan(input:OrchestratorInput):AdaptivePlan{
 function deriveIntelligence(tier:ModelTier,machine:MachineProfile|null,capabilities:ReturnType<typeof capabilityForModel>,task:TaskAnalysis):IntelligenceLevel{
   const rank=TIER_RANK[tier];
   if(task.reasoning==="low")return"low";
-  // Allow small (rank 1) models to reach medium intelligence for medium tasks
-  // instead of being stuck at low. This ensures they get more tools and guidance.
   let level:IntelligenceLevel=task.reasoning==="medium"?(rank>=2?"high":rank>=1?"medium":"medium"):(rank>=3?"max":rank>=2?"high":rank===1?"medium":"low");
   if(capabilities.toolCalling<.5||capabilities.schemaAdherence<.5)level=level==="max"?"high":level==="high"?"medium":"low";
   if(task.risk==="destructive")level=level==="low"?"low":"medium";
