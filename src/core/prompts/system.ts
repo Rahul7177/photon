@@ -1,98 +1,25 @@
 import type { AdaptivePlan, IntelligenceLevel, Mode } from "../../shared/types";
 import { estimateTokens } from "../adaptive/tokens";
 
-export interface SystemPromptInput {
-  mode: Mode;
-  plan: AdaptivePlan;
-  toolInstructions: string;
-  workspaceName: string | undefined;
-  workspaceMap?: string;
-  retrievedContext?: string;
+export interface SystemPromptInput { mode:Mode;plan:AdaptivePlan;toolInstructions:string;workspaceName:string|undefined;workspaceMap?:string;retrievedContext?:string;freshWebContext?:string; }
+const BUDGET_FRACTION:Record<IntelligenceLevel,number>={low:.16,medium:.22,high:.28,max:.32};
+const MAP_LINES:Record<IntelligenceLevel,number>={low:18,medium:50,high:90,max:130};
+export function buildSystemPrompt(input:SystemPromptInput):string{
+  const {mode,plan,toolInstructions,workspaceName,workspaceMap,retrievedContext,freshWebContext}=input;const level=plan.intelligence;const core:string[]=[];core.push(identity(level));if(workspaceName)core.push(`Workspace: ${workspaceName}.`);core.push(modePrompt(mode,level,Boolean(toolInstructions),plan));if(toolInstructions)core.push(toolInstructions);if(mode!=="chat"&&level!=="low")core.push(multiFileGuidance(level));core.push(formattingRules(level));
+  const budgetTokens=Math.max(256,Math.floor(plan.numCtx*BUDGET_FRACTION[level]));let used=estimateTokens(core.join("\n\n"));const extras:string[]=[];
+  if(workspaceMap&&mode!=="chat"){const capped=capLines(workspaceMap,MAP_LINES[level]);const t=estimateTokens(`Project files (partial):\n${capped}`);if(used+t<=budgetTokens){extras.push(`Project files (partial):\n${capped}`);used+=t;}}
+  if(retrievedContext&&mode!=="chat"){const trimmed=fitBlock(retrievedContext,budgetTokens-used-8);if(trimmed)extras.push("Relevant code from the workspace (retrieved for this request; read files to confirm before editing):\n"+trimmed);}
+  if(freshWebContext){const trimmed=fitBlock(freshWebContext,Math.max(80,budgetTokens-used-12));if(trimmed)extras.push("Fresh web evidence retrieved by Photon for this request. Treat it as the source of current facts; cite or summarize it accurately and do not claim you searched if no evidence is present:\n"+trimmed);}
+  return[...core,...extras].join("\n\n");
 }
-
-const BUDGET_FRACTION: Record<IntelligenceLevel, number> = { low: 0.16, medium: 0.22, high: 0.28, max: 0.32 };
-const MAP_LINES: Record<IntelligenceLevel, number> = { low: 18, medium: 50, high: 90, max: 130 };
-
-export function buildSystemPrompt(input: SystemPromptInput): string {
-  const { mode, plan, toolInstructions, workspaceName, workspaceMap, retrievedContext } = input;
-  const level = plan.intelligence;
-  const core: string[] = [];
-  core.push(identity(level));
-  if (workspaceName) core.push(`Workspace: ${workspaceName}.`);
-  core.push(modePrompt(mode, level, Boolean(toolInstructions), plan));
-  if (toolInstructions) core.push(toolInstructions);
-  if (mode !== "chat" && level !== "low") core.push(multiFileGuidance(level));
-  core.push(formattingRules(level));
-
-  const budgetTokens = Math.max(256, Math.floor(plan.numCtx * BUDGET_FRACTION[level]));
-  let used = estimateTokens(core.join("\n\n"));
-  const extras: string[] = [];
-  if (workspaceMap && mode !== "chat") {
-    const capped = capLines(workspaceMap, MAP_LINES[level]);
-    const t = estimateTokens(`Project files (partial):\n${capped}`);
-    if (used + t <= budgetTokens) { extras.push(`Project files (partial):\n${capped}`); used += t; }
-  }
-  if (retrievedContext && mode !== "chat") {
-    const trimmed = fitBlock(retrievedContext, budgetTokens - used - 8);
-    if (trimmed) extras.push("Relevant code from the workspace (retrieved for this request; read files to confirm before editing):\n" + trimmed);
-  }
-  return [...core, ...extras].join("\n\n");
-}
-
-function capLines(text: string, max: number): string { const lines = text.split("\n"); return lines.length <= max ? text : lines.slice(0, max).join("\n") + "\n…"; }
-function fitBlock(text: string, maxTokens: number): string | null { if (maxTokens < 40) return null; if (estimateTokens(text) <= maxTokens) return text; const chars = Math.max(200, maxTokens * 4); const cut = text.slice(0, chars); const lastNl = cut.lastIndexOf("\n"); return (lastNl > 100 ? cut.slice(0, lastNl) : cut) + "\n… (truncated)"; }
-
-function identity(level: IntelligenceLevel): string {
-  if (level === "low") return "You are Photon, a concise coding and information assistant inside VS Code.";
-  if (level === "max") return "You are Photon, an expert coding and information assistant inside VS Code. Reason carefully when the task requires it, use available tools for current or external information, verify changes, and be concise but complete.";
-  return "You are Photon, a precise, practical coding and information assistant inside VS Code. Be concise.";
-}
-
-const MODE_PROMPTS: Record<Mode, Record<"low" | "rich", string>> = {
-  chat: {
-    low: "You are in CHAT mode. Answer directly. You may use the listed tools when they provide information you cannot safely know from memory, especially for current/latest/live facts. Never claim you lack web access when a web tool is listed; use it.",
-    rich: "You are in CHAT mode. Answer questions and write code snippets directly. You may use the listed tools when needed. For current, latest, live, market, price, weather, news, or other external facts, use web_search/web_fetch when available instead of guessing or claiming that you cannot access the web. After a tool result, answer the user without unnecessary extra reasoning.",
-  },
-  plan: {
-    low: "PLAN mode. Inspect code with read-only tools (read_file, list_dir, find_files, search_code), then reply with a short numbered plan. Do NOT edit files. Never guess file contents — read them.",
-    rich: "You are in PLAN mode. Produce a clear, ordered plan — do not make changes. Use read-only tools to understand the code first, then present a numbered plan. Name exact files and functions each step touches.",
-  },
-  agent: {
-    low: "AGENT mode rules: 1) read_file before edit_file; copy `find` EXACTLY from what you read. 2) One small step per tool call, then wait for its result. 3) Only state what tools returned — never invent file contents, paths, or command output. 4) When done, stop calling tools and summarize briefly.",
-    rich: "You are in AGENT mode. Complete the task by using tools. Work in small, verifiable steps: locate relevant files, read before editing, make focused changes, and verify. Only rely on tool results. When the task is complete, stop calling tools and give a short summary.",
-  },
+function capLines(text:string,max:number):string{const lines=text.split("\n");return lines.length<=max?text:lines.slice(0,max).join("\n")+"\n…";}
+function fitBlock(text:string,maxTokens:number):string|null{if(maxTokens<40)return null;if(estimateTokens(text)<=maxTokens)return text;const chars=Math.max(200,maxTokens*4);const cut=text.slice(0,chars);const lastNl=cut.lastIndexOf("\n");return(lastNl>100?cut.slice(0,lastNl):cut)+"\n… (truncated)";}
+function identity(level:IntelligenceLevel):string{if(level==="low")return"You are Photon, a concise coding and information assistant inside VS Code.";if(level==="max")return"You are Photon, an expert coding and information assistant inside VS Code. Reason carefully only when the task requires it, use available tools for current or external information, verify changes, and be concise but complete.";return"You are Photon, a precise, practical coding and information assistant inside VS Code. Be concise.";}
+const MODE_PROMPTS:Record<Mode,Record<"low"|"rich",string>>={
+  chat:{low:"You are in CHAT mode. Answer directly. You may use the listed tools when they provide information you cannot safely know from memory, especially current/latest/live facts. Never claim you lack web access when a web tool is listed; use it.",rich:"You are in CHAT mode. Answer questions and write code snippets directly. You may use the listed tools when needed. For current, latest, live, market, price, weather, news, or other external facts, use web_search/web_fetch when available instead of guessing or claiming that you cannot access the web. After getting tool evidence, answer directly without unnecessary extra reasoning."},
+  plan:{low:"PLAN mode. Inspect code with read-only tools (read_file, list_dir, find_files, search_code), then reply with a short numbered plan. Do NOT edit files. Never guess file contents — read them.",rich:"You are in PLAN mode. Produce a clear, ordered plan — do not make changes. Use read-only tools to understand the code first, then present a numbered plan. Name exact files and functions each step touches."},
+  agent:{low:"AGENT mode rules: 1) read_file before edit_file; copy `find` EXACTLY from what you read. 2) One small step per tool call, then wait for its result. 3) Only state what tools returned — never invent file contents, paths, or command output. 4) When done, stop calling tools and summarize briefly.",rich:"You are in AGENT mode. Complete the task by using tools. Work in small, verifiable steps: locate relevant files, read before editing, make focused changes, and verify. Only rely on tool results. When the task is complete, stop calling tools and give a short summary."},
 };
-
-function modePrompt(mode: Mode, level: IntelligenceLevel, hasTools: boolean, plan: AdaptivePlan): string {
-  let text = MODE_PROMPTS[mode][level === "low" ? "low" : "rich"];
-  if (hasTools && mode === "chat") {
-    text += "\nTool use is available for this turn. If the request is time-sensitive or requires external data, use the relevant tool rather than debating whether a tool exists.";
-  }
-  if (plan.task && /current|latest|live|today|as of/i.test(plan.rationale.join(" "))) {
-    text += "\nThis request may require fresh external information; prioritize the web tools when appropriate.";
-  }
-  return text;
-}
-
-function multiFileGuidance(level: IntelligenceLevel): string {
-  if (level === "medium") return [
-    "Working across files:",
-    "- Locate before you guess: find_files for file names, search_code for content.",
-    "- Always read_file before edit_file, and copy the exact text into `find`.",
-    "- After edits, run get_diagnostics on the changed file to catch mistakes early.",
-    "- For multi-step tasks, keep a todo_write checklist updated.",
-    "- Change one file at a time.",
-  ].join("\n");
-  return [
-    "## Working across multiple files",
-    "1. ORIENT — start from the project file list; use find_files, search_code, or code_outline instead of guessing paths.",
-    "2. PLAN — for multi-step work, write a todo_write checklist first and keep it updated. Use think only when native model reasoning is unavailable or insufficient.",
-    "3. READ — open each file you intend to change with read_file. Never edit an unread file.",
-    "4. EDIT — use edit_file with `find` copied verbatim from what you read. One focused change per call; use move_path for renames.",
-    "5. VERIFY — after each edit run get_diagnostics; after behavioral changes run the relevant command via run_command.",
-    "6. Track done vs. remaining across files; finish one file before the next.",
-    "Never invent paths, symbols, or command output — confirm them with tools first.",
-  ].join("\n");
-}
-
-function formattingRules(level: IntelligenceLevel): string { if (level === "low") return "Use Markdown. Put code in fenced blocks. Keep it short."; return "Formatting: reply in GitHub-flavored Markdown. Use fenced code blocks with a language tag for code, inline code for identifiers, and concise lists where helpful. Always close Markdown markers. Do not narrate tool use at length — act, then report briefly."; }
+function modePrompt(mode:Mode,level:IntelligenceLevel,hasTools:boolean,plan:AdaptivePlan):string{let text=MODE_PROMPTS[mode][level==="low"?"low":"rich"];if(hasTools&&mode==="chat")text+="\nTool use is available for this turn. If a tool can provide authoritative current/external information, call it rather than debating whether tools exist.";if(plan.task?.requiresWeb)text+="\nThis task requires fresh external information. Prefer the web tool path before answering.";return text;}
+function multiFileGuidance(level:IntelligenceLevel):string{if(level==="medium")return["Working across files:","- Locate before you guess: find_files for file names, search_code for content.","- Always read_file before edit_file, and copy the exact text into `find`.","- After edits, run get_diagnostics on the changed file to catch mistakes early.","- For multi-step tasks, keep a todo_write checklist updated.","- Change one file at a time."].join("\n");return["## Working across multiple files","1. ORIENT — start from the project file list; use find_files, search_code, or code_outline instead of guessing paths.","2. PLAN — for multi-step work, write a todo_write checklist first and keep it updated. Use think only when native model reasoning is unavailable or insufficient.","3. READ — open each file you intend to change with read_file. Never edit an unread file.","4. EDIT — use edit_file with `find` copied verbatim from what you read. One focused change per call; use move_path for renames.","5. VERIFY — after each edit run get_diagnostics; after behavioral changes run the relevant command via run_command.","6. Track done vs. remaining across files; finish one file before the next.","Never invent paths, symbols, or command output — confirm them with tools first."].join("\n");}
+function formattingRules(level:IntelligenceLevel):string{if(level==="low")return"Use Markdown. Put code in fenced blocks. Keep it short.";return"Formatting: reply in GitHub-flavored Markdown. Use fenced code blocks with a language tag for code, inline code for identifiers, and concise lists where helpful. Always close Markdown markers. Do not narrate tool use at length — act, then report briefly.";}
