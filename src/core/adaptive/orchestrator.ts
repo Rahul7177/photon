@@ -1,142 +1,70 @@
-import type {
-  AdaptivePlan,
-  IntelligenceLevel,
-  IntelligenceSetting,
-  MachineProfile,
-  Mode,
-  ModelInfo,
-  ModelTier,
-} from "../../shared/types";
+import type { AdaptivePlan, IntelligenceLevel, IntelligenceSetting, MachineProfile, Mode, ModelInfo, ModelTier, TaskAnalysis } from "../../shared/types";
+import { analyzeTask, buildExecutionPolicy, buildVerificationPlan, capabilityForModel } from "../intelligence/policy";
 
 export interface OrchestratorInput {
   model: ModelInfo;
   machine: MachineProfile | null;
   mode: Mode;
-  /** User override for the context window, if any. */
+  prompt?: string;
   userNumCtx?: number;
-  /** "auto" lets Photon derive the level from the model/machine. */
   intelligence: IntelligenceSetting;
   reserveOutputTokens: number;
   adaptiveEnabled: boolean;
-  /** Opt-in: let cloud models use native tool calling instead of Photon's
-   *  portable block protocol. Defaults to false (block protocol). */
   cloudNativeTools?: boolean;
+  task?: TaskAnalysis;
 }
 
-/** Per-level knobs. Higher levels spend more context on richer prompts + tools. */
-interface LevelProfile {
-  maxTools: number;
-  allowParallelTools: boolean;
-  outputCap: number;
-  chatTemp: number;
-  taskTemp: number;
-}
-
-// maxTools is a count cap; the registry ALSO hard-gates by each tool's minTier.
-// Counts are chosen so a low-tier coding agent still gets a complete core loop
-// (read/edit/write/find/list), medium adds search + diagnostics + shell, and
-// web/planning tools only appear at high+ (blueprint: ≤5–7 tools for weak
-// models). Capable models are never tool-starved: max allows the full set.
+interface LevelProfile { maxTools: number; allowParallelTools: boolean; outputCap: number; chatTemp: number; taskTemp: number; }
 const LEVELS: Record<IntelligenceLevel, LevelProfile> = {
   low: { maxTools: 5, allowParallelTools: false, outputCap: 768, chatTemp: 0.5, taskTemp: 0.2 },
-  medium: { maxTools: 8, allowParallelTools: false, outputCap: 2048, chatTemp: 0.6, taskTemp: 0.3 },
+  medium: { maxTools: 8, allowParallelTools: true, outputCap: 2048, chatTemp: 0.6, taskTemp: 0.3 },
   high: { maxTools: 14, allowParallelTools: true, outputCap: 4096, chatTemp: 0.7, taskTemp: 0.35 },
   max: { maxTools: 18, allowParallelTools: true, outputCap: 8192, chatTemp: 0.7, taskTemp: 0.4 },
 };
+const TIER_RANK: Record<ModelTier, number> = { tiny: 0, small: 1, medium: 2, large: 3 };
 
-/**
- * The core of Photon: translate (machine, model, mode, intelligence) into
- * concrete settings, a tool protocol, and a prompt detail level a local model
- * can actually handle. Rule-based and transparent — every choice lands in
- * `rationale` and is surfaced in the UI.
- */
 export function buildPlan(input: OrchestratorInput): AdaptivePlan {
   const { model, machine, mode, reserveOutputTokens, adaptiveEnabled } = input;
   const rationale: string[] = [];
   const tier = model.tier ?? "small";
+  const task = input.task ?? analyzeTask(input.prompt ?? "", mode);
+  const capabilities = capabilityForModel(model);
 
-  // --- Intelligence level: auto-derive from capability, or honor the override.
   const auto = input.intelligence === "auto";
-  const level: IntelligenceLevel =
-    input.intelligence === "auto" ? deriveIntelligence(tier, machine) : input.intelligence;
+  let level: IntelligenceLevel = auto ? deriveIntelligence(tier, machine, capabilities, task) : input.intelligence;
   const profile = LEVELS[level];
-  rationale.push(
-    auto
-      ? `Intelligence: ${level} (auto from a ${tier} model${machine ? ` on a ${machine.tier}-end machine` : ""}).`
-      : `Intelligence: ${level} (pinned by user).`
-  );
+  rationale.push(auto ? `Intelligence: ${level} (task/capability aware).` : `Intelligence: ${level} (pinned by user).`);
+  rationale.push(`Task: ${task.scope}, reasoning=${task.reasoning}, risk=${task.risk}, verification=${task.verification.join(",") || "none"}.`);
 
-  // --- Context window: bounded by the model, then shrunk to fit weak hardware.
   const modelMax = model.contextLength ?? 8192;
   let numCtx = modelMax;
-
   if (adaptiveEnabled && machine) {
     const ramGb = machine.freeRamBytes / 1024 ** 3;
-    // KV-cache grows with num_ctx; on low-RAM machines a huge window swaps and
-    // crawls. Cap to what the machine can comfortably hold.
-    const ramCap =
-      machine.tier === "low" ? 8192 : machine.tier === "mid" ? 16384 : 32768;
-    if (modelMax > ramCap) {
-      numCtx = ramCap;
-      rationale.push(
-        `Capped context to ${ramCap} tokens for a ${machine.tier}-end machine (${ramGb.toFixed(
-          1
-        )} GB free); ${model.name} supports ${modelMax}.`
-      );
-    } else {
-      rationale.push(`Using the model's full ${modelMax}-token window.`);
-    }
+    const ramCap = machine.tier === "low" ? 8192 : machine.tier === "mid" ? 16384 : 32768;
+    if (modelMax > ramCap) { numCtx = ramCap; rationale.push(`Capped context to ${ramCap} for ${machine.tier}-end hardware (${ramGb.toFixed(1)} GB free).`); }
+    else rationale.push(`Using model context ${modelMax}.`);
   }
+  if (input.userNumCtx && input.userNumCtx > 0) { numCtx = input.userNumCtx; rationale.push(`Context pinned to ${numCtx} by user.`); }
 
-  if (input.userNumCtx && input.userNumCtx > 0) {
-    numCtx = input.userNumCtx;
-    rationale.push(`Context window pinned to ${numCtx} by user.`);
-  }
-
-  // --- Tool protocol: weak / non-tool-trained models get the forgiving block
-  // protocol; capable tool-trained models can use native calling. Cloud models
-  // typically use the block protocol — it's portable across every provider's API
-  // but can be overridden by the user.
   const isCloud = !!model.provider && model.provider !== "ollama" && model.provider !== "llamacpp";
-  const canNative = model.toolTrained === true && (tier === "medium" || tier === "large");
-  
+  const canNative = model.toolTrained === true || capabilities.toolCalling >= 0.78;
   let toolProtocol: AdaptivePlan["toolProtocol"] = "photon-block";
-  if (!isCloud && adaptiveEnabled && canNative) {
-    toolProtocol = "native";
-  } else if (isCloud && input.cloudNativeTools === true && canNative) {
-    toolProtocol = "native";
-  }
+  if (canNative && ((!isCloud && adaptiveEnabled) || (isCloud && input.cloudNativeTools === true))) toolProtocol = "native";
+  rationale.push(toolProtocol === "native" ? "Native tool calling enabled." : "Using Photon block protocol for tolerant tool use.");
 
-  rationale.push(
-    toolProtocol === "native"
-      ? `${model.name} is tool-trained; using native tool calling.`
-      : isCloud
-        ? `${model.name} is a cloud model; using Photon's portable block protocol.`
-        : `Using Photon's forgiving block protocol — safest for a ${tier} model.`
-  );
-
-  // --- Tools + parallelism come from the intelligence profile.
+  const riskTight = task.risk === "destructive";
   const maxTools = isCloud ? 100 : profile.maxTools;
-  const allowParallelTools = profile.allowParallelTools;
-  if (!isCloud && (level === "low" || level === "medium")) {
-    rationale.push(
-      `Exposing ${maxTools} tools, one call per turn — keeps a ${level} run from overwhelming the model.`
-    );
-  } else if (isCloud) {
-    rationale.push(`Cloud model detected; exposing all tools (${maxTools} limit).`);
-  }
-
-  // --- Sampling. Plan/Agent want determinism; Chat can be a touch warmer.
+  const allowParallelTools = profile.allowParallelTools && !riskTight;
   const temperature = mode === "chat" ? profile.chatTemp : profile.taskTemp;
-  const topP = 0.9;
+  const maxOutputTokens = Math.max(256, Math.min(profile.outputCap, Math.max(256, numCtx - reserveOutputTokens), Math.floor(numCtx * 0.5)));
+  const executionPolicy = buildExecutionPolicy(task, capabilities, mode === "agent" ? 100 : mode === "plan" ? 50 : 1, maxTools);
+  executionPolicy.maxConcurrent = allowParallelTools ? executionPolicy.maxConcurrent : 1;
+  executionPolicy.generationBudgetTokens = Math.min(executionPolicy.generationBudgetTokens, maxOutputTokens);
+  const verification = buildVerificationPlan(task);
 
-  // --- Output budget: leave room in the window; don't let low levels ramble.
-  const maxOutputTokens = Math.max(
-    256,
-    Math.min(profile.outputCap, numCtx - reserveOutputTokens, Math.floor(numCtx * 0.5))
-  );
-
-  if (model.vision) rationale.push(`${model.name} accepts images — attachments enabled.`);
+  if (model.vision) rationale.push(`${model.name} accepts images.`);
+  if (model.thinking) rationale.push(`${model.name} exposes native thinking/reasoning capability.`);
+  rationale.push(`Execution: maxConcurrent=${executionPolicy.maxConcurrent}, generationBudget=${executionPolicy.generationBudgetTokens}, steps=${executionPolicy.stepBudget}.`);
 
   return {
     model: model.name,
@@ -144,7 +72,7 @@ export function buildPlan(input: OrchestratorInput): AdaptivePlan {
     contextWindow: numCtx,
     numCtx,
     temperature,
-    topP,
+    topP: 0.9,
     maxOutputTokens,
     toolProtocol,
     maxTools,
@@ -152,16 +80,19 @@ export function buildPlan(input: OrchestratorInput): AdaptivePlan {
     intelligence: level,
     intelligenceAuto: auto,
     rationale,
+    task,
+    modelCapabilities: capabilities,
+    executionPolicy,
+    verification,
   };
 }
 
-function deriveIntelligence(
-  tier: ModelTier,
-  machine: MachineProfile | null
-): IntelligenceLevel {
-  let level: IntelligenceLevel =
-    tier === "tiny" ? "low" : tier === "small" ? "medium" : tier === "medium" ? "high" : "max";
-  // A low-end machine can't sustain the heaviest prompts even on a big model.
+function deriveIntelligence(tier: ModelTier, machine: MachineProfile | null, capabilities: ReturnType<typeof capabilityForModel>, task: TaskAnalysis): IntelligenceLevel {
+  const rank = TIER_RANK[tier];
+  let level: IntelligenceLevel = rank <= 0 ? "low" : rank === 1 ? "medium" : rank === 2 ? "high" : "max";
+  if (capabilities.toolCalling < 0.5 || capabilities.schemaAdherence < 0.5) level = level === "max" ? "high" : level === "high" ? "medium" : "low";
+  if (task.risk === "destructive") level = level === "low" ? "low" : "medium";
+  if (task.reasoning === "high" && rank >= 2) level = "max";
   if (machine?.tier === "low" && level === "max") level = "high";
   return level;
 }
