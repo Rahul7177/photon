@@ -1,1 +1,0 @@
-Gemini tool declarations use `parametersJsonSchema` at the provider boundary. Photon retains a richer provider-neutral JSON Schema internally, while Gemini's GenerateContent function declaration receives the JSON Schema form explicitly.
