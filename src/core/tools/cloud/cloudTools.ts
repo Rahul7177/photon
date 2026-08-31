@@ -19,9 +19,17 @@ import { clamp, fail, ok, outputBudget, type Tool } from "../types";
  * follow the conventions capable models already know from agentic coding tools
  * while reusing Photon's hardened public-web search/fetch implementations.
  *
- * `attempt_completion` and `ask_followup_question` are intercepted by the
- * engine before execution: they control turn lifecycle, not the workspace.
+ * The active policy is set by the cloud runtime for each request:
+ *   all  = normal coding/agent task
+ *   web  = pure external-information request
+ *   none = conversational turn with no tool need
  */
+export type CloudToolPolicy = "all" | "web" | "none";
+let activeCloudToolPolicy: CloudToolPolicy = "all";
+
+export function setCloudToolPolicy(policy: CloudToolPolicy): void {
+  activeCloudToolPolicy = policy;
+}
 
 const COMMAND_TIMEOUT_MS = 180_000;
 const COMMAND_MAX_BUFFER = 1024 * 1024;
@@ -224,6 +232,9 @@ export const cloudAttemptCompletion: Tool = {
 };
 
 export function cloudTools(): Tool[] {
+  const lifecycle = [cloudAskFollowup, cloudAttemptCompletion];
+  if (activeCloudToolPolicy === "none") return lifecycle;
+  if (activeCloudToolPolicy === "web") return [cloudWebSearch, cloudWebFetch, ...lifecycle];
   return [
     cloudReadFile,
     cloudWriteFile,
@@ -234,8 +245,7 @@ export function cloudTools(): Tool[] {
     cloudListDefinitions,
     cloudWebSearch,
     cloudWebFetch,
-    cloudAskFollowup,
-    cloudAttemptCompletion,
+    ...lifecycle,
   ];
 }
 
