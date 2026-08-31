@@ -1,41 +1,22 @@
-import type { Tool } from "../types";
-import {
-  editFileTool,
-  listDirTool,
-  movePathTool,
-  readFileTool,
-  writeFileTool,
-} from "./files";
+import { editFileTool, listDirTool, movePathTool, readFileTool, writeFileTool } from "./files";
 import { codeOutlineTool, findFilesTool, searchCodeTool } from "./search";
 import { runCommandTool } from "./terminal";
 import { webFetchTool, webSearchTool } from "./web";
 import { getDiagnosticsTool } from "./verify";
 import { thinkTool, todoWriteTool } from "./plan";
+import type { Tool } from "../types";
 
-/**
- * All built-in tools, ordered by priority (lower = kept for weak models).
- *
- * The set is deliberately dual-mode: the first ~7 entries form a complete,
- * forgiving core (read → edit → write → locate → verify) that fits inside a
- * tiny model's tool budget, while the rest unlock progressively for capable
- * models — whose larger context windows and better instruction-following let
- * them exploit shell access, web tools, and planning aids without derailing.
- */
+/** Single canonical built-in set; metadata is normalized once for all engines. */
 export function builtinTools(): Tool[] {
-  return [
-    readFileTool,        // 1 — ground truth for every other action
-    editFileTool,        // 2 — surgical change
-    writeFileTool,       // 3 — create / full rewrite
-    findFilesTool,       // 4 — locate by name/glob
-    listDirTool,         // 5 — explore structure
-    searchCodeTool,      // 6 — locate by content (grep)
-    getDiagnosticsTool,  // 7 — verify edits against the editor
-    runCommandTool,      // 8 — build/test/execute
-    movePathTool,        // 9 — rename/move refactors
-    codeOutlineTool,     // 10 — navigate big files cheaply
-    todoWriteTool,       // 11 — stable multi-step plan
-    thinkTool,           // 12 — private reasoning scratchpad
-    webSearchTool,       // 13 — external knowledge
-    webFetchTool,        // 14 — read docs/raw files
-  ];
+  const tools=[readFileTool,editFileTool,writeFileTool,findFilesTool,listDirTool,searchCodeTool,getDiagnosticsTool,runCommandTool,movePathTool,codeOutlineTool,todoWriteTool,thinkTool,webSearchTool,webFetchTool];
+  return tools.map(enrichMetadata);
+}
+function enrichMetadata(tool:Tool):Tool{
+  const s=tool.spec;if(s.risk)return tool;
+  const tags=new Set(s.tags??[]);
+  const risk=s.name.startsWith("web_")?"network":tags.has("exec")?"execute":tags.has("write")||s.sideEffecting?"workspace_write":"read";
+  const concurrency=risk==="read"?"safe_parallel":"serial";
+  const idempotency=risk==="read"?"idempotent":s.name==="run_command"?"stateful":"non_idempotent";
+  const verifyAfter=s.name==="edit_file"||s.name==="write_file"||s.name==="move_path"?["diagnostics"]:s.name==="run_command"?["tests","build","diagnostics"]:[];
+  return {...tool,spec:{...s,risk:risk as any,concurrency:concurrency as any,idempotency:idempotency as any,verifyAfter:verifyAfter as any}};
 }
