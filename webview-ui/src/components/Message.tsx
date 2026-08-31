@@ -4,10 +4,13 @@ import { Markdown } from "./Markdown";
 import { ToolCard } from "./ToolCard";
 
 export function Message({ message }: { message: ChatMessage }) {
+  // Internal orchestration messages are intentionally kept in the session so
+  // the model can reason from tool results, but they are not conversation
+  // content and should never be rendered as user/assistant bubbles.
+  if (message.internal || isInternalOrchestrationMessage(message)) return null;
+
   const isUser = message.role === "user";
   const attachments = message.attachments ?? [];
-  // Whitespace-only streamed/tool-call messages must not create an empty
-  // full-width assistant bubble. Tool cards remain visible independently.
   const hasContent = Boolean(message.content?.trim());
   const isStreaming = message.streaming === true;
 
@@ -52,6 +55,20 @@ export function Message({ message }: { message: ChatMessage }) {
       )}
     </div>
   );
+}
+
+function isInternalOrchestrationMessage(message: ChatMessage): boolean {
+  const text = (message.content ?? "").trim();
+  if (!text) return false;
+
+  // Unified local loop stores block-protocol tool results as user messages so
+  // they can be fed back into weak models. Hide those implementation details
+  // from the UI while preserving them in the session transcript.
+  if (message.toolCallId && /^\{\s*"type"\s*:\s*"tool_(?:result|error)"\b/i.test(text)) return true;
+  if (/^\{\s*"type"\s*:\s*"tool_(?:result|error)"\b/i.test(text)) return true;
+
+  // Photon-generated control nudges used to recover weak-model tool turns.
+  return /^(?:Your previous reply arrived empty\.|Continue the task\.|You stopped after describing next steps but made no tool call\.|Your reply was cut off\.|That exact tool call already ran\.|That exact operation already ran\.|Fix the tool call\.\s*Use exactly:|Correct the invalid tool call and retry\.|Verification is still required before finishing:|The workspace changed successfully\.)/i.test(text);
 }
 
 function MessageActions({ content, isUser }: { content: string; isUser: boolean }) {
