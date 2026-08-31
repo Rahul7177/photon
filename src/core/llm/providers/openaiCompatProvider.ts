@@ -1,4 +1,4 @@
-import type { ModelInfo } from "../../../shared/types";
+import type { ModelInfo, ThinkingLevel } from "../../../shared/types";
 import type { LLMChatChunk, LLMChatRequest, LLMProvider, ProviderModel } from "../types";
 import { fetchWithRetry, streamSse, tryJson } from "../sse";
 
@@ -117,23 +117,7 @@ export class OpenAICompatProvider implements LLMProvider {
     if (req.tools?.length) body.tools = req.tools;
     if (this.keyInBody) body.apiKey = this.apiKey;
 
-    // Provider-aware reasoning controls. Nemotron 3.5 Lightning uses
-    // `chat_template_kwargs.enable_thinking` plus `thinking_token_budget` on
-    // NVIDIA's OpenAI-compatible endpoint. We intentionally only send these
-    // extra fields to known NVIDIA/Nemotron deployments because arbitrary
-    // OpenAI-compatible servers may reject provider-specific payload members.
-    const thinkingLevel = req.options?.thinkingLevel;
-    if (this.id === "nvidia" || /nemotron-3(?:\\.5)?[-_ ]lightning/i.test(req.model)) {
-      if (thinkingLevel === "off") {
-        body.chat_template_kwargs = { enable_thinking: false };
-      } else if (thinkingLevel) {
-        body.chat_template_kwargs = { enable_thinking: true };
-        if (/nemotron-3(?:\\.5)?[-_ ]lightning/i.test(req.model)) {
-          const budget = thinkingLevel === "low" ? 256 : thinkingLevel === "medium" ? 1024 : 4096;
-          body.thinking_token_budget = budget;
-        }
-      }
-    }
+    applyReasoningControls(body, this.id, req.model, req.options?.thinkingLevel);
 
     const res = await fetchWithRetry(`${this.baseUrl}/chat/completions`, {
       method: "POST", headers: { "Content-Type": "application/json", ...this.authHeaders(), ...this.extraHeaders },
@@ -172,7 +156,36 @@ export class OpenAICompatProvider implements LLMProvider {
   }
 }
 
-function guessTier(id: string): "small" | "medium" | "large" { const n=id.toLowerCase(); if(/nano|mini|flash|lite|small|tiny|8b|3b|4b|7b/.test(n))return"medium"; if(/opus|pro|max|ultra|405b|671b|deepseek-r\\d|frontier/.test(n))return"large"; return"large"; }
-function guessCapabilities(id: string): string[] { const n=id.toLowerCase(); const caps:string[]=[]; if(/vision|visual|vl|4o|gpt-4|gemini|pixtral|llava|multimodal|image|gemma.*3/.test(n))caps.push("vision"); if(/audio|whisper|speech|voxtral|ultravox/.test(n))caps.push("audio"); if(/video|veo|live/.test(n))caps.push("video"); if(/r1|o1|o3|thinking|reasoning|qwq|qwen3|deepseek-r|magistral|nemotron.*think|nemotron-3.*lightning/.test(n))caps.push("thinking"); if(/gemma/.test(n)&&!caps.includes("vision"))caps.push("vision"); return caps; }
+function applyReasoningControls(body: Record<string, unknown>, provider: string, model: string, level: ThinkingLevel | undefined): void {
+  if (!level) return;
+  const n = model.toLowerCase();
+
+  // NVIDIA NIM / Nemotron. Keep these fields out of arbitrary OpenAI-compatible
+  // gateways because many reject unknown request members.
+  if (provider === "nvidia" || /nemotron-3(?:\.5)?[-_ ]lightning/i.test(n)) {
+    const enabled = level !== "off";
+    body.chat_template_kwargs = { enable_thinking: enabled };
+    if (enabled) {
+      const budget = level === "low" ? 256 : level === "medium" ? 1024 : level === "high" ? 4096 : 8192;
+      body.thinking_token_budget = budget;
+    }
+    return;
+  }
+
+  // OpenAI's reasoning-capable families expose reasoning_effort. Do not send
+  // it to ordinary chat models or arbitrary compatible gateways.
+  if (provider === "openai" && /(?:^|[:/])(?:gpt-5(?:\.[0-9]+)?|o[1-9]\b)/i.test(model)) {
+    if (level === "off") {
+      // "none" is supported by current GPT-5 reasoning models; older o-series
+      // may reject it, so omit the field there and preserve their provider default.
+      if (/gpt-5/i.test(model)) body.reasoning_effort = "none";
+    } else {
+      body.reasoning_effort = level === "xtrahigh" ? "xhigh" : level;
+    }
+  }
+}
+
+function guessTier(id: string): "small" | "medium" | "large" { const n=id.toLowerCase(); if(/nano|mini|flash|lite|small|tiny|8b|3b|4b|7b/.test(n))return"medium"; if(/opus|pro|max|ultra|405b|671b|deepseek-r\d|frontier/.test(n))return"large"; return"large"; }
+function guessCapabilities(id: string): string[] { const n=id.toLowerCase(); const caps:string[]=[]; if(/vision|visual|vl|4o|gpt-4|gemini|pixtral|llava|multimodal|image|gemma.*3/.test(n))caps.push("vision"); if(/audio|whisper|speech|voxtral|ultravox/.test(n))caps.push("audio"); if(/video|veo|live/.test(n))caps.push("video"); if(/r1|o1|o3|o4|thinking|reasoning|qwq|qwen3|deepseek-r|magistral|nemotron.*think|nemotron-3.*lightning/.test(n))caps.push("thinking"); if(/gemma/.test(n)&&!caps.includes("vision"))caps.push("vision"); return caps; }
 const TOOL_TRAINED_HINTS=["qwen2","qwen3","llama3.1","llama3.2","llama3.3","mistral","mistral-nemo","firefunction","command-r","hermes","qwq","deepseek-r","tool"];
 function isToolTrainedModel(id:string):boolean{const n=id.toLowerCase();return TOOL_TRAINED_HINTS.some(h=>n.includes(h));}
