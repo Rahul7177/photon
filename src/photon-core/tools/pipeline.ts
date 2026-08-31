@@ -1,5 +1,6 @@
 import type { Tool, ToolContext, ToolResult } from "../../core/tools/types";
-import type { ToolCall, ToolSpec } from "../../shared/types";
+import type { AdaptivePlan, ToolCall, ToolSpec } from "../../shared/types";
+import { canRunInParallel, rankTools, recoveryDirective } from "../../core/intelligence/policy";
 
 export type ToolPreExecuteEvent={call:ToolCall;tool:Tool;cancel?:(reason:string)=>void};
 export type ToolPostExecuteEvent={call:ToolCall;result:ToolResult};
@@ -16,32 +17,53 @@ export class ToolPipeline{
   onPreExecute(fn:(e:ToolPreExecuteEvent,next:()=>Promise<void>)=>Promise<void>):()=>void{this.preListeners.add(fn);return()=>this.preListeners.delete(fn);}
   onPostExecute(fn:(e:ToolPostExecuteEvent)=>void):()=>void{this.postListeners.add(fn);return()=>this.postListeners.delete(fn);}
 
-  specsForPlan(plan:import("../../shared/types").AdaptivePlan):ToolSpec[]{
+  specsForPlan(plan:AdaptivePlan):ToolSpec[]{
     if(plan.mode==="chat")return[];
     const rank:Record<string,number>={low:0,medium:1,high:2,max:3};
     const level=rank[plan.intelligence]??0;
-    const preferredTags=plan.mode==="plan"?["fs","read","search","plan"]:["fs","read","search","write","exec","plan","web"];
-    return this.specs()
-      .filter(s=>{const min=rank[s.minTier??"low"]??0;return min<=level;})
-      .filter(s=>plan.mode!=="plan"||!s.sideEffecting)
-      .sort((a,b)=>{
-        const at=(a.tags??[]).some(t=>preferredTags.includes(t))?0:1;
-        const bt=(b.tags??[]).some(t=>preferredTags.includes(t))?0:1;
-        return at-bt||a.priority-b.priority;
-      })
-      .slice(0,Math.max(1,plan.maxTools));
+    let specs=this.specs().filter(s=>(rank[s.minTier??"low"]??0)<=level);
+    if(plan.mode==="plan")specs=specs.filter(s=>!s.sideEffecting);
+    const task=plan.task??{scope:"single_file",reasoning:"medium",risk:"low",verification:[],ambiguity:"low",estimatedSteps:1};
+    return rankTools(specs,task,"orient").slice(0,Math.max(1,plan.maxTools));
   }
 
   async execute(call:ToolCall,ctx:ToolContext):Promise<ToolResult>{
     const tool=this.tools.get(call.name);
-    if(!tool)return{ok:false,status:"invalid_args",retryable:false,output:`Unknown tool "${call.name}". Available tools: ${this.specs().slice(0,12).map(s=>s.name).join(", ")}`};
+    if(!tool)return{ok:false,status:"invalid_args",retryable:false,recovery:{action:"repair"},output:`Unknown tool "${call.name}". Available tools: ${this.specs().map(s=>s.name).join(", ")}`};
     let cancelled:string|undefined;
     const preEvent:ToolPreExecuteEvent={call,tool,cancel:r=>cancelled=r};
     for(const fn of this.preListeners){let nextCalled=false;await fn(preEvent,async()=>{nextCalled=true;});if(!nextCalled){cancelled??="blocked by policy";break;}if(cancelled)break;}
     if(cancelled)return{ok:false,status:"permission_denied",retryable:false,output:cancelled};
     let result:ToolResult;
-    try{result=await tool.execute(call.args,ctx);}catch(e){result={ok:false,status:"execution_error",retryable:true,output:(e as Error).message};}
+    try{result=await tool.execute(call.args,ctx);}catch(e){result={ok:false,status:"execution_error",retryable:true,recovery:{action:"retry"},output:(e as Error).message};}
+    if(!result.ok&&!result.recovery){ result.recovery={action:result.retryable?"retry":"ask_user"}; }
     for(const fn of this.postListeners)fn({call,result});
     return result;
   }
+
+  /** Execute independent safe-read waves concurrently; all writes/exec stay ordered. */
+  async executeMany(calls:ToolCall[],ctx:ToolContext,maxConcurrent=4):Promise<Map<string,ToolResult>>{
+    const results=new Map<string,ToolResult>();
+    const pending=[...calls];
+    while(pending.length){
+      const wave:ToolCall[]=[];
+      const first=pending.shift()!; wave.push(first);
+      const firstSpec=this.tools.get(first.name)?.spec;
+      if(firstSpec){
+        for(let i=0;i<pending.length&&wave.length<maxConcurrent;){
+          const candidate=pending[i]; const spec=this.tools.get(candidate.name)?.spec;
+          if(spec&&canRunInParallel(firstSpec,spec)&&wave.every(c=>{const s=this.tools.get(c.name)?.spec;return!!s&&canRunInParallel(s,spec);})){
+            wave.push(candidate);pending.splice(i,1);
+          }else i++;
+        }
+      }
+      const waveResults=await Promise.all(wave.map(c=>this.execute(c,ctx)));
+      wave.forEach((c,i)=>results.set(c.id,waveResults[i]));
+      if(wave.length>1 && waveResults.some(r=>!r.ok)) break;
+    }
+    return results;
+  }
+
+  /** Human-readable recovery instruction for callers that want to steer the model. */
+  recoveryHint(result:ToolResult):string|undefined{return result.recovery?recoveryDirective(result):undefined;}
 }
