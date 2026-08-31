@@ -1,19 +1,19 @@
 import type { AdaptivePlan } from "../../shared/types";
+import type { ToolContext } from "../../core/tools/types";
 import type { PhotonAgent } from "../agent/agent";
 
 export type LoopDeps = {
-  /** Kept for constructor compatibility while the unified runtime is canonical. */
-  [key:string]: unknown;
-  buildPlan?: (prompt:string,mode:any,attachmentsCount:number)=>AdaptivePlan|null;
+  llm: any;
+  tools: any;
+  systemPrompt: any;
+  workspaceName?: string;
+  retrieveContext?: (query:string,signal:AbortSignal)=>Promise<string|undefined>;
+  reserveOutputTokens: number;
+  buildPlan: (prompt:string,mode:any,attachmentsCount:number)=>AdaptivePlan|null;
+  buildToolContext: (signal:AbortSignal,capability:any)=>ToolContext;
 };
 
-/**
- * Compatibility shell for the experimental harness loop.
- *
- * Photon now has one canonical execution brain in core/agent/unifiedEngine.ts.
- * This class intentionally does not execute tools itself; existing controller
- * construction remains source-compatible while avoiding a second divergent loop.
- */
+/** Compatibility shell: Photon has one canonical execution brain in core/agent/unifiedEngine.ts. */
 export class AgentLoop {
   private preStepListeners:Array<(decision:any,next:()=>Promise<any>)=>Promise<any>>=[];
   constructor(private readonly deps:LoopDeps){}
@@ -24,9 +24,6 @@ export class AgentLoop {
       const inbox=agent.inbox.claim();if(!inbox)return;
       const decision:any={kind:"enter",messages:inbox,plan:null};
       for(const fn of this.preStepListeners){const next=async()=>decision;const result=await fn(decision,next);if(result)Object.assign(decision,result);if(decision.kind==="reject")return;}
-      // The controller-facing runtime owns actual turns. This shell only records
-      // that a harness invocation was accepted; callers should use the canonical
-      // AgentEngine facade installed by installUnifiedRuntime().
       agent.inject(`Unified Photon runtime is responsible for this turn. ${decision.plan?"Plan prepared.":"No plan was supplied."}`);
     }finally{agent._setIdle();}
   }
