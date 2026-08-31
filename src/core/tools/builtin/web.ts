@@ -20,7 +20,22 @@ export const webSearchTool: Tool = {
     if (!query) return fail("Provide a search query.");
     try {
       const signal = AbortSignal.any([ctx.signal, AbortSignal.timeout(15000)]);
-      const res = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, { method: "POST", signal, headers: { "User-Agent": "Photon VS Code extension" } });
+
+      // Weather is a high-value current-data case where search-engine HTML is
+      // unnecessarily fragile. Keep it behind the same native `web_search`
+      // tool, but use a public current-weather endpoint first so a valid query
+      // produces usable evidence for the model instead of an empty result set.
+      const weather = extractWeatherLocation(query);
+      if (weather) {
+        const direct = await fetchCurrentWeather(weather, signal);
+        if (direct) return ok(clamp(direct, outputBudget(ctx)));
+      }
+
+      const res = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
+        method: "GET",
+        signal,
+        headers: { "User-Agent": "Photon VS Code extension" },
+      });
       if (!res.ok) return fail(`Search failed with status ${res.status}.`);
       const html = await res.text();
       const results = parseDuckDuckGo(html).slice(0, ctx.capability === "max" ? 8 : 5);
@@ -73,6 +88,36 @@ export const webFetchTool: Tool = {
     }
   },
 };
+
+function extractWeatherLocation(query:string):string|undefined{
+  const m=query.match(/\b(?:weather|forecast|temperature)\b[\s\S]*?\b(?:in|of|for|at)\s+(.+?)\s*$/i);
+  if(!m)return undefined;
+  const cleaned=m[1]
+    .replace(/\b(right now|right away|today|tonight|tomorrow|this week|currently|now)\b[\s,.-]*$/i,"")
+    .trim()
+    .replace(/[?.!,]+$/g,"");
+  return cleaned.length>=2?cleaned:undefined;
+}
+
+async function fetchCurrentWeather(location:string, signal:AbortSignal):Promise<string|undefined>{
+  try{
+    const url=`https://wttr.in/${encodeURIComponent(location)}?format=j1`;
+    const res=await fetch(url,{signal,headers:{"User-Agent":"Photon VS Code extension"}});
+    if(!res.ok)return undefined;
+    const json=await res.json() as {
+      current_condition?:Array<{temp_C?:string;FeelsLikeC?:string;humidity?:string;weatherDesc?:Array<{value?:string}>;windspeedKmph?:string;uvIndex?:string}>;
+      nearest_area?:Array<{areaName?:Array<{value?:string}>;region?:Array<{value?:string}>;country?:Array<{value?:string}>}>;
+    };
+    const cur=json.current_condition?.[0];
+    if(!cur)return undefined;
+    const area=json.nearest_area?.[0];
+    const place=area?.areaName?.[0]?.value??location;
+    const region=area?.region?.[0]?.value;
+    const country=area?.country?.[0]?.value;
+    const bits=[`${cur.weatherDesc?.[0]?.value??"Current conditions"}.`,cur.temp_C?`Temperature: ${cur.temp_C}°C.`:"",cur.FeelsLikeC?`Feels like: ${cur.FeelsLikeC}°C.`:"",cur.humidity?`Humidity: ${cur.humidity}%.`:"",cur.windspeedKmph?`Wind: ${cur.windspeedKmph} km/h.`:"",cur.uvIndex?`UV index: ${cur.uvIndex}.`:""] .filter(Boolean);
+    return `Current weather for ${[place,region,country].filter(Boolean).join(", ")}: ${bits.join(" ")}`;
+  }catch{return undefined;}
+}
 
 function isPublicUrl(raw:string):boolean{
   let u:URL;try{u=new URL(raw);}catch{return false;}
