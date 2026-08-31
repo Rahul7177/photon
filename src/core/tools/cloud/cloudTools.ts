@@ -8,6 +8,7 @@ import { codeOutlineTool } from "../builtin/search";
 import { listDirTool } from "../builtin/files";
 import { searchCodeTool } from "../builtin/search";
 import { readFileTool } from "../builtin/files";
+import { webSearchTool, webFetchTool } from "../builtin/web";
 import { resolveInWorkspace } from "../paths";
 import { clamp, fail, ok, outputBudget, type Tool } from "../types";
 
@@ -16,10 +17,7 @@ import { clamp, fail, ok, outputBudget, type Tool } from "../types";
  *
  * Deliberately separate from the local (block-protocol) tools: names and shapes
  * follow the conventions capable models already know from agentic coding tools
- * (Cline & peers) — `write_to_file`, `replace_in_file`, `execute_command`,
- * `attempt_completion` — so frontier models operate in their native idiom
- * instead of Photon's small-model scaffolding. Execution reuses the hardened
- * builtin implementations wherever the semantics match.
+ * while reusing Photon's hardened public-web search/fetch implementations.
  *
  * `attempt_completion` and `ask_followup_question` are intercepted by the
  * engine before execution: they control turn lifecycle, not the workspace.
@@ -131,31 +129,22 @@ export const cloudExecuteCommand: Tool = {
     if (!command) return fail("Provide a command.");
     if (!ctx.workspaceRoot) return fail("No workspace folder is open.");
     const requested = Number(args.timeout_ms);
-    const timeoutMs =
-      Number.isFinite(requested) && requested > 0
-        ? Math.min(Math.floor(requested), 600_000)
-        : COMMAND_TIMEOUT_MS;
+    const timeoutMs = Number.isFinite(requested) && requested > 0 ? Math.min(Math.floor(requested), 600_000) : COMMAND_TIMEOUT_MS;
     const approved = await ctx.requestApproval(mkCall("execute_command", args));
     if (!approved) return fail("User declined to run the command.");
     ctx.log(`$ ${command}`);
     return new Promise((resolve) => {
       let child: ReturnType<typeof exec> | undefined;
       const onAbort = () => child?.kill();
-      child = exec(
-        command,
-        { cwd: ctx.workspaceRoot, timeout: timeoutMs, maxBuffer: COMMAND_MAX_BUFFER, windowsHide: true },
-        (error, stdout, stderr) => {
-          ctx.signal.removeEventListener("abort", onAbort);
-          const out = [stdout, stderr].filter(Boolean).join("\n").trim();
-          if (ctx.signal.aborted) return resolve(fail("Command cancelled."));
-          const code = error ? ((error as unknown as { code?: number }).code ?? 1) : 0;
-          const header = `Exit code ${code}.`;
-          if (code !== 0) {
-            return resolve(fail(`${header}\n${clamp(out || error?.message || "(no output)", outputBudget(ctx))}`));
-          }
-          resolve(ok(`${header}\n${clamp(out || "(no output)", outputBudget(ctx))}`));
-        }
-      );
+      child = exec(command, { cwd: ctx.workspaceRoot, timeout: timeoutMs, maxBuffer: COMMAND_MAX_BUFFER, windowsHide: true }, (error, stdout, stderr) => {
+        ctx.signal.removeEventListener("abort", onAbort);
+        const out = [stdout, stderr].filter(Boolean).join("\n").trim();
+        if (ctx.signal.aborted) return resolve(fail("Command cancelled."));
+        const code = error ? ((error as unknown as { code?: number }).code ?? 1) : 0;
+        const header = `Exit code ${code}.`;
+        if (code !== 0) return resolve(fail(`${header}\n${clamp(out || error?.message || "(no output)", outputBudget(ctx))}`));
+        resolve(ok(`${header}\n${clamp(out || "(no output)", outputBudget(ctx))}`));
+      });
       ctx.signal.addEventListener("abort", onAbort, { once: true });
     });
   },
@@ -197,9 +186,7 @@ export const cloudListDefinitions: Tool = {
   spec: {
     name: "list_code_definition_names",
     summary: "List the top-level code definitions (functions, classes, types) defined in a source file.",
-    params: [
-      { name: "path", type: "string", required: true, description: "File path relative to the workspace root." },
-    ],
+    params: [{ name: "path", type: "string", required: true, description: "File path relative to the workspace root." }],
     sideEffecting: false,
     priority: 7,
     tags: ["fs", "read", "navigate"],
@@ -207,40 +194,35 @@ export const cloudListDefinitions: Tool = {
   execute: codeOutlineTool.execute,
 };
 
-/** Lifecycle tools — intercepted by CloudEngine, never actually executed. */
+/** Public web search available to cloud models using the same hardened implementation as local Photon. */
+export const cloudWebSearch: Tool = { ...webSearchTool, spec: { ...webSearchTool.spec, priority: 8, minTier: undefined } };
+/** Public HTTPS fetch available to cloud models using the same hardened implementation as local Photon. */
+export const cloudWebFetch: Tool = { ...webFetchTool, spec: { ...webFetchTool.spec, priority: 9, minTier: undefined } };
+
 export const cloudAskFollowup: Tool = {
   spec: {
     name: "ask_followup_question",
     summary: "Ask the user a question when you need information to proceed.",
-    params: [
-      { name: "question", type: "string", required: true, description: "The question to ask." },
-    ],
+    params: [{ name: "question", type: "string", required: true, description: "The question to ask." }],
     sideEffecting: false,
-    priority: 8,
+    priority: 10,
     tags: ["lifecycle"],
   },
-  async execute(args) {
-    return ok((args.question as string) ?? "");
-  },
+  async execute(args) { return ok((args.question as string) ?? ""); },
 };
 
 export const cloudAttemptCompletion: Tool = {
   spec: {
     name: "attempt_completion",
     summary: "Present the final result once the task is fully complete. This ends the task.",
-    params: [
-      { name: "result", type: "string", required: true, description: "The final summary of what was done, in Markdown." },
-    ],
+    params: [{ name: "result", type: "string", required: true, description: "The final summary of what was done, in Markdown." }],
     sideEffecting: false,
     priority: 0,
     tags: ["lifecycle"],
   },
-  async execute(args) {
-    return ok((args.result as string) ?? "");
-  },
+  async execute(args) { return ok((args.result as string) ?? ""); },
 };
 
-/** The full cloud tool set, in presentation order. */
 export function cloudTools(): Tool[] {
   return [
     cloudReadFile,
@@ -250,6 +232,8 @@ export function cloudTools(): Tool[] {
     cloudSearchFiles,
     cloudListFiles,
     cloudListDefinitions,
+    cloudWebSearch,
+    cloudWebFetch,
     cloudAskFollowup,
     cloudAttemptCompletion,
   ];
