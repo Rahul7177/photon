@@ -1,8 +1,18 @@
 import { useState, useMemo } from "react";
+import type { ThinkingSetting } from "../../../src/shared/types";
 import type { AppState, Actions } from "../state/store";
 import { ClockIcon, GearIcon, LightbulbIcon, RefreshIcon, PlusIcon } from "./Icons";
 import { SessionHistory } from "./SessionHistory";
 import { TransparencyPanel } from "./TransparencyPanel";
+
+const THINKING_OPTIONS: Array<{ value: ThinkingSetting; short: string; label: string }> = [
+  { value: "auto", short: "A", label: "Auto" },
+  { value: "off", short: "0", label: "Off" },
+  { value: "low", short: "L", label: "Low" },
+  { value: "medium", short: "M", label: "Medium" },
+  { value: "high", short: "H", label: "High" },
+  { value: "xtrahigh", short: "XH", label: "Extra High" },
+];
 
 export function Header({
   state,
@@ -15,18 +25,37 @@ export function Header({
 }) {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
-
   const sessionTitle = useMemo(() => {
     if (!state.activeSessionId) return "";
     const s = state.sessions.find((x) => x.id === state.activeSessionId);
     return s?.title ?? "";
   }, [state.activeSessionId, state.sessions]);
+  const thinking = state.config.thinkingLevel;
+  const thinkingLabel = THINKING_OPTIONS.find((x) => x.value === thinking)?.label ?? "Auto";
 
   return (
     <header className="header">
       <div className="header-row">
         <span className="session-title">{sessionTitle || "New Chat"}</span>
         <div className="header-actions">
+          <div className="thinking-level-group" role="group" aria-label={`Reasoning level: ${thinkingLabel}`}>
+            {THINKING_OPTIONS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                className={`thinking-level-btn ${thinking === option.value ? "active" : ""}`}
+                title={option.label}
+                aria-label={`Reasoning ${option.label}`}
+                aria-pressed={thinking === option.value}
+                onClick={() => actions.setThinkingSetting(option.value)}
+              >
+                {option.short}
+              </button>
+            ))}
+          </div>
+          <span className="thinking-level-current" title={`Current reasoning level: ${thinkingLabel}`}>
+            {thinkingLabel}
+          </span>
           <button
             className={`icon-btn ${state.config.autoSelectModel ? "active" : ""}`}
             title="Why this model? (Auto Mode)"
@@ -53,5 +82,3 @@ export function Header({
     </header>
   );
 }
-
-
