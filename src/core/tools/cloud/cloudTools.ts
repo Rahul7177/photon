@@ -31,6 +31,14 @@ export function setCloudToolPolicy(policy: CloudToolPolicy): void {
   activeCloudToolPolicy = policy;
 }
 
+interface WebSearchState {
+  calls: number;
+  cache: Map<string, string>;
+}
+
+const WEB_SEARCH_STATE = new WeakMap<AbortSignal, WebSearchState>();
+const MAX_WEB_SEARCH_CALLS = 3;
+
 const COMMAND_TIMEOUT_MS = 180_000;
 const COMMAND_MAX_BUFFER = 1024 * 1024;
 
@@ -202,8 +210,48 @@ export const cloudListDefinitions: Tool = {
   execute: codeOutlineTool.execute,
 };
 
-/** Public web search available to cloud models using the same hardened implementation as local Photon. */
-export const cloudWebSearch: Tool = { ...webSearchTool, spec: { ...webSearchTool.spec, priority: 8, minTier: undefined } };
+/** Public web search for cloud models, with evidence enrichment and loop protection. */
+export const cloudWebSearch: Tool = {
+  ...webSearchTool,
+  spec: { ...webSearchTool.spec, priority: 8, minTier: undefined },
+  async execute(args, ctx) {
+    const query = (args.query as string)?.trim();
+    if (!query) return fail("Provide a search query.");
+    const state = getWebSearchState(ctx.signal);
+    const key = normalizeSearchQuery(query);
+    const cached = state.cache.get(key);
+    if (cached) return ok(`${cached}\n\n[Photon reused the existing web evidence for this repeated query.]`);
+    if (state.calls >= MAX_WEB_SEARCH_CALLS) {
+      return ok(
+        `${[...state.cache.values()][0] ?? "No usable web evidence has been collected."}\n\n[Photon stopped repeated web searches for this turn. Use web_fetch on a relevant source above or answer from the evidence already collected.]`
+      );
+    }
+    state.calls++;
+    const result = await webSearchTool.execute(args, ctx);
+    if (!result.ok) return result;
+
+    let output = result.output;
+    if (isFreshOrExactQuery(query)) {
+      const urls = [...output.matchAll(/https:\/\/[^\s)]+/gi)]
+        .map((m) => m[0].replace(/[.,;]+$/, ""))
+        .filter((url, i, all) => all.indexOf(url) === i)
+        .slice(0, 1);
+      if (urls[0]) {
+        const fetched = await webFetchTool.execute({ url: urls[0] }, ctx);
+        if (fetched.ok) {
+          output += `\n\n--- PRIMARY SOURCE EVIDENCE ---\n${fetched.output}\n--- END PRIMARY SOURCE EVIDENCE ---`;
+        } else {
+          output += "\n\nIMPORTANT: This is a search lead only. For an exact/current value, fetch one of the returned URLs before answering.";
+        }
+      }
+    }
+
+    output = clamp(output, outputBudget(ctx));
+    state.cache.set(key, output);
+    return ok(output);
+  },
+};
+
 /** Public HTTPS fetch available to cloud models using the same hardened implementation as local Photon. */
 export const cloudWebFetch: Tool = { ...webFetchTool, spec: { ...webFetchTool.spec, priority: 9, minTier: undefined } };
 
@@ -247,6 +295,23 @@ export function cloudTools(): Tool[] {
     cloudWebFetch,
     ...lifecycle,
   ];
+}
+
+function getWebSearchState(signal: AbortSignal): WebSearchState {
+  let state = WEB_SEARCH_STATE.get(signal);
+  if (!state) {
+    state = { calls: 0, cache: new Map<string, string>() };
+    WEB_SEARCH_STATE.set(signal, state);
+  }
+  return state;
+}
+
+function normalizeSearchQuery(query: string): string {
+  return query.toLowerCase().replace(/\s+/g, " ").replace(/[?!.:,;]+$/g, "").trim();
+}
+
+function isFreshOrExactQuery(query: string): boolean {
+  return /\b(today|now|right now|current|currently|latest|live|recent|as of|price|prices|weather|temperature|forecast|news|market|stock|stocks|gold|silver|bitcoin|crypto|exchange rate|rate|version|release|traffic)\b/i.test(query);
 }
 
 function mkCall(name: string, args: Record<string, unknown>): ToolCall {
