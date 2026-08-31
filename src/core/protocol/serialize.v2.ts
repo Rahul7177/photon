@@ -20,8 +20,14 @@ export function renderToolInstructionsV2(tools: ToolSpec[], plan: AdaptivePlan):
 }
 
 function renderSpec(t: ToolSpec, level: IntelligenceLevel): string {
+  if (level === "low") {
+    // For low-end models: show each parameter on its own line with type +
+    // whether required, plus a concrete example so the model can pattern-match.
+    const params = t.params.map(p => `  ${p.name}: ${p.type}${p.required ? " (required)" : " (optional)"} — ${p.description}`).join("\n");
+    const example = t.example ? `\nExample:\n${t.example}` : "";
+    return `- ${t.name}: ${t.summary}\n${params}${example}`;
+  }
   const args = t.params.map((p) => `${p.name}${p.required ? "" : "?"}:${p.type}`).join(", ");
-  if (level === "low") return `- ${t.name}(${args}) — ${t.summary}`;
   return `- ${t.name}: ${t.summary}${t.risk ? ` [risk=${t.risk}]` : ""}\n${t.params.map(p => `  ${p.name}: ${p.type}${p.required ? " required" : " optional"} — ${p.description}`).join("\n")}`;
 }
 

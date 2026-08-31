@@ -21,7 +21,10 @@ export function buildSystemPrompt(input: SystemPromptInput): string {
   if (workspaceName) core.push(`Workspace: ${workspaceName}.`);
   core.push(modePrompt(mode, level, Boolean(toolInstructions), plan));
   if (toolInstructions) core.push(toolInstructions);
-  if (mode !== "chat" && level !== "low") core.push(multiFileGuidance(level));
+  // Provide workflow guidance to ALL intelligence levels, including low.
+  // Low-end models need this even more than capable ones — it scaffolds
+  // the read→edit→verify pattern they would otherwise miss.
+  if (mode !== "chat") core.push(multiFileGuidance(level));
   core.push(formattingRules(level));
 
   const budgetTokens = Math.max(256, Math.floor(plan.numCtx * BUDGET_FRACTION[level]));
@@ -75,6 +78,16 @@ function modePrompt(mode: Mode, level: IntelligenceLevel, hasTools: boolean, pla
 }
 
 function multiFileGuidance(level: IntelligenceLevel): string {
+  if (level === "low") return [
+    "Tool-use guide (follow exactly):",
+    "1. Use list_dir or search_code to locate files — never guess paths.",
+    "2. Use read_file to open a file before editing it.",
+    "3. Use write_to_file to create or replace a file's contents.",
+    "4. Use run_command for shell commands (install, build, test).",
+    "5. After each tool call, read the result. If it fails, fix the error and retry.",
+    "6. When the task is done, stop calling tools and give a short summary.",
+    "Call ONE tool at a time. Wait for its result before the next call.",
+  ].join("\n");
   if (level === "medium") return [
     "Working across files:",
     "- Locate before you guess: find_files for file names, search_code for content.",

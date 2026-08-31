@@ -99,7 +99,7 @@ export function installUnifiedRuntime():void{
 
 function classifyCloudToolPolicy(mode:unknown,text:string):CloudToolPolicy{
   const t=text.trim().toLowerCase();
-  if(!t)return mode==="chat"?"none":"all";
+  if(!t) return "all";
 
   // Deterministic guard: greetings, thanks and other social acknowledgements
   // must never make a cloud model inspect the workspace.
@@ -107,10 +107,14 @@ function classifyCloudToolPolicy(mode:unknown,text:string):CloudToolPolicy{
     return "none";
   }
 
-  const workspaceIntent=/\b(file|files|folder|directory|workspace|repo|repository|codebase|code|class|function|symbol|bug|error|stack trace|edit|modify|change|implement|refactor|debug|fix|write|read|search files|list files|build|test|compile|lint|run command)\b/i.test(t);
-  const externalIntent=/\b(weather|temperature|forecast|news|current|today|tonight|latest|live|recent|price|prices|stock|stocks|market|release|version|time|date|traffic)\b/i.test(t);
+  // Agent/plan modes always need the full tool set.
+  if(mode==="agent"||mode==="plan") return "all";
 
-  if(externalIntent && !workspaceIntent)return "web";
-  if(mode==="chat" && !workspaceIntent)return "none";
+  const workspaceIntent=/\b(file|files|folder|directory|workspace|repo|repository|codebase|code|class|function|symbol|bug|error|stack trace|edit|modify|change|implement|refactor|debug|fix|write|read|search files|list files|build|test|compile|lint|run command|search|find|show|open|list|get|create|add|remove|delete|rename|move|copy|update|set|configure|install|uninstall|run|start|stop|restart|check|test|debug|format|lint|deploy|push|pull|commit|merge|branch|clone|init|setup)\b/i.test(t);
+  const externalIntent=/\b(weather|temperature|forecast|news|current|today|tonight|latest|live|recent|price|prices|stock|stocks|market|release|version|time|date|traffic|search|lookup|find out|what is|what are|how to|who is|where is)\b/i.test(t);
+
+  if(externalIntent && !workspaceIntent) return "web";
+  // Chat mode: still pass tools so the model can search/fetch when needed.
+  // Only deny tools for purely social/greeting messages (handled above).
   return "all";
 }
