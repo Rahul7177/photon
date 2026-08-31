@@ -17,11 +17,17 @@ export function TransparencyPanel({
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    const onDoc = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
-    };
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
+    // Delay adding the listener so the mousedown that *opened* this panel
+    // doesn't immediately trigger the outside-click close.
+    const timer = setTimeout(() => {
+      const onDoc = (e: MouseEvent) => {
+        if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+      };
+      document.addEventListener("mousedown", onDoc);
+      cleanupRef.current = () => document.removeEventListener("mousedown", onDoc);
+    }, 0);
+    const cleanupRef = { current: () => clearTimeout(timer) };
+    return () => { clearTimeout(timer); cleanupRef.current(); };
   }, [onClose]);
 
   const d = state.decision;

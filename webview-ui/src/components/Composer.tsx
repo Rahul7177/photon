@@ -1,9 +1,83 @@
 import { useRef, useState } from "react";
-import type { Attachment } from "../../../src/shared/types";
+import type { Attachment, Mode } from "../../../src/shared/types";
 import type { AppState, Actions } from "../state/store";
 import { ContextMeter } from "./ContextMeter";
 import { CapabilityBadges } from "./CapabilityBadges";
-import { readFileToAttachment, formatBytes } from "../attachments";
+import { readFileToAttachment, readClipboardBlobToAttachment, formatBytes } from "../attachments";
+
+const MODES: { id: Mode; label: string; hint: string }[] = [
+  { id: "chat", label: "Chat", hint: "Talk & get code, no tools" },
+  { id: "plan", label: "Plan", hint: "Read-only investigation → step-by-step plan" },
+  { id: "agent", label: "Agent", hint: "Uses tools to edit files and run commands" },
+];
+
+// Sentinel value for the "Auto" model-picker option.
+const AUTO = "__auto__";
+
+function benchTps(results: { model: string; tokensPerSec: number }[], model: string): number | undefined {
+  const r = results.find((b) => b.model === model);
+  return r ? Math.round(r.tokensPerSec) : undefined;
+}
+
+// Custom dropdown component that opens upwards
+function ModeDropdown({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => void }) {
+  const [open, setOpen] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const currentMode = MODES.find((m) => m.id === mode) || MODES[0];
+
+  const handleClickOutside = (e: MouseEvent) => {
+    if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
+      setOpen(false);
+    }
+  };
+
+  // Close dropdown when clicking outside
+  if (typeof window !== "undefined") {
+    // Use a ref to store the handler so we can remove it
+    const handlerRef = useRef(handleClickOutside);
+    handlerRef.current = handleClickOutside;
+
+    // We'll add the event listener in a useEffect, but since this is a simple component,
+    // we'll use a different approach - attach to document on mount
+  }
+
+  // Simple approach: use a native select but style it to look like a dropdown
+  // For "opens upwards", we'll use a custom implementation
+  return (
+    <div className="mode-dropdown" ref={wrapperRef}>
+      <button
+        className="mode-dropdown-trigger"
+        onClick={() => setOpen(!open)}
+        title={currentMode.hint}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+      >
+        <span>{currentMode.label}</span>
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M4 6l4 4 4-4" />
+        </svg>
+      </button>
+      {open && (
+        <ul className="mode-dropdown-menu" role="listbox">
+          {MODES.map((m) => (
+            <li key={m.id} role="option" aria-selected={mode === m.id}>
+              <button
+                className={`mode-dropdown-item${mode === m.id ? " active" : ""}`}
+                onClick={() => {
+                  onChange(m.id);
+                  setOpen(false);
+                }}
+                title={m.hint}
+              >
+                {m.label}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 export function Composer({ state, actions }: { state: AppState; actions: Actions }) {
   const [text, setText] = useState("");
@@ -49,14 +123,42 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
 
   const onPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const items = Array.from(e.clipboardData.items);
-    const files = items
-      .filter((it) => it.kind === "file")
-      .map((it) => it.getAsFile())
-      .filter((f): f is File => !!f);
-    if (files.length) {
-      e.preventDefault();
-      await handleFiles(files);
+    const fileItems = items.filter((it) => it.kind === "file");
+
+    if (fileItems.length === 0) return; // no file content in clipboard — let default paste handle it
+
+    e.preventDefault();
+    setAttachError(null);
+    const next: Attachment[] = [];
+
+    for (const item of fileItems) {
+      let file = item.getAsFile();
+
+      // Phase 1.3: Firefox fallback — getAsFile() returns null for pasted
+      // images in some Firefox versions. Read the Blob directly via the
+      // clipboard item's type to construct a minimal File.
+      if (!file && item.type.startsWith("image/")) {
+        file = new File(
+          [new Blob([], { type: item.type })],
+          `clipboard-${Date.now()}.${item.type.split("/")[1] ?? "png"}`,
+          { type: item.type }
+        );
+      }
+
+      if (file) {
+        const { attachment, error } = await readFileToAttachment(file);
+        if (error) setAttachError(error);
+        else if (attachment) {
+          if (attachment.kind === "image" && !supportsVision) {
+            setAttachError(`${model?.name ?? "This model"} can't read images — attach text/code instead.`);
+            continue;
+          }
+          next.push(attachment);
+        }
+      }
     }
+
+    if (next.length) setAttachments((a) => [...a, ...next]);
   };
 
   const onDrop = async (e: React.DragEvent<HTMLDivElement>) => {
@@ -85,6 +187,73 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
   return (
     <div className="composer" onDrop={onDrop} onDragOver={onDragOver}>
       <ContextMeter usage={state.usage} plan={state.plan} stats={state.generationStats} compactBadgesModel={modelCaps} />
+
+      {/* Toolbar row: Local/Cloud toggle + Model selector */}
+      <div className="composer-toolbar">
+        <div className="iface-toggle" title="Local: Ollama/llama.cpp with adaptive tuning. Cloud: direct provider APIs.">
+          <button
+            className={state.config.interfaceMode === "local" ? "active" : ""}
+            onClick={() => actions.setInterfaceMode("local")}
+          >
+            Local
+          </button>
+          <button
+            className={state.config.interfaceMode === "cloud" ? "active cloud" : "cloud"}
+            onClick={() => actions.setInterfaceMode("cloud")}
+          >
+            ☁ Cloud
+          </button>
+        </div>
+        <div className="model-picker">
+          <select
+            value={state.config.autoSelectModel ? AUTO : state.selectedModel}
+            onChange={(e) => {
+              if (e.target.value === AUTO) actions.setAutoSelect(true);
+              else actions.setModel(e.target.value);
+            }}
+            disabled={state.models.length === 0}
+            title={
+              state.config.autoSelectModel
+                ? `Auto — Photon picks the model per request${state.selectedModel ? ` (last: ${state.selectedModel})` : ""}`
+                : state.selectedModel
+            }
+          >
+            {!state.ready && <option value="">Loading models…</option>}
+            {state.ready && state.models.length === 0 && <option value="">No models — check Local / Cloud</option>}
+            {state.ready && state.models.length > 0 && <option value={AUTO}>🤖 Auto</option>}
+            {state.models.map((m) => {
+              const tps = benchTps(state.benchResults, m.name);
+              const display = m.name.includes(":") ? m.name.split(":").slice(1).join(":") : m.name;
+              return (
+                <option key={m.name} value={m.name} title={m.name}>
+                  {display}
+                  {m.tier ? ` · ${m.tier}` : ""}
+                  {tps ? ` · ${tps} tok/s` : ""}
+                </option>
+              );
+            })}
+          </select>
+        </div>
+
+        {/* Thinking level selector — only for models that support it */}
+        {modelCaps?.thinking && (
+          <div className="thinking-level-group">
+            {(["off", "low", "medium", "high"] as const).map((lvl) => (
+              <button
+                key={lvl}
+                className={`thinking-level-btn${state.config.thinkingLevel === lvl ? " active" : ""}`}
+                title={`Thinking: ${lvl}`}
+                onClick={() => actions.setThinkingLevel(lvl)}
+              >
+                {lvl === "off" ? "⊘" : lvl === "low" ? "◎" : lvl === "medium" ? "◉" : "⊕"}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Inline capability badges — same row, wraps to icons when tight */}
+        {modelCaps && <CapabilityBadges model={modelCaps} compact />}
+      </div>
 
       {attachError && <div className="attach-error">{attachError}</div>}
 
@@ -122,8 +291,13 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
           onClick={() => fileRef.current?.click()}
           disabled={busy || !state.selectedModel}
         >
-          +
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M13.5 7.5l-5.8 5.8a3.5 3.5 0 01-5-5l5.8-5.8a2.3 2.3 0 013.3 3.3L6.1 11.5a1.2 1.2 0 01-1.7-1.7l5-5" />
+          </svg>
         </button>
+        <div className="input-mode-tabs" role="tablist">
+          <ModeDropdown mode={state.mode} onChange={(m) => actions.setMode(m)} />
+        </div>
         <textarea
           ref={taRef}
           rows={1}
@@ -156,5 +330,6 @@ function placeholder(state: AppState): string {
     return hint;
   }
   const verb = { chat: "Ask", plan: "Describe what to plan", agent: "Describe a task" }[state.mode];
-  return `${verb}… (${state.mode} mode)`;
+  const tTag = state.config.thinkingLevel !== "off" ? ` +${state.config.thinkingLevel}` : "";
+  return `${verb}… (${state.mode}${tTag} mode)`;
 }

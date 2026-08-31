@@ -77,6 +77,8 @@ export interface PhotonConfig {
   /** Which engine stack is active: local (Ollama + adaptive) or cloud
    *  (direct native tool-calling, no adaptive limits, no Ollama models). */
   interfaceMode: "local" | "cloud";
+  /** Extended thinking level for supported models: off | low | medium | high. */
+  thinkingLevel: "off" | "low" | "medium" | "high";
 }
 
 export interface ProviderStatus {
@@ -157,4 +159,6 @@ export type ViewMessage =
   | { type: "removeCustomProvider"; payload: { id: string } }
   | { type: "openDiagnostics" }
   | { type: "setPerModelConfig"; payload: { model: string; config: import("./types").PerModelConfig } }
-  | { type: "removePerModelConfig"; payload: { model: string } };
+  | { type: "removePerModelConfig"; payload: { model: string } }
+  | { type: "setThinkingEnabled"; payload: { enabled: boolean } }
+  | { type: "setThinkingLevel"; payload: { level: "off" | "low" | "medium" | "high" } };

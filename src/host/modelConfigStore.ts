@@ -25,10 +25,31 @@ export class ModelConfigStore {
     const next: PerModelConfig = { ...cur, ...patch };
     // Deep-merge llamacpp sub-object
     if (patch.llamacpp && cur.llamacpp) next.llamacpp = { ...cur.llamacpp, ...patch.llamacpp };
+    if (patch.sampling && cur.sampling) next.sampling = { ...cur.sampling, ...patch.sampling };
     if (!next.numCtx) delete (next as any).numCtx;
     // Prune empty llamacpp
     if (next.llamacpp && Object.keys(next.llamacpp).length === 0) delete (next as any).llamacpp;
+    if (next.sampling && Object.keys(next.sampling).length === 0) delete (next as any).sampling;
+    if (next.sampling) {
+      if (next.sampling.temp === undefined) delete (next.sampling as any).temp;
+      if (next.sampling.topP === undefined) delete (next.sampling as any).topP;
+      if (next.sampling.seed === undefined) delete (next.sampling as any).seed;
+      if (Object.keys(next.sampling).length === 0) delete (next as any).sampling;
+    }
     await this.set(model, next);
+  }
+
+  /** Effective config for a model, with file-wins merging (Phase 1.4). */
+  effective(model: string, fileConfigs?: Record<string, PerModelConfig>): PerModelConfig | undefined {
+    const stored = this.get(model);
+    const file = fileConfigs?.[model];
+    if (!file) return stored;
+    if (!stored) return file;
+    // File wins: shallow merge, with deep merge for sub-objects
+    const merged: PerModelConfig = { ...stored, ...file };
+    if (stored.llamacpp || file.llamacpp) merged.llamacpp = { ...(stored.llamacpp ?? {}), ...(file.llamacpp ?? {}) };
+    if (stored.sampling || file.sampling) merged.sampling = { ...(stored.sampling ?? {}), ...(file.sampling ?? {}) };
+    return merged;
   }
 
   async remove(model: string): Promise<void> {

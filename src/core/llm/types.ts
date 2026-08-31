@@ -12,6 +12,9 @@ export interface LLMToolCall {
    *  engines assign one when the provider doesn't (e.g. Gemini). */
   id?: string;
   function: { name: string; arguments: Record<string, unknown> };
+  /** Gemini reasoning models require this signature on function call parts
+   *  when echoing them back. Other providers ignore it. */
+  thoughtSignature?: string;
 }
 
 export interface LLMMessage {
@@ -33,6 +36,8 @@ export interface LLMChatOptions {
   num_predict?: number;
   stop?: string[];
   seed?: number;
+  /** Thinking / reasoning budget level for models that support it. */
+  thinkingLevel?: "off" | "low" | "medium" | "high";
 }
 
 export interface LLMChatRequest {

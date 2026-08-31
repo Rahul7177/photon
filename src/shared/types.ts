@@ -50,6 +50,8 @@ export interface ToolCall {
   error?: string;
   /** Whether this call mutates the workspace / runs commands. */
   sideEffecting?: boolean;
+  /** Gemini reasoning models require this signature on function call parts. */
+  thoughtSignature?: string;
 }
 
 /** A model as reported by a provider, enriched with Photon's profile. */
@@ -118,6 +120,12 @@ export interface PerModelConfig {
   numCtx?: number;
   /** llama.cpp-specific flags — only meaningful for provider === "llamacpp" */
   llamacpp?: LlamaCppSettings;
+  /** Sampling overrides — per-model temperature / top_p / seed. */
+  sampling?: {
+    temp?: number;
+    topP?: number;
+    seed?: number;
+  };
   /** Human note, e.g. "8B Q8 for coding" */
   note?: string;
 }

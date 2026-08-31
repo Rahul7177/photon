@@ -134,7 +134,10 @@ export class GeminiProvider implements LLMProvider {
         const parts: Record<string, unknown>[] = [];
         if (m.content) parts.push({ text: m.content });
         for (const tc of m.tool_calls) {
-          parts.push({ functionCall: { name: tc.function.name, args: tc.function.arguments ?? {} } });
+          const fnPart: Record<string, unknown> = { functionCall: { name: tc.function.name, args: tc.function.arguments ?? {} } };
+          // Gemini reasoning models require thoughtSignature to be echoed back.
+          if (tc.thoughtSignature) fnPart.thoughtSignature = tc.thoughtSignature;
+          parts.push(fnPart);
         }
         contents.push({ role: "model", parts });
         continue;
@@ -191,7 +194,7 @@ export class GeminiProvider implements LLMProvider {
     for await (const payload of streamSse(res.body, signal)) {
       const json = tryJson<{
         candidates?: {
-          content?: { parts?: { text?: string; functionCall?: { name: string; args?: Record<string, unknown> } }[] };
+          content?: { parts?: { text?: string; functionCall?: { name: string; args?: Record<string, unknown> }; thoughtSignature?: string }[] };
           finishReason?: string;
         }[];
       }>(payload);
@@ -199,13 +202,15 @@ export class GeminiProvider implements LLMProvider {
       const cand = json.candidates?.[0];
       const parts = cand?.content?.parts ?? [];
       let text = "";
-      const toolCalls: { function: { name: string; arguments: Record<string, unknown> } }[] = [];
+      const toolCalls: { function: { name: string; arguments: Record<string, unknown> }; thoughtSignature?: string }[] = [];
       for (const p of parts) {
         if (p.text) text += p.text;
         if (p.functionCall) {
           toolCalls.push({
             function: { name: p.functionCall.name, arguments: p.functionCall.args ?? {} },
-          });
+            // Preserve thoughtSignature for Gemini reasoning models.
+            ...(p.thoughtSignature ? { thoughtSignature: p.thoughtSignature } : {}),
+          } as any);
         }
       }
       if (text) yield { message: { role: "assistant", content: text }, done: false };

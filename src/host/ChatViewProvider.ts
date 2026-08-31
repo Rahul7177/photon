@@ -59,8 +59,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const csp = [
       `default-src 'none'`,
       `img-src ${webview.cspSource} https: data:`,
-      `style-src ${webview.cspSource} 'unsafe-inline'`,
-      `font-src ${webview.cspSource}`,
+      `style-src ${webview.cspSource} 'unsafe-inline' https://fonts.googleapis.com`,
+      `font-src ${webview.cspSource} https://fonts.gstatic.com`,
+      `connect-src ${webview.cspSource} https://fonts.googleapis.com https://fonts.gstatic.com`,
       `script-src 'nonce-${nonce}'`,
     ].join("; ");
 
@@ -71,6 +72,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <meta http-equiv="Content-Security-Policy" content="${csp}" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="stylesheet" href="${styleUri}" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bungee+Spice&display=swap" rel="stylesheet" />
   <title>Photon</title>
 </head>
 <body>

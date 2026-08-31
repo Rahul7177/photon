@@ -74,6 +74,7 @@ const initialConfig: PhotonConfig = {
   embeddingModel: "nomic-embed-text",
   providers: [],
   interfaceMode: "local",
+  thinkingLevel: "off" as "off" | "low" | "medium" | "high",
 };
 
 const initialIndex: IndexStatus = { phase: "idle", filesIndexed: 0, chunks: 0, pending: 0 };
@@ -115,6 +116,7 @@ type LocalAction =
   | { type: "_clearApproval" }
   | { type: "_clearError" }
   | { type: "_setMode"; mode: Mode }
+  | { type: "_setModel"; model: string }
   | { type: "_fetchProviderModels"; id: string }
   | { type: "_testModel"; providerId: string; model: ModelInfo };
 type Action = HostMessage | LocalAction;
@@ -127,6 +129,8 @@ function reducer(state: AppState, msg: Action): AppState {
       return { ...state, error: null };
     case "_setMode":
       return { ...state, mode: msg.mode };
+    case "_setModel":
+      return { ...state, selectedModel: msg.model, autoSelectModel: false };
     case "_fetchProviderModels":
       if (!("id" in msg)) return state; // type guard
       return {
@@ -176,7 +180,9 @@ function reducer(state: AppState, msg: Action): AppState {
         messages: msg.payload.messages,
         mode: msg.payload.mode,
         activeSessionId: msg.payload.id,
-        error: null,
+        // Only clear error if there isn't one — an error message from the
+        // emitter may have arrived just before this sessionLoaded cleanup.
+        error: state.error && state.status === "idle" ? state.error : null,
         usage: null,
         generationStats: null,
       };
@@ -326,7 +332,10 @@ export function useAppState() {
     send: (text: string, attachments?: Attachment[]) =>
       post({ type: "sendPrompt", payload: { text, attachments } }),
     cancel: () => post({ type: "cancel" }),
-    setModel: (model: string) => post({ type: "setModel", payload: { model } }),
+    setModel: (model: string) => {
+      dispatch({ type: "_setModel", model } as unknown as Action);
+      post({ type: "setModel", payload: { model } });
+    },
     setMode: (mode: Mode) => {
       // Optimistically switch the UI so the tab reacts instantly, even offline.
       dispatch({ type: "_setMode", mode });
@@ -352,6 +361,8 @@ export function useAppState() {
     setInterfaceMode: (mode: "local" | "cloud") =>
       post({ type: "setInterfaceMode", payload: { mode } }),
     setAutoSelect: (enabled: boolean) => post({ type: "setAutoSelect", payload: { enabled } }),
+    setThinkingEnabled: (enabled: boolean) => post({ type: "setThinkingEnabled", payload: { enabled } }),
+    setThinkingLevel: (level: "off" | "low" | "medium" | "high") => post({ type: "setThinkingLevel", payload: { level } }),
     pinModel: (model: string) => post({ type: "pinModel", payload: { model } }),
     runBench: (model?: string) => post({ type: "runBench", payload: { model } }),
     setIndexingEnabled: (enabled: boolean) =>

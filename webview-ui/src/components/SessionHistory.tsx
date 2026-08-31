@@ -17,11 +17,18 @@ export function SessionHistory({
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const onDocClick = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
-    };
-    document.addEventListener("mousedown", onDocClick);
-    return () => document.removeEventListener("mousedown", onDocClick);
+    // Delay adding the listener so the mousedown that *opened* this panel
+    // doesn't immediately trigger the outside-click close.
+    const timer = setTimeout(() => {
+      const onDocClick = (e: MouseEvent) => {
+        if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+      };
+      document.addEventListener("mousedown", onDocClick);
+      // store cleanup on the timer so the return cleanup also removes it
+      timerRef.current = () => document.removeEventListener("mousedown", onDocClick);
+    }, 0);
+    const timerRef = { current: () => clearTimeout(timer) };
+    return () => { clearTimeout(timer); timerRef.current(); };
   }, [onClose]);
 
   return (

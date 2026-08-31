@@ -76,6 +76,8 @@ interface PendingCall {
   id: string;
   name: string;
   args: Record<string, unknown>;
+  /** Gemini reasoning models require this on functionCall parts. */
+  thoughtSignature?: string;
 }
 
 /** True when a generation ended because it hit an output-token cap. */
@@ -108,7 +110,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
   for (let step = 0; step < MAX_STEPS; step++) {
     if (signal.aborted) return;
 
-    const messages = fitToWindow(system, history, contextWindow);
+    const messages = fitToWindow(system, history, contextWindow, model);
     // Emit usage for the context meter.
     const historyTokens = messages.slice(1).reduce((sum, m) => sum + estimateTokens(m.content) + 8, 0);
     emitter.onUsage({ used: systemTokens + historyTokens, window: contextWindow, breakdown: [
@@ -152,6 +154,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
             id: tc.id ?? randomUUID(),
             name: tc.function.name,
             args: tc.function.arguments ?? {},
+            ...(tc.thoughtSignature ? { thoughtSignature: tc.thoughtSignature } : {}),
           });
         }
         if (chunk.done_reason) doneReason = chunk.done_reason;
@@ -166,8 +169,8 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
     }
     emitStats(true);
     if (signal.aborted) {
-      emitter.onDone(assistantId);
       emitter.onGenerationStats(null);
+      emitter.onDone(assistantId);
       return;
     }
     if (streamError) {
@@ -179,6 +182,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
         step--;
         continue;
       }
+      emitter.onGenerationStats(null);
       emitter.onError(`Model error: ${(streamError as Error).message}`);
       emitter.onDone(assistantId);
       return;
@@ -200,6 +204,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
       emitter.onError(
         "The model returned an empty response several times and stopped. Try a different model or try again later."
       );
+      emitter.onGenerationStats(null);
       return;
     }
     emptyStreak = 0;
@@ -238,6 +243,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
       tool_calls: calls.map((c) => ({
         id: c.id,
         function: { name: c.name, arguments: c.args },
+        ...(c.thoughtSignature ? { thoughtSignature: c.thoughtSignature } : {}),
       })),
     });
 
@@ -268,6 +274,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
         args: c.args,
         status: "proposed",
         sideEffecting: spec?.sideEffecting ?? false,
+        ...(c.thoughtSignature ? { thoughtSignature: c.thoughtSignature } : {}),
       };
       emitter.onToolCall(assistantId, call);
 
@@ -304,21 +311,25 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
     }
 
     if (completion !== null) {
+      emitter.onGenerationStats(null);
       emitter.onContent(assistantId, completion);
       emitter.onDone(assistantId);
       return;
     }
     if (followup !== null) {
+      emitter.onGenerationStats(null);
       emitter.onContent(assistantId, followup);
       emitter.onDone(assistantId);
       return;
     }
 
+    emitter.onGenerationStats(null);
     emitter.onDone(assistantId);
     // Loop: the model sees its tool results and continues.
   }
 
   if (!signal.aborted) {
+    emitter.onGenerationStats(null);
     emitter.onError(
       `Reached the ${MAX_STEPS}-step safety limit in cloud mode. Ask me to continue if more work is needed.`
     );
@@ -330,8 +341,10 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
  * reserving headroom for output. Cutting happens at USER-message boundaries so
  * an assistant tool_call is never separated from its tool results (which would
  * break provider-side validation).
+ *
+ * Phase 1.2: When `model` is provided, uses model-specific token estimation.
  */
-function fitToWindow(system: string, history: LLMMessage[], window: number): LLMMessage[] {
+function fitToWindow(system: string, history: LLMMessage[], window: number, model?: string): LLMMessage[] {
   const budget =
     Math.max(2048, Math.floor(window * (1 - OUTPUT_RESERVE))) - estimateTokens(system);
   const tokens = history.map((m) => {
@@ -395,6 +408,7 @@ export function cloudHistoryFromSession(messages: ChatMessage[]): LLMMessage[] {
           tool_calls: calls.map((c) => ({
             id: c.id,
             function: { name: c.name, arguments: c.args },
+            ...(c.thoughtSignature ? { thoughtSignature: c.thoughtSignature } : {}),
           })),
         });
         for (const c of calls) {

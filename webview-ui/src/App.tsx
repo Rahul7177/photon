@@ -24,7 +24,7 @@ export function App() {
             <OfflineBanner onRetry={actions.refreshModels} />
           )}
           {state.messages.length === 0 ? (
-            <Hero state={state} onPick={actions.send} />
+            <Hero state={state} />
           ) : (
             <MessageList state={state} dispatch={dispatch} actions={actions} />
           )}

@@ -114,6 +114,8 @@ export class PhotonController {
   /** Which engine stack is active: local (Ollama + adaptive) or cloud
    *  (direct provider APIs, native tool calling, no adaptive limits). */
   private interfaceMode: "local" | "cloud" = "local";
+  /** Extended thinking level for supported models. */
+  private thinkingLevel: "off" | "low" | "medium" | "high" = "off";
   private plan: AdaptivePlan | null = null;
   private userNumCtx: number | undefined;
   private session: SessionState;
@@ -372,6 +374,22 @@ export class PhotonController {
     this.projectConfig = result.config;
     // The file may enable auto-approve for the project (it can enable, not disable).
     if (this.projectConfig?.autoApprove) this.autoApprove = true;
+
+    // Phase 1.4: Sync file-based per-model configs → ModelConfigStore (file wins).
+    // The file is the source of truth for team-shared overrides; the extension's
+    // globalState is the fallback for user-only overrides not in the file.
+    if (result.modelConfigs && Object.keys(result.modelConfigs).length > 0) {
+      for (const [model, fileCfg] of Object.entries(result.modelConfigs)) {
+        const effective = this.modelConfigs.effective(model, result.modelConfigs);
+        if (effective) {
+          // Write the file-wins merged result to globalState so the rest of the
+          // codebase can read it via modelConfigs.get(model) without knowing
+          // about the file layer.
+          void this.modelConfigs.set(model, effective);
+        }
+      }
+      this.output.appendLine(`[config] Synced ${Object.keys(result.modelConfigs).length} per-model config(s) from project file`);
+    }
   }
 
   /** Watch the project config file so team edits apply without a reload. */
@@ -994,6 +1012,14 @@ export class PhotonController {
       case "setInterfaceMode":
         await this.setInterfaceMode(msg.payload.mode);
         return;
+      case "setThinkingEnabled":
+        this.thinkingLevel = msg.payload.enabled ? "medium" : "off";
+        this.pushConfig();
+        return;
+      case "setThinkingLevel":
+        this.thinkingLevel = msg.payload.level;
+        this.pushConfig();
+        return;
       case "newSession": {
         // Swap the session SYNCHRONOUSLY, before any await. Message handlers
         // run fire-and-forget and interleave at their await points, so awaiting
@@ -1361,7 +1387,7 @@ export class PhotonController {
       }
       const before = session.messages.length;
       session.messages = session.messages.filter(
-        (m) => !(m.role === "assistant" && !m.content.trim() && !m.toolCalls?.length)
+        (m) => !(m.role === "assistant" && !m.content.trim() && !m.toolCalls?.length && !m.notice)
       );
       touched = touched || session.messages.length !== before;
       await this.persistActiveSession(session);
@@ -1458,6 +1484,24 @@ export class PhotonController {
         this.safePost({ type: "messageDone", payload: { id } });
       },
       onError: (message) => {
+        // Surface the error in the chat as an assistant notice so it's
+        // visible even after the banner is dismissed.
+        if (isLive()) {
+          if (!current) {
+            current = {
+              id: randomUUID(),
+              role: "assistant",
+              content: "",
+              toolCalls: [],
+              createdAt: Date.now(),
+              streaming: false,
+            };
+            session.messages.push(current);
+          }
+          current.streaming = false;
+          current.notice = `⚠️ ${message}`;
+          this.safePost({ type: "messageAppended", payload: { ...current } });
+        }
         if (!isLive()) return;
         this.safePost({ type: "error", payload: { message } });
       },
@@ -1654,6 +1698,7 @@ export class PhotonController {
       embeddingModel: this.embeddingModelName(),
       providers: this.providerStatuses(),
       interfaceMode: this.interfaceMode,
+      thinkingLevel: this.thinkingLevel,
     };
   }
 
@@ -1832,10 +1877,21 @@ export class PhotonController {
 
   /** Public method for Chat Participant to send a prompt directly */
   async sendPrompt(text: string, attachments?: Attachment[]): Promise<void> {
+    // Use the same queue logic as onPrompt
     if (this.turnAbort && !this.turnAbort.signal.aborted) {
-      this.safePost({ type: "status", payload: { kind: "running", detail: "Queued — will run after current turn." } });
+      this.promptQueue.push({ text, attachments });
+      this.safePost({ type: "status", payload: { kind: "running", detail: `Queued (${this.promptQueue.length}) — will run after current turn.` } });
       return;
     }
     await this.runPrompt(text, attachments);
+    // Drain queued prompts (preserves order, like harness Inbox.claim)
+    if (this.promptQueue.length && !this.drainingQueue) {
+      this.drainingQueue = true;
+      while (this.promptQueue.length) {
+        const next = this.promptQueue.shift()!;
+        await this.runPrompt(next.text, next.attachments);
+      }
+      this.drainingQueue = false;
+    }
   }
 }

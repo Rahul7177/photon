@@ -1,6 +1,6 @@
 import type { TokenUsage } from "../../shared/types";
 import type { LLMMessage } from "../llm/types";
-import { estimateTokens } from "../adaptive/tokens";
+import { estimateTokensForModel } from "../adaptive/tokens";
 
 export interface FitResult {
   messages: LLMMessage[];
@@ -15,14 +15,18 @@ export interface FitResult {
  * request) is kept unconditionally — on a very small window with a large
  * system prompt it must never be the thing that gets trimmed. Returns a usage
  * breakdown for the UI meter.
+ *
+ * Phase 1.2: When `model` is provided, a model-specific tokenizer is used
+ * for more accurate estimation (within ~10% of eval_count).
  */
 export function fitToWindow(
   system: LLMMessage,
   history: LLMMessage[],
   budgetTokens: number,
-  window: number
+  window: number,
+  model?: string
 ): FitResult {
-  const systemTokens = tokensOf(system);
+  const systemTokens = tokensOf(system, model);
   const available = Math.max(0, budgetTokens - systemTokens);
 
   // Walk from newest to oldest, keeping what fits. The newest message is
@@ -31,7 +35,7 @@ export function fitToWindow(
   let historyTokens = 0;
   let dropped = 0;
   for (let i = history.length - 1; i >= 0; i--) {
-    const t = tokensOf(history[i]);
+    const t = tokensOf(history[i], model);
     if (i === history.length - 1 || historyTokens + t <= available) {
       kept.unshift(history[i]);
       historyTokens += t;
@@ -53,10 +57,10 @@ export function fitToWindow(
   return { messages: [system, ...kept], droppedCount: dropped, usage };
 }
 
-function tokensOf(msg: LLMMessage): number {
-  let t = 4 + estimateTokens(msg.content);
+function tokensOf(msg: LLMMessage, model?: string): number {
+  let t = 4 + estimateTokensForModel(msg.content, model);
   for (const call of msg.tool_calls ?? []) {
-    t += estimateTokens(call.function.name) + estimateTokens(JSON.stringify(call.function.arguments));
+    t += estimateTokensForModel(call.function.name, model) + estimateTokensForModel(JSON.stringify(call.function.arguments), model);
   }
   return t;
 }

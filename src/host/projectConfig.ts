@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import type { IntelligenceSetting } from "../shared/types";
+import type { IntelligenceSetting, PerModelConfig } from "../shared/types";
 
 /**
  * Checked-in, team-shareable project configuration (Module 5). Lives at
@@ -7,6 +7,10 @@ import type { IntelligenceSetting } from "../shared/types";
  * a team checks in `.eslintrc`. Versioned so the schema can evolve without
  * breaking older checked-in files. These are DEFAULTS — an explicit user choice
  * in the UI/settings always overrides them (see PhotonController precedence).
+ *
+ * Phase 1.4: Adds `modelConfigs` — a map of model-name → PerModelConfig so a
+ * team can check in per-model overrides (context, ngl, sampling, etc.) and new
+ * clones pick them up automatically.
  */
 export interface ProjectConfig {
   version: number;
@@ -20,6 +24,8 @@ export interface ProjectConfig {
   indexing?: boolean;
   /** Auto-approve side-effecting tools (file writes, commands) for this project. */
   autoApprove?: boolean;
+  /** Phase 1.4: Per-model overrides keyed by model name (e.g. "llamacpp:gemma"). */
+  modelConfigs?: Record<string, PerModelConfig>;
 }
 
 const CURRENT_VERSION = 1;
@@ -27,6 +33,8 @@ const VALID_INTELLIGENCE: IntelligenceSetting[] = ["auto", "low", "medium", "hig
 
 export interface LoadResult {
   config: ProjectConfig | null;
+  /** Per-model configs from the file (Phase 1.4). Merged with config.modelConfigs. */
+  modelConfigs?: Record<string, PerModelConfig>;
   /** Absolute path that was read, if any (for the file watcher). */
   path?: string;
   /** Human-readable problem, if the file existed but couldn't be used. */
@@ -59,7 +67,8 @@ export function loadProjectConfig(): LoadResult {
           error: `.photon/${file} contained no recognizable settings. This parser supports only flat "key: value" pairs — use .photon/config.json for nested YAML.`,
         };
       }
-      return { config, path };
+      // Phase 1.4: Return per-model configs for file-wins merging
+      return { config, modelConfigs: config.modelConfigs, path };
     } catch (e) {
       return { config: null, path, error: `Could not parse .photon/${file}: ${(e as Error).message}` };
     }
@@ -84,6 +93,44 @@ function validate(raw: unknown): ProjectConfig {
   if (typeof o.numCtx === "number" && o.numCtx > 0) config.numCtx = Math.floor(o.numCtx);
   if (typeof o.indexing === "boolean") config.indexing = o.indexing;
   if (typeof o.autoApprove === "boolean") config.autoApprove = o.autoApprove;
+
+  // Phase 1.4: Per-model configs — a map of model-name → PerModelConfig
+  // Example: { "llamacpp:gemma": { "numCtx": 32768, "llamacpp": { "ngl": "all" }, "sampling": { "temp": 0.7 } } }
+  if (o.modelConfigs && typeof o.modelConfigs === "object") {
+    const mc = o.modelConfigs as Record<string, unknown>;
+    const validated: Record<string, PerModelConfig> = {};
+    for (const [key, val] of Object.entries(mc)) {
+      if (!key.trim() || typeof val !== "object" || !val) continue;
+      const parsed = val as Record<string, unknown>;
+      const cfg: PerModelConfig = {};
+      if (typeof parsed.numCtx === "number" && parsed.numCtx > 0) cfg.numCtx = Math.floor(parsed.numCtx);
+      if (typeof parsed.note === "string") cfg.note = parsed.note;
+      if (parsed.llamacpp && typeof parsed.llamacpp === "object") {
+        const lc = parsed.llamacpp as Record<string, unknown>;
+        cfg.llamacpp = {};
+        if (typeof lc.ctx === "number" && lc.ctx > 0) cfg.llamacpp.ctx = lc.ctx;
+        if (lc.ngl !== undefined) cfg.llamacpp.ngl = typeof lc.ngl === "number" ? lc.ngl : (lc.ngl === "all" ? "all" : Number(lc.ngl) || undefined);
+        if (typeof lc.fit === "boolean") cfg.llamacpp.fit = lc.fit;
+        if (typeof lc.np === "number" && lc.np > 0) cfg.llamacpp.np = lc.np;
+        if (typeof lc.fa === "boolean") cfg.llamacpp.fa = lc.fa;
+        if (typeof lc.ctk === "string") cfg.llamacpp.ctk = lc.ctk;
+        if (typeof lc.ctv === "string") cfg.llamacpp.ctv = lc.ctv;
+        if (typeof lc.extraArgs === "string") cfg.llamacpp.extraArgs = lc.extraArgs;
+        if (Object.keys(cfg.llamacpp).length === 0) delete cfg.llamacpp;
+      }
+      if (parsed.sampling && typeof parsed.sampling === "object") {
+        const sp = parsed.sampling as Record<string, unknown>;
+        cfg.sampling = {};
+        if (typeof sp.temp === "number") cfg.sampling.temp = sp.temp;
+        if (typeof sp.topP === "number") cfg.sampling.topP = sp.topP;
+        if (typeof sp.seed === "number") cfg.sampling.seed = sp.seed;
+        if (Object.keys(cfg.sampling).length === 0) delete cfg.sampling;
+      }
+      if (Object.keys(cfg).length > 0) validated[key.trim()] = cfg;
+    }
+    if (Object.keys(validated).length > 0) config.modelConfigs = validated;
+  }
+
   return config;
 }
 

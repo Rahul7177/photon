@@ -157,7 +157,7 @@ export class AgentEngine {
       emitter.onPhase("thinking");
 
       const budget = plan.numCtx - plan.maxOutputTokens;
-      const fit = fitToWindow(systemMsg, working, budget, plan.numCtx);
+      const fit = fitToWindow(systemMsg, working, budget, plan.numCtx, plan.model);
       emitter.onUsage(fit.usage);
       trimmedTotal += fit.droppedCount;
 
@@ -495,7 +495,7 @@ export class AgentEngine {
       working.push({ role: "user", content: buildRepairPrompt(errors, specs, plan) });
 
       const budget = plan.numCtx - plan.maxOutputTokens;
-      const fit = fitToWindow(systemMsg, working, budget, plan.numCtx);
+      const fit = fitToWindow(systemMsg, working, budget, plan.numCtx, plan.model);
       let gen: { raw: string; nativeCalls: NativeCall[]; truncated: boolean };
       try {
         gen = await this.stream(fit.messages, plan, specs, signal);

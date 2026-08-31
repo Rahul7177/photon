@@ -93,7 +93,7 @@ export class AgentLoop {
           const history = sessionToLLM(session, plan!);
           // fitToWindow for local; cloud uses its own fit but we reuse
           const budget = plan!.numCtx - plan!.maxOutputTokens;
-          const fit = fitToWindow({ role: "system", content: system } as LLMMessage, history, budget, plan!.numCtx);
+          const fit = fitToWindow({ role: "system", content: system } as LLMMessage, history, budget, plan!.numCtx, plan!.model);
           const messagesForLlm = fit.messages.slice(1); // system already in header
           const toolCtx = this.deps.buildToolContext(signal, plan!.intelligence);
 

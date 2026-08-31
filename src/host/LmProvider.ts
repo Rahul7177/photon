@@ -1,29 +1,63 @@
 import * as vscode from "vscode";
-
-function randomUUID(): string {
-  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    const v = c === "x" ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
-}
+import type { Attachment } from "../shared/types";
+import { PhotonController } from "./PhotonController";
 
 /**
  * Chat Participant registration - makes Photon show up in Copilot Chat panel as @photon
  */
 export function registerChatParticipant(
   context: vscode.ExtensionContext,
-  controller: any
+  controller: PhotonController
 ): vscode.Disposable {
+  function randomUUID(): string {
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+      const r = (Math.random() * 16) | 0;
+      const v = c === "x" ? r : (r & 0x3) | 0x8;
+      return v.toString(16);
+    });
+  }
+
   const participant = vscode.chat.createChatParticipant("photon", async (request, _context, stream, _token) => {
     const text = request.prompt;
+    const attachments: Attachment[] = request.references?.map((ref) => {
+      const value = (ref as any).value;
+      const name = (ref as any).name ?? "attachment";
 
-    stream.progress("Sending to Photon...");
+      if (typeof value === "string") {
+        return {
+          id: randomUUID(),
+          kind: "text",
+          name,
+          mime: "text/plain",
+          size: Buffer.byteLength(value),
+          text: value,
+        } as Attachment;
+      }
+      // Handle image attachments
+      if (value instanceof Uint8Array) {
+        return {
+          id: randomUUID(),
+          kind: "image",
+          name,
+          mime: "image/png",
+          size: value.byteLength,
+          dataBase64: Buffer.from(value).toString("base64"),
+        } as Attachment;
+      }
+      return null;
+    }).filter((a): a is Attachment => a !== null) ?? [];
 
-    // Send to Photon controller
-    await controller.sendPrompt(text, []); // skip attachments for now in chat participant
+    // Use markdown for progress since stream.progress API varies
+    stream.markdown("🔄 Sending to Photon...");
 
-    stream.markdown("✅ Sent to Photon sidebar");
+    try {
+      // Send to Photon controller with attachments
+      await controller.sendPrompt(text, attachments);
+      stream.markdown("✅ Sent to Photon sidebar");
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      stream.markdown(`❌ Error: ${message}`);
+    }
   });
 
   participant.iconPath = vscode.Uri.joinPath(
@@ -33,4 +67,12 @@ export function registerChatParticipant(
   );
 
   return participant;
+}
+
+function randomUUID(): string {
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
 }
