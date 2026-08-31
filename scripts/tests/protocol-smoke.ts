@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { parsePhotonBlocks } from "../../src/core/protocol/parse";
 import { builtinTools } from "../../src/core/tools/builtin";
 
-const specs = builtinTools.map((t) => t.spec);
+const specs = builtinTools().map((t) => t.spec);
 
 const python = `[TOOL write_file]\npath: factorial.py\ncontent: |\ndef factorial(n):\n    result = 1\n    for i in range(1, n + 1):\n        result *= i\n    return result\n[/TOOL]`;
 const parsed = parsePhotonBlocks(python, specs);
