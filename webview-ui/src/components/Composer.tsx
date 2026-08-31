@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import type { Attachment, Mode } from "../../../src/shared/types";
+import type { Attachment, Mode, ThinkingSetting } from "../../../src/shared/types";
 import type { AppState, Actions } from "../state/store";
 import { ContextMeter } from "./ContextMeter";
 import { CapabilityBadges } from "./CapabilityBadges";
@@ -9,6 +9,15 @@ const MODES: { id: Mode; label: string; hint: string }[] = [
   { id: "chat", label: "Chat", hint: "Talk & get code, no tools" },
   { id: "plan", label: "Plan", hint: "Read-only investigation → step-by-step plan" },
   { id: "agent", label: "Agent", hint: "Uses tools to edit files and run commands" },
+];
+
+const THINKING_OPTIONS: Array<{ value: ThinkingSetting; label: string }> = [
+  { value: "auto", label: "Auto" },
+  { value: "off", label: "Off" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xtrahigh", label: "Extra High" },
 ];
 
 // Sentinel value for the "Auto" model-picker option.
@@ -41,8 +50,6 @@ function ModeDropdown({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => v
     // we'll use a different approach - attach to document on mount
   }
 
-  // Simple approach: use a native select but style it to look like a dropdown
-  // For "opens upwards", we'll use a custom implementation
   return (
     <div className="mode-dropdown" ref={wrapperRef}>
       <button
@@ -125,7 +132,7 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
     const items = Array.from(e.clipboardData.items);
     const fileItems = items.filter((it) => it.kind === "file");
 
-    if (fileItems.length === 0) return; // no file content in clipboard — let default paste handle it
+    if (fileItems.length === 0) return;
 
     e.preventDefault();
     setAttachError(null);
@@ -133,10 +140,6 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
 
     for (const item of fileItems) {
       let file = item.getAsFile();
-
-      // Phase 1.3: Firefox fallback — getAsFile() returns null for pasted
-      // images in some Firefox versions. Read the Blob directly via the
-      // clipboard item's type to construct a minimal File.
       if (!file && item.type.startsWith("image/")) {
         file = new File(
           [new Blob([], { type: item.type })],
@@ -146,7 +149,7 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
       }
 
       if (file) {
-        const { attachment, error } = await readFileToAttachment(file);
+        const { attachment, error } = await readClipboardBlobToAttachment(file);
         if (error) setAttachError(error);
         else if (attachment) {
           if (attachment.kind === "image" && !supportsVision) {
@@ -188,7 +191,6 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
     <div className="composer" onDrop={onDrop} onDragOver={onDragOver}>
       <ContextMeter usage={state.usage} plan={state.plan} stats={state.generationStats} compactBadgesModel={modelCaps} />
 
-      {/* Toolbar row: Local/Cloud toggle + Model selector */}
       <div className="composer-toolbar">
         <div className="iface-toggle" title="Local: Ollama/llama.cpp with adaptive tuning. Cloud: direct provider APIs.">
           <button
@@ -235,23 +237,20 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
           </select>
         </div>
 
-        {/* Thinking level selector — only for models that support it */}
         {modelCaps?.thinking && (
-          <div className="thinking-level-group">
-            {(["off", "low", "medium", "high"] as const).map((lvl) => (
-              <button
-                key={lvl}
-                className={`thinking-level-btn${state.config.thinkingLevel === lvl ? " active" : ""}`}
-                title={`Thinking: ${lvl}`}
-                onClick={() => actions.setThinkingLevel(lvl)}
-              >
-                {lvl === "off" ? "⊘" : lvl === "low" ? "◎" : lvl === "medium" ? "◉" : "⊕"}
-              </button>
-            ))}
+          <div className="thinking-picker" title="Reasoning level">
+            <select
+              value={state.config.thinkingLevel}
+              onChange={(e) => actions.setThinkingSetting(e.target.value as ThinkingSetting)}
+              aria-label="Reasoning level"
+            >
+              {THINKING_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
           </div>
         )}
 
-        {/* Inline capability badges — same row, wraps to icons when tight */}
         {modelCaps && <CapabilityBadges model={modelCaps} compact />}
       </div>
 
@@ -330,6 +329,6 @@ function placeholder(state: AppState): string {
     return hint;
   }
   const verb = { chat: "Ask", plan: "Describe what to plan", agent: "Describe a task" }[state.mode];
-  const tTag = state.config.thinkingLevel !== "off" ? ` +${state.config.thinkingLevel}` : "";
+  const tTag = state.config.thinkingLevel !== "off" && state.config.thinkingLevel !== "auto" ? ` +${state.config.thinkingLevel}` : "";
   return `${verb}… (${state.mode}${tTag} mode)`;
 }
