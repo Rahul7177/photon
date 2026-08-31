@@ -1,17 +1,11 @@
-import type { ModelInfo } from "../../../shared/types";
+import type { ModelInfo, ThinkingLevel } from "../../../shared/types";
 import type { LLMChatChunk, LLMChatRequest, LLMProvider, ProviderModel } from "../types";
 import { fetchWithRetry, streamSse, tryJson } from "../sse";
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
-
 type GeminiInputFunction = { function: { name: string; description?: string; parameters?: unknown } };
-
-export function toGeminiFunctionDeclaration(tool: GeminiInputFunction): { name: string; description?: string; parametersJsonSchema?: unknown } {
-  return { name: tool.function.name, description: tool.function.description, parametersJsonSchema: tool.function.parameters };
-}
-
+export function toGeminiFunctionDeclaration(tool: GeminiInputFunction): { name: string; description?: string; parametersJsonSchema?: unknown } { return { name: tool.function.name, description: tool.function.description, parametersJsonSchema: tool.function.parameters }; }
 function geminiHeaders(apiKey: string): Record<string, string> { return { "x-goog-api-key": apiKey }; }
-
 export interface GeminiConfig { apiKey: string; enabled: boolean; models: ProviderModel[]; }
 
 export class GeminiProvider implements LLMProvider {
@@ -20,21 +14,10 @@ export class GeminiProvider implements LLMProvider {
   enabled: boolean;
   private readonly apiKey: string;
   private readonly models: ProviderModel[];
-
   constructor(cfg: GeminiConfig) { this.apiKey = cfg.apiKey; this.enabled = cfg.enabled; this.models = cfg.models; }
   isConfigured(): boolean { return !!this.apiKey; }
-
-  async ping(): Promise<boolean> {
-    try {
-      const res = await fetch(`${GEMINI_BASE}/models`, { headers: geminiHeaders(this.apiKey), signal: AbortSignal.timeout(8000) });
-      return res.ok;
-    } catch { return false; }
-  }
-
-  async listModels(): Promise<ModelInfo[]> {
-    return this.models.map((m) => ({ name: m.name, paramSize: m.paramSize, paramsB: m.paramsB, contextLength: m.contextLength, toolTrained: m.toolTrained, vision: m.vision, audio: m.audio, video: m.video, thinking: m.thinking, capabilities: m.capabilities, tier: m.tier, provider: this.id }));
-  }
-
+  async ping(): Promise<boolean> { try { return (await fetch(`${GEMINI_BASE}/models`, { headers: geminiHeaders(this.apiKey), signal: AbortSignal.timeout(8000) })).ok; } catch { return false; } }
+  async listModels(): Promise<ModelInfo[]> { return this.models.map((m) => ({ name: m.name, paramSize: m.paramSize, paramsB: m.paramsB, contextLength: m.contextLength, toolTrained: m.toolTrained, vision: m.vision, audio: m.audio, video: m.video, thinking: m.thinking, capabilities: m.capabilities, tier: m.tier, provider: this.id })); }
   async fetchLiveModels(): Promise<ModelInfo[]> {
     const res = await fetchWithRetry(`${GEMINI_BASE}/models`, { headers: geminiHeaders(this.apiKey), signal: AbortSignal.timeout(12000) }, { retries: 1 });
     if (!res.ok) { const detail = await res.text().catch(() => ""); throw new Error(`Gemini model list failed (${res.status}). ${detail}`.trim()); }
@@ -47,65 +30,45 @@ export class GeminiProvider implements LLMProvider {
     }
     return out;
   }
-
   async *chatStream(req: LLMChatRequest, signal?: AbortSignal): AsyncGenerator<LLMChatChunk> {
-    const contents: { role: string; parts: Record<string, unknown>[] }[] = [];
-    let system = "";
+    const contents: { role: string; parts: Record<string, unknown>[] }[] = []; let system = "";
     for (const m of req.messages) {
       if (m.role === "system") { system += (system ? "\n\n" : "") + m.content; continue; }
-      if (m.role === "tool") {
-        const fnResp = { functionResponse: { name: m.name ?? "tool", response: { output: m.content } } };
-        const last = contents[contents.length - 1];
-        if (last && last.role === "user") last.parts.push(fnResp); else contents.push({ role: "user", parts: [fnResp] });
-        continue;
-      }
-      if (m.role === "assistant" && m.tool_calls?.length) {
-        const parts: Record<string, unknown>[] = [];
-        if (m.content) parts.push({ text: m.content });
-        for (const tc of m.tool_calls) {
-          const fnPart: Record<string, unknown> = { functionCall: { name: tc.function.name, args: tc.function.arguments ?? {} } };
-          if (tc.thoughtSignature) fnPart.thoughtSignature = tc.thoughtSignature;
-          parts.push(fnPart);
-        }
-        contents.push({ role: "model", parts });
-        continue;
-      }
-      const role = m.role === "assistant" ? "model" : "user"; const parts: Record<string, unknown>[] = [];
-      if (m.content) parts.push({ text: m.content });
-      for (const img of m.images ?? []) parts.push({ inlineData: { mimeType: "image/png", data: img } });
-      contents.push({ role, parts });
+      if (m.role === "tool") { const fnResp = { functionResponse: { name: m.name ?? "tool", response: { output: m.content } } }; const last = contents[contents.length - 1]; if (last && last.role === "user") last.parts.push(fnResp); else contents.push({ role: "user", parts: [fnResp] }); continue; }
+      if (m.role === "assistant" && m.tool_calls?.length) { const parts: Record<string, unknown>[] = []; if (m.content) parts.push({ text: m.content }); for (const tc of m.tool_calls) { const fnPart: Record<string, unknown> = { functionCall: { name: tc.function.name, args: tc.function.arguments ?? {} } }; if (tc.thoughtSignature) fnPart.thoughtSignature = tc.thoughtSignature; parts.push(fnPart); } contents.push({ role: "model", parts }); continue; }
+      const role = m.role === "assistant" ? "model" : "user"; const parts: Record<string, unknown>[] = []; if (m.content) parts.push({ text: m.content }); for (const img of m.images ?? []) parts.push({ inlineData: { mimeType: "image/png", data: img } }); contents.push({ role, parts });
     }
-
-    const body: Record<string, unknown> = { contents, generationConfig: {} };
-    if (system) body.systemInstruction = { parts: [{ text: system }] };
-    const gc = body.generationConfig as Record<string, unknown>;
+    const body: Record<string, unknown> = { contents, generationConfig: {} }; if (system) body.systemInstruction = { parts: [{ text: system }] }; const gc = body.generationConfig as Record<string, unknown>;
     if (req.options?.temperature !== undefined) gc.temperature = req.options.temperature;
     if (req.options?.top_p !== undefined) gc.topP = req.options.top_p;
     if (req.options?.num_predict && req.options.num_predict > 0) gc.maxOutputTokens = req.options.num_predict;
+    applyGeminiThinking(gc, req.model, req.options?.thinkingLevel);
     if (req.tools?.length) body.tools = [{ functionDeclarations: (req.tools as GeminiInputFunction[]).map(toGeminiFunctionDeclaration) }];
-
     const url = `${GEMINI_BASE}/models/${req.model}:streamGenerateContent?alt=sse`;
     const res = await fetchWithRetry(url, { method: "POST", headers: { "Content-Type": "application/json", ...geminiHeaders(this.apiKey) }, body: JSON.stringify(body), signal }, { retries: 2, signal });
     if (!res.ok || !res.body) { const detail = await res.text().catch(() => ""); throw new Error(`Gemini streamGenerateContent failed (${res.status}). ${detail}`.trim()); }
-
     for await (const payload of streamSse(res.body, signal)) {
-      const json = tryJson<{ candidates?: { content?: { parts?: { text?: string; functionCall?: { name: string; args?: Record<string, unknown> }; thoughtSignature?: string }[] }; finishReason?: string }[] }>(payload);
-      if (!json) continue;
-      const cand = json.candidates?.[0]; const parts = cand?.content?.parts ?? []; let text = "";
-      const toolCalls: { function: { name: string; arguments: Record<string, unknown> }; thoughtSignature?: string }[] = [];
-      for (const p of parts) { if (p.text) text += p.text; if (p.functionCall) toolCalls.push({ function: { name: p.functionCall.name, arguments: p.functionCall.args ?? {} }, ...(p.thoughtSignature ? { thoughtSignature: p.thoughtSignature } : {}) } as any); }
-      if (text) yield { message: { role: "assistant", content: text }, done: false };
-      if (toolCalls.length) yield { message: { role: "assistant", content: "", tool_calls: toolCalls }, done: false };
-      if (cand?.finishReason) { yield { message: { role: "assistant", content: "" }, done: true, done_reason: cand.finishReason }; return; }
+      const json = tryJson<{ candidates?: { content?: { parts?: { text?: string; functionCall?: { name: string; args?: Record<string, unknown> }; thoughtSignature?: string }[] }; finishReason?: string }[] }>(payload); if (!json) continue;
+      const cand = json.candidates?.[0]; const parts = cand?.content?.parts ?? []; let text = ""; const toolCalls: { function: { name: string; arguments: Record<string, unknown> }; thoughtSignature?: string }[] = [];
+      for (const p of parts) { if (p.text) text += p.text; if (p.functionCall) toolCalls.push({ function: { name: p.functionCall.name, arguments: p.functionCall.args ?? {} }, ...(p.thoughtSignature ? { thoughtSignature: p.thoughtSignature } : {}) }); }
+      if (text) yield { message: { role: "assistant", content: text }, done: false }; if (toolCalls.length) yield { message: { role: "assistant", content: "", tool_calls: toolCalls }, done: false }; if (cand?.finishReason) { yield { message: { role: "assistant", content: "" }, done: true, done_reason: cand.finishReason }; return; }
     }
     yield { done: true };
   }
 }
 
-function geminiCaps(id: string): string[] {
-  const n = id.toLowerCase(); const caps = ["tools", "vision"];
-  if (/audio|native-audio|speech/.test(n)) caps.push("audio");
-  if (/video|veo|live/.test(n)) caps.push("video");
-  if (/thinking|2\.5|flash-thinking|pro/.test(n)) caps.push("thinking");
-  return caps;
+function applyGeminiThinking(gc: Record<string, unknown>, model: string, level: ThinkingLevel | undefined): void {
+  if (!level || level === "off" && !/gemini-(?:2\.5|3)/i.test(model)) return;
+  const n = model.toLowerCase();
+  if (/gemini-2\.5/.test(n)) {
+    const budgets: Record<ThinkingLevel, number> = { off: 0, low: 512, medium: 1536, high: 4096, xtrahigh: 8192 };
+    gc.thinkingConfig = { thinkingBudget: budgets[level] };
+    return;
+  }
+  if (/gemini-3/.test(n)) {
+    // Gemini 3.1 Pro does not support "minimal"; its lowest supported level is low.
+    const mapped = /gemini-3\.1-pro/i.test(n) && level === "off" ? "low" : level === "off" ? "minimal" : level === "xtrahigh" ? "high" : level;
+    gc.thinkingConfig = { thinkingLevel: mapped };
+  }
 }
+function geminiCaps(id: string): string[] { const n = id.toLowerCase(); const caps = ["tools", "vision"]; if (/audio|native-audio|speech/.test(n)) caps.push("audio"); if (/video|veo|live/.test(n)) caps.push("video"); if (/thinking|2\.5|flash-thinking|pro/.test(n)) caps.push("thinking"); return caps; }
