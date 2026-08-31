@@ -1,15 +1,16 @@
 import { randomUUID } from "node:crypto";
+import * as vscode from "vscode";
 import type { AdaptivePlan, ChatMessage, ToolCall, ToolSpec } from "../../shared/types";
 import type { LLMMessage, LLMProvider } from "../llm/types";
 import { buildSystemPrompt } from "../prompts/system";
 import { fitToWindow } from "./contextManager";
 import { parsePhotonBlocks, validateAgainstSpec, stripToolMarkup } from "../protocol/parse";
 import { renderToolInstructionsV2, toNativeToolsV2, renderToolResultV2 } from "../protocol/serialize.v2";
-import { rankTools, executionFingerprint, recoveryDirective } from "../intelligence/policy";
+import { rankTools, executionFingerprint, recoveryDirective, buildExecutionPolicy, capabilityForModel, buildVerificationPlan } from "../intelligence/policy";
 import { ToolPipeline } from "../../photon-core/tools/pipeline";
 import type { Tool, ToolContext } from "../tools/types";
 import { AgentEngine } from "./engine";
-import { PhotonController } from "../../host/PhotonController";
+import { buildWorkspaceMap } from "../tools/workspaceMap";
 
 export interface UnifiedEngineDeps {
   provider: LLMProvider;
@@ -26,31 +27,30 @@ export interface UnifiedEmitter {
   onUsage(usage:import("../../shared/types").TokenUsage):void; onGenerationStats(stats:import("../../shared/types").GenerationStats|null):void;
   onDone(id:string,notice?:string):void; onError(message:string):void;
 }
-const MAX_OUTPUT_CHARS=200_000;
-const MAX_EMPTY_RETRIES=2;
-const MAX_CONTINUATIONS=3;
+const MAX_OUTPUT_CHARS=200_000;const MAX_EMPTY_RETRIES=2;const MAX_CONTINUATIONS=3;
 
-/** Unified executor shared by local and cloud providers. Transport differences stay inside LLMProvider adapters. */
+/** Unified executor shared by local and cloud providers. Provider-specific wire details remain inside LLMProvider adapters. */
 export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:AdaptivePlan,emitter:UnifiedEmitter,signal:AbortSignal,deps:UnifiedEngineDeps):Promise<void>{
   const pipeline=new ToolPipeline();pipeline.registerAll(deps.tools);
   const task=plan.task??{scope:"single_file",reasoning:"medium",risk:"low",verification:[],ambiguity:"low",estimatedSteps:1};
   const workspaceMap=plan.mode!=="chat"&&deps.workspaceMap?await deps.workspaceMap().catch(()=>undefined):undefined;
   const retrieved=plan.mode!=="chat"&&plan.intelligence!=="low"&&deps.retrieveContext?await deps.retrieveContext(lastUser(session.messages)??"",signal).catch(()=>undefined):undefined;
-  const phaseSpecs=()=>rankTools(deps.tools.map(t=>t.spec),task,requiredVerificationComplete(plan)?"final":"orient").slice(0,Math.max(1,plan.maxTools));
-  let specs=phaseSpecs();
+  const verificationPlan=plan.verification??buildVerificationPlan(task);const verification=new Set(verificationPlan.completed);const required=new Set(verificationPlan.required);
+  const phase=()=>required.size&&[...required].some(v=>!verification.has(v))?"verify":"orient";
+  let specs=rankTools(deps.tools.map(t=>t.spec),task,phase()).slice(0,Math.max(1,plan.maxTools));
   const toolInstructions=plan.toolProtocol==="photon-block"?renderToolInstructionsV2(specs,plan):"";
   const system=buildSystemPrompt({mode:plan.mode,plan,toolInstructions,workspaceName:deps.workspaceName,workspaceMap,retrievedContext:retrieved});
   const systemMsg:LLMMessage={role:"system",content:system};
   let mutationEpoch=0;const executed=new Set<string>();let noProgress=0;let emptyRetries=0;let continuations=0;let mutationOccurred=false;
-  const verification=new Set(plan.verification?.completed??[]);const required=new Set(plan.verification?.required??[]);
   const maxSteps=plan.executionPolicy?.stepBudget??(plan.mode==="agent"?100:plan.mode==="plan"?50:1);
   const budgetTokens=Math.max(256,Math.min(plan.maxOutputTokens||2048,plan.executionPolicy?.generationBudgetTokens??plan.maxOutputTokens??2048));
 
   for(let step=0;step<maxSteps&&!signal.aborted;step++){
-    specs=phaseSpecs();emitter.onPhase("thinking");
+    specs=rankTools(deps.tools.map(t=>t.spec),task,phase()).slice(0,Math.max(1,plan.maxTools));
+    emitter.onPhase("thinking");
     const history=historyToLLM(session.messages,plan);const fit=fitToWindow(systemMsg,history,Math.max(512,plan.numCtx-budgetTokens),plan.numCtx,plan.model);emitter.onUsage(fit.usage);
     const id=randomUUID();emitter.onAssistantStart(id);let raw="";const nativeCalls:{id?:string;name:string;args:Record<string,unknown>;thoughtSignature?:string}[]=[];let doneReason:string|undefined;
-    try{for await(const chunk of deps.provider.chatStream({model:plan.model,messages:fit.messages.slice(1),options:{num_ctx:plan.numCtx,temperature:plan.temperature,top_p:plan.topP,num_predict:budgetTokens,thinkingLevel:plan.modelCapabilities?.reasoning&&plan.modelCapabilities.reasoning>=0.78?"medium":"off"},tools:plan.toolProtocol==="native"&&specs.length?toNativeToolsV2(specs):undefined},signal)){
+    try{for await(const chunk of deps.provider.chatStream({model:plan.model,messages:fit.messages.slice(1),options:{num_ctx:plan.numCtx,temperature:plan.temperature,top_p:plan.topP,num_predict:budgetTokens,thinkingLevel:plan.modelCapabilities?.reasoning&&plan.modelCapabilities.reasoning>=.78?"medium":"off"},tools:plan.toolProtocol==="native"&&specs.length?toNativeToolsV2(specs):undefined},signal)){
       if(chunk.message?.content){raw+=chunk.message.content;emitter.onDelta(id,chunk.message.content);}for(const tc of chunk.message?.tool_calls??[])nativeCalls.push({id:tc.id,name:tc.function.name,args:tc.function.arguments??{},thoughtSignature:tc.thoughtSignature});if(chunk.done_reason)doneReason=chunk.done_reason;if(raw.length>MAX_OUTPUT_CHARS){doneReason="length";break;}
     }}catch(e){if(signal.aborted){emitter.onDone(id);return;}emitter.onAssistantCancel(id);emitter.onError(`Model error: ${(e as Error).message}`);return;}
 
@@ -59,61 +59,57 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
     emptyRetries=0;
 
     if(!calls.length){
-      const cut=isLengthCutoff(doneReason)||hasUnclosedFence(raw);
-      if(cut&&continuations<MAX_CONTINUATIONS){continuations++;emitter.onDone(id);injectUser(session,"The reply was cut off. Continue exactly where you stopped; do not repeat completed work.");continue;}
-      if(plan.mode!=="chat"&&mutationOccurred&&required.size>verification.size&&continuations<MAX_CONTINUATIONS){continuations++;emitter.onDone(id);injectUser(session,`Verification is still required before finishing: ${[...required].filter(v=>!verification.has(v)).join(", ")}. Run the appropriate verification tool.`);continue;}
+      const cut=isLengthCutoff(doneReason)||hasUnclosedFence(raw);if(cut&&continuations<MAX_CONTINUATIONS){continuations++;emitter.onDone(id);injectUser(session,"The reply was cut off. Continue exactly where you stopped; do not repeat completed work.");continue;}
+      if(plan.mode!=="chat"&&mutationOccurred&&[...required].some(v=>!verification.has(v))&&continuations<MAX_CONTINUATIONS){continuations++;emitter.onDone(id);injectUser(session,`Verification is still required before finishing: ${[...required].filter(v=>!verification.has(v)).join(", ")}. Run the appropriate verification tool.`);continue;}
       emitter.onDone(id);return;
     }
 
-    const executable=calls.filter(c=>c.status!=="error");
-    if(!executable.length){noProgress++;emitter.onDone(id);injectUser(session,`Correct the invalid tool call and retry. ${calls.map(c=>c.error??"invalid call").join("; ")}`);if(noProgress>=3){emitter.onError("Stopped after repeated invalid tool calls.");return;}continue;}
+    const executable=calls.filter(c=>c.status!=="error");if(!executable.length){noProgress++;emitter.onDone(id);injectUser(session,`Correct the invalid tool call and retry. ${calls.map(c=>c.error??"invalid call").join("; ")}`);if(noProgress>=3){emitter.onError("Stopped after repeated invalid tool calls.");return;}continue;}
+    const fresh=executable.filter(c=>{const key=executionFingerprint(c,mutationEpoch);if(executed.has(key))return false;executed.add(key);return true;});if(!fresh.length){noProgress++;emitter.onDone(id);if(noProgress>=3)return;injectUser(session,"That exact operation already ran at the current workspace state. Choose a different next step.");continue;}
 
-    const fresh=executable.filter(c=>{const key=executionFingerprint(c,mutationEpoch);if(executed.has(key))return false;executed.add(key);return true;});
-    if(!fresh.length){noProgress++;emitter.onDone(id);if(noProgress>=3)return;injectUser(session,"That exact operation already ran at the current workspace state. Choose a different next step.");continue;}
     const toolCtx=deps.buildToolContext(signal);const results=await pipeline.executeMany(fresh,toolCtx,plan.executionPolicy?.maxConcurrent??1);let ran=false;
     for(const call of fresh){
-      const result=results.get(call.id);if(!result)continue;ran=true;const spec=deps.tools.find(t=>t.spec.name===call.name)?.spec;
-      if(spec?.sideEffecting&&result.ok){mutationEpoch++;mutationOccurred=true;}
+      const result=results.get(call.id);if(!result)continue;ran=true;const spec=deps.tools.find(t=>t.spec.name===call.name)?.spec;if(spec?.sideEffecting&&result.ok){mutationEpoch++;mutationOccurred=true;}
       if(call.name==="get_diagnostics"&&result.ok)verification.add("diagnostics");
-      if(call.name==="run_command"&&result.ok){const cmd=String(call.args.command??"").toLowerCase();if(/\b(test|vitest|jest|mocha|pytest|cargo test|go test)\b/.test(cmd))verification.add("tests");if(/\b(build|tsc|compile|bundle)\b/.test(cmd))verification.add("build");if(/\b(eslint|lint|prettier)\b/.test(cmd))verification.add("lint");}
-      emitter.onPhase("working",call.name);emitter.onToolCall(id,call);emitter.onToolUpdate(id,{...call,status:result.ok?"done":"error",result:result.ok?result.output:undefined,error:result.ok?undefined:result.output});
-      // Attach the result to the in-memory assistant tool call so subsequent turns can reconstruct native tool pairs.
-      call.result=result.output;call.status=result.ok?"done":"error";call.error=result.ok?undefined:result.output;
+      if(call.name==="run_command"&&result.ok){const cmd=String(call.args.command??"").toLowerCase();if(/\b(test|vitest|jest|mocha|pytest|cargo test|go test)\b/.test(cmd))verification.add("tests");if(/\b(build|tsc|compile|bundle)\b/.test(cmd))verification.add("build");if(/\b(eslint|lint|prettier)\b/.test(cmd))verification.add("lint");if(/\b(run|start|serve|runtime)\b/.test(cmd))verification.add("runtime");}
+      emitter.onPhase("working",call.name);emitter.onToolCall(id,call);emitter.onToolUpdate(id,{...call,status:result.ok?"done":"error",result:result.ok?result.output:undefined,error:result.ok?undefined:result.output});call.result=result.output;call.status=result.ok?"done":"error";call.error=result.ok?undefined:result.output;
       session.messages.push({id:randomUUID(),role:plan.toolProtocol==="native"?"tool":"user",content:renderToolResultV2(call.name,result.output,result.ok,result.metadata),toolCallId:call.id,createdAt:Date.now()});
       if(!result.ok){const hint=result.recovery?recoveryDirective(result):undefined;if(hint)injectUser(session,hint);}
+      if(result.metadata?.evidence?.length)for(const evidence of result.metadata.evidence)verificationPlan.evidence.push(evidence);
     }
+    verificationPlan.completed=[...verification];
     emitter.onDone(id);if(ran){noProgress=0;continuations=0;}else noProgress++;if(noProgress>=3){emitter.onError("Stopped after three steps without meaningful progress.");return;}
   }
   if(!signal.aborted)emitter.onError(`Reached the ${maxSteps}-step safety limit.`);
 }
 
-function requiredVerificationComplete(plan:AdaptivePlan):boolean{const r=plan.verification;if(!r||!r.required.length)return true;return r.required.every(v=>r.completed.includes(v));}
-function injectUser(session:{messages:ChatMessage[]},content:string):void{session.messages.push({id:randomUUID(),role:"user",content,createdAt:Date.now()});}
 function resolveCalls(raw:string,native:{id?:string;name:string;args:Record<string,unknown>;thoughtSignature?:string}[],specs:ToolSpec[],plan:AdaptivePlan):ToolCall[]{
   if(plan.toolProtocol==="native"&&native.length)return native.map(c=>{const v=validateAgainstSpec(c.name,c.args,specs);return{id:c.id??randomUUID(),name:c.name,args:v.args,status:v.errors.length?"error":"proposed",error:v.errors.join(" "),sideEffecting:specs.find(s=>s.name===c.name)?.sideEffecting,thoughtSignature:c.thoughtSignature};});
   return parsePhotonBlocks(raw,specs).calls.map(p=>({id:randomUUID(),name:p.name,args:p.args,status:p.errors.length?"error":"proposed",error:p.errors.join(" "),sideEffecting:specs.find(s=>s.name===p.name)?.sideEffecting}));
 }
-function historyToLLM(messages:ChatMessage[],plan:AdaptivePlan):LLMMessage[]{const out:LLMMessage[]=[];for(const m of messages){if(m.role==="user")out.push({role:"user",content:m.content,images:m.attachments?.filter(a=>a.kind==="image"&&a.dataBase64).map(a=>a.dataBase64 as string)});else if(m.role==="assistant"){if(m.content.trim())out.push({role:"assistant",content:m.content});for(const c of m.toolCalls??[])if(c.result!==undefined&&plan.toolProtocol==="native")out.push({role:"tool",content:renderToolResultV2(c.name,c.result,c.status!=="error"),tool_call_id:c.id,name:c.name});}else if(m.role==="tool")out.push({role:"tool",content:m.content,tool_call_id:m.toolCallId,name:(m as any).name});}return out;}
+function historyToLLM(messages:ChatMessage[],plan:AdaptivePlan):LLMMessage[]{const out:LLMMessage[]=[];for(const m of messages){if(m.role==="user")out.push({role:"user",content:m.content,images:m.attachments?.filter(a=>a.kind==="image"&&a.dataBase64).map(a=>a.dataBase64 as string)});else if(m.role==="assistant"){const calls=(m.toolCalls??[]).filter(c=>c.status!=="error");if(m.content.trim()||calls.length)out.push({role:"assistant",content:m.content,tool_calls:plan.toolProtocol==="native"&&calls.length?calls.map(c=>({id:c.id,function:{name:c.name,arguments:c.args},thoughtSignature:c.thoughtSignature})):undefined});}else if(m.role==="tool")out.push({role:"tool",content:m.content,tool_call_id:m.toolCallId,name:(m as any).name});}return out;}
 function lastUser(messages:ChatMessage[]):string|undefined{for(let i=messages.length-1;i>=0;i--)if(messages[i].role==="user")return messages[i].content;return undefined;}
 function isLengthCutoff(r?:string){if(!r)return false;const x=r.toLowerCase();return x==="length"||x==="max_tokens"||x==="max-tokens"||x==="maxoutputtokens";}
 function hasUnclosedFence(text:string){const m=text.match(/```/g);return!!m&&m.length%2===1;}
 
-/** Compatibility shim: replaces the legacy local loop and controller cloud loop with the same runtime. */
+/** Activate the common runtime for both legacy local and cloud controller facades without a static circular dependency. */
 export function installUnifiedRuntime():void{
   const localProto=AgentEngine.prototype as any;
   if(!localProto.__photonUnified){
-    localProto.runTurn=function(session:ChatMessage|any,plan:AdaptivePlan,emitter:UnifiedEmitter,signal:AbortSignal){
-      const d=this.deps;
-      return runUnifiedTurn(session,plan,emitter,signal,{provider:d.client,tools:d.registry.all(),workspaceName:d.workspaceName,workspaceMap:d.workspaceMap,retrieveContext:d.retrieveContext,buildToolContext:d.toolContext,reserveOutputTokens:d.reserveOutputTokens});
-    };
+    localProto.runTurn=function(session:ChatMessage|any,plan:AdaptivePlan,emitter:UnifiedEmitter,signal:AbortSignal){const d=this.deps;return runUnifiedTurn(session,plan,emitter,signal,{provider:d.client,tools:d.registry.all(),workspaceName:d.workspaceName,workspaceMap:d.workspaceMap,retrieveContext:d.retrieveContext,buildToolContext:d.toolContext,reserveOutputTokens:d.reserveOutputTokens});};
     localProto.__photonUnified=true;
   }
-  const cloudProto=PhotonController.prototype as any;
-  if(!cloudProto.__photonUnifiedCloud){
-    cloudProto.runCloudTurn=async function(session:any,plan:AdaptivePlan,emitter:UnifiedEmitter,signal:AbortSignal){
-      const root=this.context?.extensionUri?undefined:undefined;
-      return runUnifiedTurn(session,plan,emitter,signal,{provider:this.providers,tools:this.registry.all(),workspaceName:undefined,workspaceMap:()=>Promise.resolve(undefined),buildToolContext:(s:AbortSignal)=>this.buildToolContext(s),retrieveContext:undefined,reserveOutputTokens:1024});
-    };
-    cloudProto.__photonUnifiedCloud=true;
-  }
+  try{
+    const Controller=(require("../../host/PhotonController") as typeof import("../../host/PhotonController")).PhotonController;
+    const cloudProto=Controller.prototype as any;
+    if(!cloudProto.__photonUnifiedCloud){
+      cloudProto.runCloudTurn=async function(session:any,plan:AdaptivePlan,emitter:UnifiedEmitter,signal:AbortSignal){
+        const self=this as any;const model=self.models?.find((m:any)=>m.name===plan.model);const task=plan.task??self.lastDecision?.complexity?.task;const caps=plan.modelCapabilities??capabilityForModel(model??{name:plan.model});const effectiveTask=task??{scope:"single_file",reasoning:"medium",risk:"low",verification:[],ambiguity:"low",estimatedSteps:1};
+        const enriched={...plan,task:effectiveTask,modelCapabilities:caps,executionPolicy:plan.executionPolicy??buildExecutionPolicy(effectiveTask,caps,plan.mode==="agent"?100:plan.mode==="plan"?50:1,plan.maxTools),verification:plan.verification??buildVerificationPlan(effectiveTask)} as AdaptivePlan;
+        const root=vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        return runUnifiedTurn(session,enriched,emitter,signal,{provider:self.providers,tools:self.registry.all(),workspaceName:vscode.workspace.workspaceFolders?.[0]?.name,workspaceMap:()=>buildWorkspaceMap(root),retrieveContext:(q:string,s:AbortSignal)=>self.index?.retrieveContext(q,s),buildToolContext:(s:AbortSignal)=>self.buildToolContext(s),reserveOutputTokens:1024});
+      };
+      cloudProto.__photonUnifiedCloud=true;
+    }
+  }catch{}
 }
