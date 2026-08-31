@@ -1,6 +1,6 @@
 import type { Tool, ToolContext, ToolResult } from "../../core/tools/types";
 import type { AdaptivePlan, ToolCall, ToolSpec } from "../../shared/types";
-import { canRunInParallel, rankTools, recoveryDirective } from "../../core/intelligence/policy";
+import { canRunInParallel, rankTools, recoveryDirective, selectToolSpecs } from "../../core/intelligence/policy";
 
 export type ToolPreExecuteEvent={call:ToolCall;tool:Tool;cancel?:(reason:string)=>void};
 export type ToolPostExecuteEvent={call:ToolCall;result:ToolResult};
@@ -18,13 +18,9 @@ export class ToolPipeline{
   onPostExecute(fn:(e:ToolPostExecuteEvent)=>void):()=>void{this.postListeners.add(fn);return()=>this.postListeners.delete(fn);}
 
   specsForPlan(plan:AdaptivePlan):ToolSpec[]{
-    if(plan.mode==="chat")return[];
-    const rank:Record<string,number>={low:0,medium:1,high:2,max:3};
-    const level=rank[plan.intelligence]??0;
-    let specs=this.specs().filter(s=>(rank[s.minTier??"low"]??0)<=level);
-    if(plan.mode==="plan")specs=specs.filter(s=>!s.sideEffecting);
     const task=plan.task??{scope:"single_file",reasoning:"medium",risk:"low",verification:[],ambiguity:"low",estimatedSteps:1};
-    return rankTools(specs,task,"orient").slice(0,Math.max(1,plan.maxTools));
+    const phase=plan.mode==="plan"?"orient":plan.mode==="chat"?"final":"orient";
+    return selectToolSpecs(this.specs(),plan,phase);
   }
 
   async execute(call:ToolCall,ctx:ToolContext):Promise<ToolResult>{
@@ -41,7 +37,6 @@ export class ToolPipeline{
     return result;
   }
 
-  /** Execute independent safe-read waves concurrently; all writes/exec stay ordered. */
   async executeMany(calls:ToolCall[],ctx:ToolContext,maxConcurrent=4):Promise<Map<string,ToolResult>>{
     const results=new Map<string,ToolResult>();
     const pending=[...calls];
@@ -59,11 +54,10 @@ export class ToolPipeline{
       }
       const waveResults=await Promise.all(wave.map(c=>this.execute(c,ctx)));
       wave.forEach((c,i)=>results.set(c.id,waveResults[i]));
-      if(wave.length>1 && waveResults.some(r=>!r.ok)) break;
+      if(wave.length>1&&waveResults.some(r=>!r.ok))break;
     }
     return results;
   }
 
-  /** Human-readable recovery instruction for callers that want to steer the model. */
   recoveryHint(result:ToolResult):string|undefined{return result.recovery?recoveryDirective(result):undefined;}
 }
