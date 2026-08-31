@@ -17,8 +17,8 @@ export interface GeminiConfig {
 
 /**
  * Google Gemini provider (Generative Language API). Streams via SSE
- * (`streamGenerateContent?alt=sse`). Function calling is supported but Photon
- * uses the block protocol for cloud models, so tool results flow as text.
+ * (`streamGenerateContent?alt=sse`) and translates Photon-native tool schemas
+ * to Gemini's function declaration format at the provider boundary.
  */
 export class GeminiProvider implements LLMProvider {
   readonly id = "gemini";
@@ -166,7 +166,12 @@ export class GeminiProvider implements LLMProvider {
             (t) => ({
               name: t.function.name,
               description: t.function.description,
-              parameters: t.function.parameters,
+              // Gemini's function-calling `parameters` field uses the protobuf
+              // Schema type and rejects JSON-Schema-only keywords such as
+              // `additionalProperties`. Photon keeps the richer canonical
+              // schema, so send it through Gemini's JSON-Schema escape hatch.
+              // `parametersJsonSchema` is mutually exclusive with `parameters`.
+              parametersJsonSchema: t.function.parameters,
             })
           ),
         },
