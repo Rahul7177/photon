@@ -3,7 +3,7 @@ import type { Attachment, Mode, ThinkingSetting } from "../../../src/shared/type
 import type { AppState, Actions } from "../state/store";
 import { ContextMeter } from "./ContextMeter";
 import { CapabilityBadges } from "./CapabilityBadges";
-import { readFileToAttachment, readClipboardBlobToAttachment, formatBytes } from "../attachments";
+import { readFileToAttachment, formatBytes } from "../attachments";
 
 const MODES: { id: Mode; label: string; hint: string }[] = [
   { id: "chat", label: "Chat", hint: "Talk & get code, no tools" },
@@ -40,14 +40,9 @@ function ModeDropdown({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => v
     }
   };
 
-  // Close dropdown when clicking outside
   if (typeof window !== "undefined") {
-    // Use a ref to store the handler so we can remove it
     const handlerRef = useRef(handleClickOutside);
     handlerRef.current = handleClickOutside;
-
-    // We'll add the event listener in a useEffect, but since this is a simple component,
-    // we'll use a different approach - attach to document on mount
   }
 
   return (
@@ -149,7 +144,7 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
       }
 
       if (file) {
-        const { attachment, error } = await readClipboardBlobToAttachment(file);
+        const { attachment, error } = await readFileToAttachment(file);
         if (error) setAttachError(error);
         else if (attachment) {
           if (attachment.kind === "image" && !supportsVision) {
@@ -238,7 +233,7 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
         </div>
 
         {modelCaps?.thinking && (
-          <div className="thinking-picker" title="Reasoning level">
+          <div className="model-picker thinking-picker" title="Reasoning level">
             <select
               value={state.config.thinkingLevel}
               onChange={(e) => actions.setThinkingSetting(e.target.value as ThinkingSetting)}
