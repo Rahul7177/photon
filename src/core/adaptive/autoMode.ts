@@ -1,52 +1,19 @@
-import type {
-  AdaptivePlan,
-  AutoDecision,
-  BenchResult,
-  ComplexityAssessment,
-  MachineProfile,
-  Mode,
-  ModelInfo,
-  ModelScore,
-} from "../../shared/types";
+import type { AdaptivePlan, AutoDecision, BenchResult, ComplexityAssessment, MachineProfile, Mode, ModelInfo, ModelScore } from "../../shared/types";
+import { capabilityForModel, analyzeTask, toComplexity } from "../intelligence/policy";
 import { buildPlan, type OrchestratorInput } from "./orchestrator";
-import { classifyComplexity } from "./complexity";
+import { estimateTokens } from "./tokens";
 
-// Ranking weights, kept as named, tunable constants (not magic numbers buried in
-// logic) so they can be adjusted from telemetry later without touching the algorithm.
 const WEIGHTS = {
-  /** Meets the task's minimum context requirement — dominant, near-binary. */
-  contextFit: 40,
-  /** Extra headroom above the minimum, lightly rewarded. */
-  contextHeadroom: 8,
-  /** Measured generation speed on this machine (from Photon Bench). */
-  throughput: 18,
-  /** Measured structured-tool-call reliability (from Photon Bench). */
-  toolReliability: 22,
-  /** Capability tier vs. task difficulty match. */
-  tierMatch: 20,
-  /** Small efficiency bonus for not over-provisioning a simple task. */
-  efficiency: 6,
-  /** Nudge toward free/local models when scores are otherwise close. */
-  localPreference: 4,
-  /** Penalty for a model whose context can't hold the task. Large enough to
-   *  matter, small enough that measured bench quality can still win — the old
-   *  fits-first sort made ANY fitting model (e.g. a cloud model with a huge
-   *  advertised window) beat every local model regardless of everything else. */
-  contextMisfit: 24,
-};
-
-const TIER_RANK: Record<NonNullable<ModelInfo["tier"]>, number> = {
-  tiny: 0,
-  small: 1,
-  medium: 2,
-  large: 3,
-};
-
-/** Ideal tier per complexity level — the ranker rewards proximity to this. */
-const IDEAL_TIER: Record<ComplexityAssessment["level"], number> = {
-  simple: 1, // small is plenty
-  moderate: 2, // medium
-  complex: 3, // large
+  contextFit: 30,
+  contextHeadroom: 6,
+  throughput: 12,
+  toolCalling: 18,
+  reasoning: 12,
+  coding: 14,
+  recovery: 10,
+  verification: 8,
+  tierMatch: 8,
+  localPreference: 3,
 };
 
 export interface AutoModeInput {
@@ -55,124 +22,55 @@ export interface AutoModeInput {
   attachmentCount?: number;
   models: ModelInfo[];
   machine: MachineProfile | null;
-  /** Photon Bench results keyed by model name (M7), used to rank on real data. */
   benchByModel?: Map<string, BenchResult>;
-  /** A model the user pinned for this project — always wins if it still exists. */
   pinnedModel?: string;
 }
 
-/**
- * Rank the available models for a given task. Pure and transparent: each score
- * carries `reasons` so the UI can explain the ranking. Uses measured benchmark
- * data when present, and falls back to static tier/param heuristics otherwise.
- */
-export function rankModels(
-  models: ModelInfo[],
-  complexity: ComplexityAssessment,
-  benchByModel?: Map<string, BenchResult>
-): ModelScore[] {
-  const throughputs = [...(benchByModel?.values() ?? [])].map((b) => b.tokensPerSec);
-  const maxTps = throughputs.length ? Math.max(...throughputs, 1) : 0;
+export function rankModels(models: ModelInfo[], complexity: ComplexityAssessment, benchByModel?: Map<string, BenchResult>): ModelScore[] {
+  const task = complexity.task ?? analyzeTask("", "agent");
+  const tpsValues = [...(benchByModel?.values() ?? [])].map(b => b.tokensPerSec).filter(v => v > 0);
+  const maxTps = Math.max(...tpsValues, 1);
+  const idealReasoning = task.reasoning === "high" ? 0.85 : task.reasoning === "medium" ? 0.65 : 0.45;
+  const idealTool = task.scope === "single_file" && task.verification.length === 0 ? 0.55 : 0.75;
 
-  const scored = models.map((m): ModelScore => {
-    const reasons: string[] = [];
-    let score = 0;
-
+  return models.map(m => {
+    const bench = benchByModel?.get(m.name);
+    const caps = capabilityForModel(m, bench);
     const ctx = m.contextLength ?? 8192;
     const fits = ctx >= complexity.minContextTokens;
-    if (fits) {
-      score += WEIGHTS.contextFit;
-      const headroom = Math.min(1, (ctx - complexity.minContextTokens) / complexity.minContextTokens);
-      score += headroom * WEIGHTS.contextHeadroom;
-      reasons.push(`context ${ctx.toLocaleString()} ≥ needed ${complexity.minContextTokens.toLocaleString()}`);
-    } else {
-      score -= WEIGHTS.contextMisfit;
-      reasons.push(`context ${ctx.toLocaleString()} < needed ${complexity.minContextTokens.toLocaleString()}`);
-    }
+    let score = 0;
+    const reasons: string[] = [];
 
-    // Local models are free, private, and always warm on this machine — a
-    // small tiebreaker toward them keeps Auto Mode from drifting cloudward.
-    if (m.provider === "ollama") {
-      score += WEIGHTS.localPreference;
-      reasons.push("local model");
-    }
+    if (fits) { score += WEIGHTS.contextFit; score += Math.min(1, (ctx - complexity.minContextTokens) / Math.max(1, complexity.minContextTokens)) * WEIGHTS.contextHeadroom; reasons.push(`context ${ctx.toLocaleString()} fits`); }
+    else { reasons.push(`context ${ctx.toLocaleString()} is tight`); score -= WEIGHTS.contextFit * 0.75; }
 
-    // Tier match: reward proximity to the ideal tier for this complexity.
-    const tier = TIER_RANK[m.tier ?? "small"];
-    const ideal = IDEAL_TIER[complexity.level];
-    const tierMatch = 1 - Math.min(1, Math.abs(tier - ideal) / 3);
-    score += tierMatch * WEIGHTS.tierMatch;
-    // For simple tasks, a smaller model that still fits is a plus (fast + frugal).
-    if (complexity.level === "simple" && tier <= ideal) score += WEIGHTS.efficiency;
-
-    // Measured signals from Photon Bench, if we have them.
-    const bench = benchByModel?.get(m.name);
-    if (bench) {
-      if (maxTps > 0) {
-        const tps = bench.tokensPerSec / maxTps;
-        score += tps * WEIGHTS.throughput;
-        reasons.push(`${Math.round(bench.tokensPerSec)} tok/s`);
-      }
-      score += bench.toolCallReliability * WEIGHTS.toolReliability;
-      reasons.push(`${Math.round(bench.toolCallReliability * 100)}% tool-call reliability`);
-    } else {
-      // No bench yet: assume tool-trained models are more reliable at tool calls.
-      const assumed = m.toolTrained ? 0.6 : 0.35;
-      score += assumed * WEIGHTS.toolReliability;
-      reasons.push(m.toolTrained ? "tool-trained (assumed reliable)" : "not tool-trained (assumed weaker)");
-    }
+    score += (caps.toolCalling * WEIGHTS.toolCalling);
+    score += (caps.coding * WEIGHTS.coding);
+    score += (caps.recovery * WEIGHTS.recovery);
+    score += (caps.verification * WEIGHTS.verification);
+    score += Math.max(0, 1 - Math.abs(caps.reasoning - idealReasoning)) * WEIGHTS.reasoning;
+    score += Math.max(0, 1 - Math.abs(caps.toolCalling - idealTool)) * WEIGHTS.tierMatch;
+    reasons.push(`tool ${Math.round(caps.toolCalling * 100)}%`);
+    reasons.push(`coding ${Math.round(caps.coding * 100)}%`);
+    if (task.reasoning !== "low") reasons.push(`reasoning ${Math.round(caps.reasoning * 100)}%`);
+    if (bench && maxTps > 0) { score += (bench.tokensPerSec / maxTps) * WEIGHTS.throughput; reasons.push(`${Math.round(bench.tokensPerSec)} tok/s`); }
+    if (m.provider === "ollama" || m.provider === "llamacpp") { score += WEIGHTS.localPreference; reasons.push("local"); }
+    if (bench?.capabilityProfile) reasons.push("bench-profiled");
 
     return { model: m.name, score: Math.round(score * 100) / 100, fits, reasons };
-  });
-
-  // Pure score order — fit is already priced into each score via the
-  // contextFit bonus / misfit penalty above.
-  return scored.sort((a, b) => b.score - a.score);
+  }).sort((a, b) => b.score - a.score);
 }
 
-/**
- * Choose a model for the request and return a fully explainable decision. A
- * pinned model always wins (but is still ranked, so the panel can show why the
- * alternatives were passed over).
- */
 export function decideModel(input: AutoModeInput): AutoDecision {
-  const complexity = classifyComplexity({
-    prompt: input.prompt,
-    attachmentCount: input.attachmentCount,
-    mode: input.mode,
-  });
+  const promptTokens = estimateTokens(input.prompt ?? "");
+  const task = analyzeTask(input.prompt, input.mode, input.attachmentCount ?? 0);
+  const complexity = toComplexity(task, promptTokens);
   const scores = rankModels(input.models, complexity, input.benchByModel);
-
-  const pinnedExists =
-    !!input.pinnedModel && input.models.some((m) => m.name === input.pinnedModel);
-
-  if (pinnedExists) {
-    return {
-      chosenModel: input.pinnedModel!,
-      auto: false,
-      pinned: true,
-      complexity,
-      scores,
-      reason: `Pinned to ${input.pinnedModel} for this project.`,
-    };
-  }
-
+  const pinnedExists = !!input.pinnedModel && input.models.some(m => m.name === input.pinnedModel);
+  if (pinnedExists) return { chosenModel: input.pinnedModel!, auto: false, pinned: true, complexity, scores, reason: `Pinned to ${input.pinnedModel}.` };
   const best = scores[0];
-  if (!best) {
-    return {
-      chosenModel: "",
-      auto: true,
-      pinned: false,
-      complexity,
-      scores,
-      reason: "No models available.",
-    };
-  }
-
-  const reason = best.fits
-    ? `Auto-selected ${best.model} for a ${complexity.level} task — ${best.reasons.slice(0, 2).join(", ")}.`
-    : `No model fully fits a ${complexity.level} task; using the closest, ${best.model}. Context may be tight.`;
-
+  if (!best) return { chosenModel: "", auto: true, pinned: false, complexity, scores, reason: "No models available." };
+  const reason = `${best.model} selected for ${task.scope}/${task.reasoning} work; ${best.reasons.slice(0, 3).join(", ")}.`;
   return { chosenModel: best.model, auto: true, pinned: false, complexity, scores, reason };
 }
 
@@ -181,27 +79,24 @@ export interface PlanRequest extends AutoModeInput {
   reserveOutputTokens: number;
   adaptiveEnabled: boolean;
   userNumCtx?: number;
+  cloudNativeTools?: boolean;
 }
 
-/**
- * The engine's top-level entry (Module 6/8): given a prompt, the available
- * models, and the machine, decide which model to use and produce the concrete
- * ExecutionPlan (`AdaptivePlan`) for it. Returns both so the host can act on the
- * plan and surface the decision in the transparency panel.
- */
 export function planRequest(input: PlanRequest): { decision: AutoDecision; plan: AdaptivePlan | null } {
   const decision = decideModel(input);
-  const model = input.models.find((m) => m.name === decision.chosenModel);
+  const model = input.models.find(m => m.name === decision.chosenModel);
   if (!model) return { decision, plan: null };
-
   const plan = buildPlan({
     model,
     machine: input.machine,
     mode: input.mode,
+    prompt: input.prompt,
     userNumCtx: input.userNumCtx,
     intelligence: input.intelligence,
     reserveOutputTokens: input.reserveOutputTokens,
     adaptiveEnabled: input.adaptiveEnabled,
+    cloudNativeTools: input.cloudNativeTools,
+    task: decision.complexity.task,
   });
   return { decision, plan };
 }
