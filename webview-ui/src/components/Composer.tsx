@@ -20,7 +20,6 @@ const THINKING_OPTIONS: Array<{ value: ThinkingSetting; label: string }> = [
   { value: "xtrahigh", label: "Extra High" },
 ];
 
-// Sentinel value for the "Auto" model-picker option.
 const AUTO = "__auto__";
 
 function benchTps(results: { model: string; tokensPerSec: number }[], model: string): number | undefined {
@@ -28,22 +27,10 @@ function benchTps(results: { model: string; tokensPerSec: number }[], model: str
   return r ? Math.round(r.tokensPerSec) : undefined;
 }
 
-// Custom dropdown component that opens upwards
 function ModeDropdown({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => void }) {
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const currentMode = MODES.find((m) => m.id === mode) || MODES[0];
-
-  const handleClickOutside = (e: MouseEvent) => {
-    if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
-      setOpen(false);
-    }
-  };
-
-  if (typeof window !== "undefined") {
-    const handlerRef = useRef(handleClickOutside);
-    handlerRef.current = handleClickOutside;
-  }
 
   return (
     <div className="mode-dropdown" ref={wrapperRef}>
@@ -232,7 +219,9 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
           </select>
         </div>
 
-        {modelCaps?.thinking && (
+        {/* Always-visible reasoning control. Providers that do not expose native reasoning
+            simply ignore unsupported values in their adapter; Auto remains safe. */}
+        {modelCaps && (
           <div className="model-picker thinking-picker" title="Reasoning level">
             <select
               value={state.config.thinkingLevel}
