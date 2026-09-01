@@ -1545,10 +1545,16 @@ export class PhotonController {
     }
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const workspaceMap = await buildWorkspaceMap(root).catch(() => undefined);
+    // Classify tool policy here too so the system prompt matches the actual
+    // tool surface. The unifiedRuntime monkey-patch also sets it, but the
+    // system prompt is built before that patch runs.
+    const lastUser = [...session.messages].reverse().find((m) => m.role === "user")?.content ?? "";
+    const toolPolicy = classifyCloudToolPolicyForPrompt(plan.mode, String(lastUser));
     const system = buildCloudSystemPrompt({
       mode: plan.mode,
       workspaceName: vscode.workspace.workspaceFolders?.[0]?.name,
       workspaceMap,
+      toolPolicy,
     });
     await runCloudTurn({
       provider: this.providers,
@@ -1894,4 +1900,18 @@ export class PhotonController {
       this.drainingQueue = false;
     }
   }
+}
+
+/** Classify cloud tool policy for the system prompt — mirrors unifiedRuntime's logic. */
+function classifyCloudToolPolicyForPrompt(mode: unknown, text: string): "all" | "web" | "none" {
+  const t = text.trim().toLowerCase();
+  if (!t) return "all";
+  if (/^(hi|hello|hey|hiya|yo|thanks|thank you|thx|ok|okay|great|cool|nice|good morning|good afternoon|good evening)[\s,!.?]*$/i.test(t)) {
+    return "none";
+  }
+  if (mode === "agent" || mode === "plan") return "all";
+  const workspaceIntent = /\b(file|files|folder|directory|workspace|repo|repository|codebase|code|class|function|symbol|bug|error|stack trace|edit|modify|change|implement|refactor|debug|fix|write|read|search files|list files|build|test|compile|lint|run command|search|find|show|open|list|get|create|add|remove|delete|rename|move|copy|update|set|configure|install|uninstall|run|start|stop|restart|check|test|debug|format|lint|deploy|push|pull|commit|merge|branch|clone|init|setup)\b/i.test(t);
+  const externalIntent = /\b(weather|temperature|forecast|news|current|today|tonight|latest|live|recent|price|prices|stock|stocks|market|release|version|time|date|traffic|search|lookup|find out|what is|what are|how to|who is|where is)\b/i.test(t);
+  if (externalIntent && !workspaceIntent) return "web";
+  return "all";
 }

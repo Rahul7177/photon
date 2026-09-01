@@ -1,4 +1,4 @@
-/* Photon design system — void black, photon red→orange→amber brand gradient.
+﻿﻿/* Photon design system — void black, photon red→orange→amber brand gradient.
    Minimal and calm: flat colors, subtle surfaces, brand accent used sparingly. */
    :root {
   /* Surfaces — aligned with photon-website palette */
@@ -46,9 +46,15 @@
 
 /* Single scrollbar scope: only inside .messages and .settings-scroll */
 .messages,
-.settings-scroll {
+.settings-scroll,
+.hero-wrapper {
   scrollbar-width: thin;
   scrollbar-color: var(--space-500) transparent;
+}
+
+/* Hide the outer VS Code webview scrollbar — only inner scrollbars should show */
+html {
+  overflow: hidden;
 }
 
 
@@ -372,28 +378,72 @@ select optgroup {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  scrollbar-gutter: stable;
 }
 .messages::-webkit-scrollbar {
-  width: 6px;
+  width: 5px;
 }
 .messages::-webkit-scrollbar-track {
   background: transparent;
 }
 .messages::-webkit-scrollbar-thumb {
-  background: var(--space-500);
-  border-radius: 3px;
+  background: linear-gradient(180deg, var(--red), var(--orange), var(--amber));
+  border-radius: 999px;
+  transition: background 0.2s, box-shadow 0.2s, opacity 0.3s;
+  opacity: 0;
+  animation: scrollbarFadeOut 0.3s ease 3s forwards;
 }
-.messages:not(:hover)::-webkit-scrollbar-thumb {
-  background: transparent;
+.messages:hover::-webkit-scrollbar-thumb,
+.messages:active::-webkit-scrollbar-thumb,
+.messages:focus-within::-webkit-scrollbar-thumb {
+  opacity: 1;
+  animation: none;
+}
+.messages::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, var(--amber), var(--orange), var(--red));
+  box-shadow: 0 0 6px rgba(255, 107, 45, 0.35);
+  opacity: 1;
+  animation: none;
 }
 
-/* Hero wrapper — no scroll, content is always visible */
+/* Hero wrapper — scrollable with custom themed scrollbar (auto-hide after 3s) */
 .hero-wrapper {
   flex: 1;
   display: flex;
   flex-direction: column;
   padding: 10px var(--gutter);
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-width: 0;
+  scrollbar-gutter: stable;
+}
+.hero-wrapper::-webkit-scrollbar {
+  width: 5px;
+}
+.hero-wrapper::-webkit-scrollbar-track {
+  background: transparent;
+}
+.hero-wrapper::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, var(--red), var(--orange), var(--amber));
+  border-radius: 999px;
+  transition: background 0.2s, box-shadow 0.2s, opacity 0.3s;
+  opacity: 0;
+  animation: scrollbarFadeOut 0.3s ease 3s forwards;
+}
+.hero-wrapper:hover::-webkit-scrollbar-thumb,
+.hero-wrapper:active::-webkit-scrollbar-thumb,
+.hero-wrapper:focus-within::-webkit-scrollbar-thumb {
+  opacity: 1;
+  animation: none;
+}
+.hero-wrapper::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, var(--amber), var(--orange), var(--red));
+  box-shadow: 0 0 6px rgba(255, 107, 45, 0.35);
+  opacity: 1;
+  animation: none;
+}
+@keyframes scrollbarFadeOut {
+  to { opacity: 0; }
 }
 .msg {
   display: flex;
@@ -819,9 +869,23 @@ select optgroup {
   gap: 6px;
   margin-bottom: var(--stack-sm);
 }
-/* When badges wrap to a second row, keep them right-aligned */
+/* Model selector + thinking dropdown + tool indicators stay together as one group.
+   They wrap as a unit — never split across rows. */
+.composer-toolbar .model-picker,
+.composer-toolbar .thinking-picker,
 .composer-toolbar .cap-badges {
-  margin-left: auto;
+  flex-shrink: 0;
+}
+.composer-toolbar .cap-badges {
+  margin-left: 0;
+}
+/* Group: model picker + thinking + badges — wraps together */
+.composer-toolbar .model-picker-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+  min-width: 0;
 }
 
 /* Model capabilities bar — shown below the toolbar */

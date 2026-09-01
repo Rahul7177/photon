@@ -27,7 +27,13 @@ function scoreTool(tool:ToolSpec,task:TaskAnalysis,phase:string,verification:Set
  * model can access its core workspace tools. */
 export function selectToolSpecs(specs:ToolSpec[],plan:AdaptivePlan,phase:"orient"|"edit"|"verify"|"final"):ToolSpec[]{
   let usable=plan.mode==="plan"?specs.filter(s=>!s.sideEffecting):[...specs];if(plan.mode==="chat")return usable.filter(s=>s.name==="web_search"||s.name==="web_fetch").slice(0,Math.max(1,plan.maxTools));
-  const byName=new Map(usable.map(s=>[s.name,s]));const core=LOCAL_CORE_TOOLS.map(n=>byName.get(n)).filter((s):s is ToolSpec=>!!s);const extended=LOCAL_EXTENDED_TOOLS.map(n=>byName.get(n)).filter((s):s is ToolSpec=>!!s);const task=plan.task??analyzeTask("",plan.mode);const coreRanked=rankTools(core,task,phase);const ranked=rankTools(usable,task,phase);const ordered:ToolSpec[]=[];const push=(s:ToolSpec)=>{if(!ordered.some(x=>x.name===s.name))ordered.push(s);};for(const s of coreRanked)push(s);const levelRank:Record<string,number>={low:0,medium:1,high:2,max:3};const extraCount=levelRank[plan.intelligence]??0;if(extraCount>=1)for(const s of extended)push(s);for(const s of ranked)push(s);return ordered.slice(0,Math.max(1,plan.maxTools));
+  const byName=new Map(usable.map(s=>[s.name,s]));const core=LOCAL_CORE_TOOLS.map(n=>byName.get(n)).filter((s):s is ToolSpec=>!!s);const extended=LOCAL_EXTENDED_TOOLS.map(n=>byName.get(n)).filter((s):s is ToolSpec=>!!s);const task=plan.task??analyzeTask("",plan.mode);const coreRanked=rankTools(core,task,phase);const ranked=rankTools(usable,task,phase);const ordered:ToolSpec[]=[];const push=(s:ToolSpec)=>{if(!ordered.some(x=>x.name===s.name))ordered.push(s);};for(const s of coreRanked)push(s);
+  // Web tools are always available — they are the only way to get current/external facts.
+  // Other extended tools (code_outline, move_path, todo_write, think) are gated by intelligence.
+  const webTools=extended.filter(s=>s.name==="web_search"||s.name==="web_fetch");
+  const otherExtended=extended.filter(s=>s.name!=="web_search"&&s.name!=="web_fetch");
+  for(const s of webTools)push(s);
+  const levelRank:Record<string,number>={low:0,medium:1,high:2,max:3};const extraCount=levelRank[plan.intelligence]??0;if(extraCount>=1)for(const s of otherExtended)push(s);for(const s of ranked)push(s);return ordered.slice(0,Math.max(1,plan.maxTools));
 }
 
 /** Native JSON tool calling is an optimization, not the local fallback path.

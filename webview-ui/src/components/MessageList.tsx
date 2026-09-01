@@ -36,7 +36,7 @@ export function MessageList({
 
   return (
     <div className="messages" ref={containerRef}>
-      {state.messages.map((m) => (
+      {state.messages.filter((m) => !m.hidden).map((m) => (
         <Message key={m.id} message={m} />
       ))}
 

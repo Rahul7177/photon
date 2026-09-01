@@ -3,16 +3,16 @@ import { clamp, fail, ok, outputBudget, type Tool } from "../types";
 export const webSearchTool: Tool = {
   spec: {
     name: "web_search",
-    summary: "Search the public web and return concise result leads.",
-    params: [{ name: "query", type: "string", required: true, description: "What to search for." }],
+    summary: "Search the web for current/external information. Returns URLs and snippets. After searching, use web_fetch on the best URL to read the full page.",
+    params: [{ name: "query", type: "string", required: true, description: "What to search for. Be specific and include keywords." }],
     sideEffecting: false,
     priority: 13,
-    minTier: "high",
+    minTier: "low",
     tags: ["web", "read", "search"],
     risk: "network",
     concurrency: "safe_parallel",
     idempotency: "idempotent",
-    example: '[TOOL web_search]\nquery: vite react plugin options 2026\n[/TOOL]',
+    example: '[TOOL web_search]\nquery: vite react plugin options 2026\n[/TOOL]\n\nAfter getting results, call web_fetch on the best URL.',
   },
   async execute(args, ctx) {
     if (ctx.webSearchProvider === "none") return fail("Web search is disabled in Photon settings.");
@@ -40,7 +40,8 @@ export const webSearchTool: Tool = {
       const html = await res.text();
       const results = parseDuckDuckGo(html).slice(0, ctx.capability === "max" ? 8 : 5);
       if (!results.length) return ok("No results found. Try different keywords.");
-      return ok(clamp(results.map((r,i)=>`${i+1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`).join("\n\n"), outputBudget(ctx)));
+      const resultList = results.map((r,i)=>`${i+1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`).join("\n\n");
+      return ok(clamp(resultList, outputBudget(ctx)));
     } catch(e) {
       if((e as Error).name==="AbortError")return fail("Search cancelled.");
       return fail(`Search error: ${(e as Error).message}`);
@@ -51,14 +52,14 @@ export const webSearchTool: Tool = {
 export const webFetchTool: Tool = {
   spec: {
     name: "web_fetch",
-    summary: "Fetch a public HTTPS page or raw file and return readable text.",
+    summary: "Read a web page or raw file. Use this after web_search to read the full content of a URL found in search results.",
     params: [
-      { name: "url", type: "string", required: true, description: "Public https:// URL." },
-      { name: "start_line", type: "number", required: false, description: "First non-empty line to return." },
+      { name: "url", type: "string", required: true, description: "Public https:// URL to fetch. Copy from web_search results." },
+      { name: "start_line", type: "number", required: false, description: "First non-empty line to return (for long pages)." },
     ],
     sideEffecting: false,
     priority: 14,
-    minTier: "high",
+    minTier: "low",
     tags: ["web", "read"],
     risk: "network",
     concurrency: "safe_parallel",

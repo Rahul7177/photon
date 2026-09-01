@@ -4,6 +4,7 @@ export interface CloudSystemInput {
   mode: Mode;
   workspaceName?: string;
   workspaceMap?: string;
+  toolPolicy?: "all" | "web" | "none";
 }
 
 /**
@@ -13,22 +14,41 @@ export interface CloudSystemInput {
 export function buildCloudSystemPrompt(input: CloudSystemInput): string {
   const parts: string[] = [];
 
+  // When toolPolicy is "none" (greeting), keep the prompt minimal — no tool
+  // instructions that would make the model try to call unavailable tools.
+  if (input.toolPolicy === "none") {
+    parts.push(
+      `You are Photon, a friendly AI assistant inside VS Code${input.workspaceName ? ` in the "${input.workspaceName}" workspace` : ""}. Greet the user warmly and ask how you can help. Do not call any tools for a simple greeting.`
+    );
+    return parts.join("\n\n");
+  }
+
   parts.push(
     `You are Photon, an expert software engineer working inside VS Code${input.workspaceName ? ` in the "${input.workspaceName}" workspace` : ""}. You complete tasks fully using the provided tools.`
   );
 
-  parts.push([
-    "# Tool use",
-    "- Call exactly ONE tool per message, then STOP and wait for its result.",
-    "- Never invent file contents, paths, or command output. Read before you edit.",
-    "- Use read_file on any file before modifying it, and copy the exact text into replace_in_file's \"find\".",
-    "- write_to_file is for NEW files or complete rewrites — always provide the FULL content, never placeholders or \"...\".",
-    "- replace_in_file is for targeted changes to existing files.",
-    "- Use list_files / search_files / list_code_definition_names to explore instead of guessing paths.",
-    "- execute_command runs in the workspace root — use it to build, test, and verify your changes.",
-    "- web_search searches the public web. web_fetch opens a public HTTPS page. Use these whenever current, live, latest, recent, market, price, weather, news, release, or other time-sensitive/external information is required.",
-    "- Do not claim that real-time or web access is unavailable when web_search or web_fetch is provided. Call the appropriate tool instead.",
-  ].join("\n"));
+  if (input.toolPolicy === "web") {
+    parts.push([
+      "# Tool use",
+      "- You have access to web_search and web_fetch for current/external information.",
+      "- web_search searches the public web. web_fetch opens a public HTTPS page.",
+      "- Call exactly ONE tool per message, then STOP and wait for its result.",
+      "- Do not claim that real-time or web access is unavailable — call the appropriate tool instead.",
+    ].join("\n"));
+  } else {
+    parts.push([
+      "# Tool use",
+      "- Call exactly ONE tool per message, then STOP and wait for its result.",
+      "- Never invent file contents, paths, or command output. Read before you edit.",
+      "- Use read_file on any file before modifying it, and copy the exact text into replace_in_file's \"find\".",
+      "- write_to_file is for NEW files or complete rewrites — always provide the FULL content, never placeholders or \"...\".",
+      "- replace_in_file is for targeted changes to existing files.",
+      "- Use list_files / search_files / list_code_definition_names to explore instead of guessing paths.",
+      "- execute_command runs in the workspace root — use it to build, test, and verify your changes.",
+      "- web_search searches the public web. web_fetch opens a public HTTPS page. Use these whenever current, live, latest, recent, market, price, weather, news, release, or other time-sensitive/external information is required.",
+      "- Do not claim that real-time or web access is unavailable when web_search or web_fetch is provided. Call the appropriate tool instead.",
+    ].join("\n"));
+  }
 
   parts.push([
     "# Completion protocol",

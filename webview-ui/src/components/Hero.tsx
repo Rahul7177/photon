@@ -31,7 +31,6 @@ export function Hero({ state }: { state: AppState }) {
             </svg>
           </span>
           <h1 className="hero-brand-title">PHOTON</h1>
-          <p className="hero-tagline">Your local AI coding companion</p>
         </div>
 
         {/* Model + mode summary */}

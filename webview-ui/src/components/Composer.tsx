@@ -188,54 +188,56 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
             ☁ Cloud
           </button>
         </div>
-        <div className="model-picker">
-          <select
-            value={state.config.autoSelectModel ? AUTO : state.selectedModel}
-            onChange={(e) => {
-              if (e.target.value === AUTO) actions.setAutoSelect(true);
-              else actions.setModel(e.target.value);
-            }}
-            disabled={state.models.length === 0}
-            title={
-              state.config.autoSelectModel
-                ? `Auto — Photon picks the model per request${state.selectedModel ? ` (last: ${state.selectedModel})` : ""}`
-                : state.selectedModel
-            }
-          >
-            {!state.ready && <option value="">Loading models…</option>}
-            {state.ready && state.models.length === 0 && <option value="">No models — check Local / Cloud</option>}
-            {state.ready && state.models.length > 0 && <option value={AUTO}>🤖 Auto</option>}
-            {state.models.map((m) => {
-              const tps = benchTps(state.benchResults, m.name);
-              const display = m.name.includes(":") ? m.name.split(":").slice(1).join(":") : m.name;
-              return (
-                <option key={m.name} value={m.name} title={m.name}>
-                  {display}
-                  {m.tier ? ` · ${m.tier}` : ""}
-                  {tps ? ` · ${tps} tok/s` : ""}
-                </option>
-              );
-            })}
-          </select>
-        </div>
-
-        {/* Always-visible reasoning control. Providers that do not expose native reasoning
-            simply ignore unsupported values in their adapter; Auto remains safe. */}
-        {modelCaps && (
-          <div className="model-picker thinking-picker" title="Reasoning level">
+        <div className="model-picker-group">
+          <div className="model-picker">
             <select
-              value={state.config.thinkingLevel}
-              onChange={(e) => actions.setThinkingSetting(e.target.value as ThinkingSetting)}
-              aria-label="Reasoning level"
+              value={state.config.autoSelectModel ? AUTO : state.selectedModel}
+              onChange={(e) => {
+                if (e.target.value === AUTO) actions.setAutoSelect(true);
+                else actions.setModel(e.target.value);
+              }}
+              disabled={state.models.length === 0}
+              title={
+                state.config.autoSelectModel
+                  ? `Auto — Photon picks the model per request${state.selectedModel ? ` (last: ${state.selectedModel})` : ""}`
+                  : state.selectedModel
+              }
             >
-              {THINKING_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>{option.label}</option>
-              ))}
+              {!state.ready && <option value="">Loading models…</option>}
+              {state.ready && state.models.length === 0 && <option value="">No models — check Local / Cloud</option>}
+              {state.ready && state.models.length > 0 && <option value={AUTO}>🤖 Auto</option>}
+              {state.models.map((m) => {
+                const tps = benchTps(state.benchResults, m.name);
+                const display = m.name.includes(":") ? m.name.split(":").slice(1).join(":") : m.name;
+                return (
+                  <option key={m.name} value={m.name} title={m.name}>
+                    {display}
+                    {m.tier ? ` · ${m.tier}` : ""}
+                    {tps ? ` · ${tps} tok/s` : ""}
+                  </option>
+                );
+              })}
             </select>
           </div>
-        )}
 
-        {modelCaps && <CapabilityBadges model={modelCaps} compact />}
+          {/* Always-visible reasoning control. Providers that do not expose native reasoning
+              simply ignore unsupported values in their adapter; Auto remains safe. */}
+          {modelCaps && (
+            <div className="model-picker thinking-picker" title="Reasoning level">
+              <select
+                value={state.config.thinkingLevel}
+                onChange={(e) => actions.setThinkingSetting(e.target.value as ThinkingSetting)}
+                aria-label="Reasoning level"
+              >
+                {THINKING_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {modelCaps && <CapabilityBadges model={modelCaps} compact />}
+        </div>
       </div>
 
       {attachError && <div className="attach-error">{attachError}</div>}

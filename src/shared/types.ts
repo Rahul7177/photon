@@ -1,7 +1,7 @@
 // Domain types shared between the extension host and the webview UI.
 // Keep this file dependency-free (no vscode / node imports) so the webview can import it directly.
 export type Mode="chat"|"plan"|"agent";export type Role="system"|"user"|"assistant"|"tool";
-export interface ChatMessage{id:string;role:Role;content:string;toolCalls?:ToolCall[];attachments?:Attachment[];toolCallId?:string;createdAt:number;streaming?:boolean;notice?:string;}
+export interface ChatMessage{id:string;role:Role;content:string;toolCalls?:ToolCall[];attachments?:Attachment[];toolCallId?:string;createdAt:number;streaming?:boolean;notice?:string;hidden?:boolean;}
 export interface Attachment{id:string;kind:"image"|"text";name:string;mime:string;size:number;dataBase64?:string;text?:string;}
 export interface ToolCall{id:string;name:string;args:Record<string,unknown>;status:"proposed"|"running"|"done"|"error"|"denied";result?:string;error?:string;sideEffecting?:boolean;thoughtSignature?:string;}
 export interface ModelCapabilityProfile{reasoning:number;coding:number;toolCalling:number;schemaAdherence:number;contextRetention:number;editFidelity:number;recovery:number;verification:number;speed:number;}

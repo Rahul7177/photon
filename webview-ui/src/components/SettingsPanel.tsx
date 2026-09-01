@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { ReactNode } from "react";
 import type { IndexStatus, IntelligenceSetting } from "../../../src/shared/types";
 import type { AppState, Actions } from "../state/store";
-import { BackIcon } from "./Icons";
+import { BackIcon, BoltIcon, SlidersIcon, RulerIcon, ShieldIcon, SearchIcon, ToolboxIcon, BotIcon, WrenchIcon, MonitorIcon, ChartIcon, HeartPulseIcon, PlugIcon, FolderIcon, LinkIcon, TabGeneralIcon, TabToolsIcon, TabModelsIcon, TabProvidersIcon, TabAdvancedIcon } from "./Icons";
 import { Toggle } from "./Toggle";
 import { AddCustomEndpoint, CloudProviderCard } from "./CloudProviders";
 import { CapabilityBadges } from "./CapabilityBadges";
@@ -33,12 +33,12 @@ const INTELLIGENCE_OPTIONS: { value: IntelligenceSetting; label: string; hint: s
 
 type Tab = "general" | "tools" | "models" | "providers" | "advanced";
 
-const TABS: { id: Tab; label: string; icon: string }[] = [
-  { id: "general", label: "General", icon: "⚙" },
-  { id: "tools", label: "Tools", icon: "🔧" },
-  { id: "models", label: "Models", icon: "🧠" },
-  { id: "providers", label: "Providers", icon: "☁" },
-  { id: "advanced", label: "Advanced", icon: "…" },
+const TABS: { id: Tab; label: string; icon: ReactNode }[] = [
+  { id: "general", label: "General", icon: <TabGeneralIcon /> },
+  { id: "tools", label: "Tools", icon: <TabToolsIcon /> },
+  { id: "models", label: "Models", icon: <TabModelsIcon /> },
+  { id: "providers", label: "Providers", icon: <TabProvidersIcon /> },
+  { id: "advanced", label: "Advanced", icon: <TabAdvancedIcon /> },
 ];
 
 export function SettingsPanel({
@@ -92,7 +92,7 @@ export function SettingsPanel({
           {/* ───── General ───── */}
           {tab === "general" && (
             <>
-              <Category title="Intelligence level" icon="⚡">
+              <Category title="Intelligence level" iconNode={<BoltIcon />}>
                 <div className="intelligence-grid">
                   {INTELLIGENCE_OPTIONS.map((opt) => (
                     <button
@@ -111,7 +111,7 @@ export function SettingsPanel({
                 </div>
               </Category>
 
-              <Category title="Adaptive engine" icon="🎛">
+              <Category title="Adaptive engine" iconNode={<SlidersIcon />}>
                 <Row label="Auto-tune settings & tools per model">
                   <Toggle checked={state.config.adaptiveEnabled} onChange={actions.setAdaptiveEnabled} />
                 </Row>
@@ -124,7 +124,7 @@ export function SettingsPanel({
                 )}
               </Category>
 
-              <Category title="Context window" icon="📐">
+              <Category title="Context window" iconNode={<RulerIcon />}>
                 <Row
                   label={`Global override (0 = auto${
                     state.plan ? `, now ${state.plan.numCtx.toLocaleString()}` : ""
@@ -151,14 +151,14 @@ export function SettingsPanel({
           {/* ───── Tools ───── */}
           {tab === "tools" && (
             <>
-              <Category title="Safety" icon="🛡">
+              <Category title="Safety" iconNode={<ShieldIcon />}>
                 <Row label="Auto-approve file edits & commands">
                   <Toggle checked={state.config.autoApprove} onChange={actions.setAutoApprove} />
                 </Row>
                 <div className="settings-hint">When on, Photon executes tools without asking.</div>
               </Category>
 
-              <Category title="Web search" icon="🔍">
+              <Category title="Web search" iconNode={<SearchIcon />}>
                 <Row label="Search provider">
                   <select
                     className="settings-select"
@@ -172,7 +172,7 @@ export function SettingsPanel({
               </Category>
 
               {state.tools.length > 0 && (
-                <Category title={`Available tools (${state.tools.length})`} icon="🧰" defaultOpen={false}>
+                <Category title={`Available tools (${state.tools.length})`} iconNode={<ToolboxIcon />} defaultOpen={false}>
                   <div className="tool-list">
                     {state.tools.map((t) => (
                       <div key={t.name} className="tool-list-row" title={t.summary}>
@@ -189,7 +189,7 @@ export function SettingsPanel({
           {/* ───── Models ───── */}
           {tab === "models" && (
             <>
-              <Category title="Current model" icon="🤖">
+              <Category title="Current model" iconNode={<BotIcon />}>
                 {model ? (
                   <>
                     <div className="settings-model-name">{model.name}</div>
@@ -205,7 +205,7 @@ export function SettingsPanel({
                 )}
               </Category>
 
-              <Category title="Per-model configuration" icon="🔧">
+              <Category title="Per-model configuration" iconNode={<WrenchIcon />}>
                 <p className="provider-section-intro">
                   Tune context and llama.cpp flags. Per-model <code>ctx</code> overrides the global.
                 </p>
@@ -213,7 +213,7 @@ export function SettingsPanel({
               </Category>
 
               {state.machine && (
-                <Category title="Machine specs" icon="💻">
+                <Category title="Machine specs" iconNode={<MonitorIcon />}>
                   <div className="settings-hint">
                     {state.machine.tier} tier · {(state.machine.totalRamBytes / 1024 ** 3).toFixed(1)} GB RAM ·{" "}
                     {state.machine.cpuCores} cores
@@ -222,7 +222,7 @@ export function SettingsPanel({
                 </Category>
               )}
 
-              <Category title="Benchmarks" icon="📊">
+              <Category title="Benchmarks" iconNode={<ChartIcon />}>
                 <Row label="Photon Bench — measured on this machine">
                   <button className="btn btn-sm" onClick={() => actions.runBench()}>
                     Benchmark all
@@ -263,7 +263,7 @@ export function SettingsPanel({
                 )}
               </Category>
 
-              <Category title="Diagnostics" icon="🩺" defaultOpen={false}>
+              <Category title="Diagnostics" iconNode={<HeartPulseIcon />} defaultOpen={false}>
                 <button className="btn" onClick={actions.diagnostics}>View full diagnostics</button>
               </Category>
             </>
@@ -272,14 +272,14 @@ export function SettingsPanel({
           {/* ───── Providers ───── */}
           {tab === "providers" && (
             <>
-              <Category title="Local connection" icon="🔌">
+              <Category title="Local connection" iconNode={<PlugIcon />}>
                 <div className="settings-hint"><code>{state.config.ollamaBaseUrl}</code></div>
                 <div className={`settings-status ${state.ollamaReachable ? "ok" : "err"}`}>
                   {state.ollamaReachable ? "Connected" : "Not reachable"}
                 </div>
               </Category>
 
-              <Category title="Cloud providers" icon="☁">
+              <Category title="Cloud providers" iconNode={<LinkIcon />}>
                 <p className="provider-section-intro">
                   Connect high-end cloud models alongside local ones. Enable a provider,
                   paste its API key, test, then add to the picker.
@@ -304,7 +304,7 @@ export function SettingsPanel({
           {/* ───── Advanced ───── */}
           {tab === "advanced" && (
             <>
-              <Category title="Workspace index" icon="📁">
+              <Category title="Workspace index" iconNode={<FolderIcon />}>
                 <Row label="Index workspace for code-aware retrieval (local, offline)">
                   <Toggle checked={state.config.indexingEnabled} onChange={actions.setIndexingEnabled} />
                 </Row>
@@ -315,7 +315,7 @@ export function SettingsPanel({
                 <div className="settings-hint">Embeds with: <code>{state.config.embeddingModel}</code></div>
               </Category>
 
-              <Category title="MCP servers" icon="🔗">
+              <Category title="MCP servers" iconNode={<LinkIcon />}>
                 {state.mcpServers.length === 0 ? (
                   <div className="settings-hint">
                     No MCP servers configured. Add them to <code>.vscode/mcp.json</code>.
@@ -373,12 +373,12 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
 
 function Category({
   title,
-  icon,
+  iconNode,
   children,
   defaultOpen = true,
 }: {
   title: string;
-  icon: string;
+  iconNode: ReactNode;
   children: ReactNode;
   defaultOpen?: boolean;
 }) {
@@ -387,7 +387,7 @@ function Category({
     <div className={`category${open ? " open" : ""}`}>
       <button className="category-header" onClick={() => setOpen((o) => !o)}>
         <span className="category-label">
-          <span className="category-icon">{icon}</span>
+          <span className="category-icon">{iconNode}</span>
           {title}
         </span>
         <span className="category-chevron">▶</span>

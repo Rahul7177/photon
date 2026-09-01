@@ -165,10 +165,10 @@ export const readFileTool: Tool = {
 export const writeFileTool: Tool = {
   spec: {
     name: "write_file",
-    summary: "Create a new file or completely overwrite an existing one.",
+    summary: "Create a new file or overwrite an existing one with the given content. Use this for new files.",
     params: [
-      { name: "path", type: "string", required: true, description: "File path relative to the workspace root." },
-      { name: "content", type: "string", required: true, description: "Full new contents of the file. To change part of an existing file, prefer edit_file." },
+      { name: "path", type: "string", required: true, description: "File path relative to the workspace root, e.g. src/utils/helper.ts" },
+      { name: "content", type: "string", required: true, description: "Full file content. Put the complete file text here." },
     ],
     sideEffecting: true,
     priority: 3,
@@ -181,6 +181,22 @@ export const writeFileTool: Tool = {
     const content = (args.content as string) ?? "";
     const r = resolveInWorkspace(ctx.workspaceRoot, rel);
     if ("error" in r) return fail(r.error);
+
+    // Guard: local models sometimes emit "content: |" or "content: >" which parses as just "|" or ">".
+    // Reject this and tell the model to use a fenced code block instead.
+    if (content.trim() === "|" || content.trim() === ">") {
+      return fail(
+        'The "content" was parsed as a single "' + content.trim() + '" character. This usually means the tool call was formatted incorrectly.\n' +
+        'Fix: use a fenced code block for the content, like this:\n' +
+        "[TOOL write_file]\npath: " + rel + "\ncontent:\n```\n<your file content here>\n```\n[/TOOL]"
+      );
+    }
+    if (!content.trim()) {
+      return fail(
+        'The "content" is empty. Provide the full file content inside a fenced code block:\n' +
+        "[TOOL write_file]\npath: " + rel + "\ncontent:\n```\n<your file content here>\n```\n[/TOOL]"
+      );
+    }
 
     const existed = await fs
       .stat(r.abs)
@@ -206,11 +222,11 @@ export const writeFileTool: Tool = {
 export const editFileTool: Tool = {
   spec: {
     name: "edit_file",
-    summary: "Replace an exact snippet of text in a file with new text.",
+    summary: "Replace an exact snippet of text in a file. Copy find text EXACTLY from read_file — no extra symbols.",
     params: [
       { name: "path", type: "string", required: true, description: "File to edit, relative to the workspace root." },
-      { name: "find", type: "string", required: true, description: "The EXACT existing text to replace. Copy it verbatim from read_file output — whitespace, indentation, and line breaks must match precisely. Include 3-5 surrounding lines so the match is unique." },
-      { name: "replace", type: "string", required: true, description: "The new text to put in its place. Use empty text to delete the snippet." },
+      { name: "find", type: "string", required: true, description: "The EXACT text to replace. Copy verbatim from read_file — no line numbers, no │ symbols, no extra characters. Include 3-5 surrounding lines so the match is unique." },
+      { name: "replace", type: "string", required: true, description: "The new text to put in its place. Plain code/text only — no extra symbols or markers." },
       { name: "replace_all", type: "boolean", required: false, description: "true = replace every occurrence (default false: exactly one match required)." },
     ],
     sideEffecting: true,
@@ -218,7 +234,7 @@ export const editFileTool: Tool = {
     minTier: "low",
     tags: ["fs", "write"],
     example:
-      '[TOOL edit_file]\npath: src/app.ts\nfind:\n```\nfunction greet(name) {\n  console.log("hi", name)\n}\n```\nreplace:\n```\nfunction greet(name: string): void {\n  console.log("hello", name);\n}\n```\n[/TOOL]',
+      '[TOOL edit_file]\npath: src/app.ts\nfind:\n```\nfunction greet(name) {\n  console.log("hi", name)\n}\n```\nreplace:\n```\nfunction greet(name: string): void {\n  console.log("hello", name);\n}\n```\n[/TOOL]\n\nIMPORTANT: Copy find text EXACTLY from read_file. Do NOT include line numbers or │ symbols. Use ``` fences for find and replace. Do NOT add | or > characters.',
   },
   async execute(args, ctx) {
     const rel = args.path as string;
@@ -228,6 +244,14 @@ export const editFileTool: Tool = {
     const r = resolveInWorkspace(ctx.workspaceRoot, rel);
     if ("error" in r) return fail(r.error);
     if (!rawFind || !rawFind.trim()) return fail('The "find" text must not be empty.');
+    // Guard: local models sometimes emit "find: |" which parses as just "|".
+    if (rawFind.trim() === "|") {
+      return fail(
+        'The "find" was parsed as a single "|" character. This usually means the tool call was formatted incorrectly.\n' +
+        'Fix: use a fenced code block for the find text, like this:\n' +
+        "[TOOL edit_file]\npath: " + rel + "\nfind:\n```\n<exact text to find>\n```\nreplace:\n```\n<replacement text>\n```\n[/TOOL]"
+      );
+    }
 
     let original: string;
     try {
@@ -325,9 +349,17 @@ export function locateEdit(
 ): { text: string; firstIndex: number; count: number } | { error: string } {
   const eol = original.includes("\r\n") ? "\r\n" : "\n";
   const norm = (s: string) => s.replace(/\r\n/g, "\n");
+  // Sanitize find/replace: strip stray symbols small models add (pipes, bullets, etc.)
+  const sanitize = (s: string): string => {
+    let lines = s.split("\n");
+    while (lines.length && /^[\|\>\-\*\•\·\s]+$/.test(lines[0])) lines.shift();
+    while (lines.length && /^[\|\>\-\*\•\·\s]+$/.test(lines[lines.length - 1])) lines.pop();
+    return lines.join("\n");
+  };
   const o = norm(original);
-  const candidates = uniq([norm(find), stripGutter(norm(find))]);
-  const rep = norm(replace);
+  const cleanFind = sanitize(norm(find));
+  const candidates = uniq([cleanFind, stripGutter(cleanFind), sanitize(stripGutter(cleanFind))]);
+  const rep = sanitize(norm(replace));
 
   // 1 & 2: exact / gutter-stripped exact.
   for (const cand of candidates) {
@@ -348,7 +380,7 @@ export function locateEdit(
   }
 
   // 3: whitespace-tolerant line-block match.
-  const fuzzy = locateFuzzy(o, stripGutter(norm(find)));
+  const fuzzy = locateFuzzy(o, stripGutter(cleanFind));
   if ("count" in fuzzy) {
     if (fuzzy.count > 1) {
       return {

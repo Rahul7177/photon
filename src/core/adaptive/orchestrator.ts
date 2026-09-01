@@ -3,7 +3,7 @@ import { analyzeTask, buildExecutionPolicy, buildVerificationPlan, capabilityFor
 
 export interface OrchestratorInput{model:ModelInfo;machine:MachineProfile|null;mode:Mode;prompt?:string;userNumCtx?:number;intelligence:IntelligenceSetting;reserveOutputTokens:number;adaptiveEnabled:boolean;cloudNativeTools?:boolean;task?:TaskAnalysis;bench?:BenchResult;}
 interface LevelProfile{maxTools:number;allowParallelTools:boolean;outputCap:number;chatTemp:number;taskTemp:number;}
-const LEVELS:Record<IntelligenceLevel,LevelProfile>={low:{maxTools:8,allowParallelTools:false,outputCap:1536,chatTemp:.35,taskTemp:.2},medium:{maxTools:8,allowParallelTools:true,outputCap:2048,chatTemp:.55,taskTemp:.3},high:{maxTools:14,allowParallelTools:true,outputCap:4096,chatTemp:.7,taskTemp:.35},max:{maxTools:18,allowParallelTools:true,outputCap:8192,chatTemp:.7,taskTemp:.4}};
+const LEVELS:Record<IntelligenceLevel,LevelProfile>={low:{maxTools:10,allowParallelTools:false,outputCap:1536,chatTemp:.35,taskTemp:.2},medium:{maxTools:10,allowParallelTools:true,outputCap:2048,chatTemp:.55,taskTemp:.3},high:{maxTools:14,allowParallelTools:true,outputCap:4096,chatTemp:.7,taskTemp:.35},max:{maxTools:18,allowParallelTools:true,outputCap:8192,chatTemp:.7,taskTemp:.4}};
 const TIER_RANK:Record<ModelTier,number>={tiny:0,small:1,medium:2,large:3};
 
 export function buildPlan(input:OrchestratorInput):AdaptivePlan{
