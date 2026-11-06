@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { PerModelConfig, LlamaCppSettings } from "../../../src/shared/types";
 import type { AppState, Actions } from "../state/store";
+import { ChevronRightIcon } from "./Icons";
 
 function launchPreview(model: string, baseUrl: string, cfg?: PerModelConfig): string {
   const lc = cfg?.llamacpp;
@@ -52,7 +53,9 @@ export function ModelConfigs({ state, actions }: { state: AppState; actions: Act
               <span className="model-config-meta">
                 {cfg?.numCtx || cfg?.llamacpp?.ctx ? `${cfg.numCtx ?? cfg.llamacpp?.ctx} ctx` : `${m.contextLength ?? "?"} ctx`} {isLlama ? "· llamacpp" : ""}
               </span>
-              <span className={`expand-chevron ${open ? "open" : ""}`}>›</span>
+              <span className={`expand-chevron ${open ? "open" : ""}`}>
+                <ChevronRightIcon />
+              </span>
             </div>
             {open && (
               <ModelEditor
@@ -208,9 +211,9 @@ function ModelEditor({
         <input placeholder="e.g. 8B Q8 for coding" value={note} onChange={(e) => setNote(e.target.value)} />
       </label>
       <div className="custom-endpoint-actions">
-        <button className="btn btn-sm btn-accent" onClick={commit}>Save</button>
+        <button className="btn btn-sm primary" onClick={commit}>Save</button>
         <button className="btn btn-sm ghost" onClick={onClose}>Cancel</button>
-        {cfg && <button className="btn btn-sm" style={{ marginLeft: "auto", color: "var(--red)" }} onClick={onClear}>Clear</button>}
+        {cfg && <button className="btn btn-sm danger" style={{ marginLeft: "auto" }} onClick={onClear}>Clear</button>}
       </div>
     </div>
   );

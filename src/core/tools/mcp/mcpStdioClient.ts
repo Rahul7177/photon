@@ -25,6 +25,7 @@ export class McpStdioClient implements IMcpClient {
   private child?: ChildProcessWithoutNullStreams;
   private nextId = 1;
   private buffer = "";
+  private readonly MAX_BUFFER = 1_000_000;
   private readonly pending = new Map<number | string, Pending>();
   private closed = false;
 
@@ -46,6 +47,9 @@ export class McpStdioClient implements IMcpClient {
 
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (d: string) => this.onData(d));
+    // Drain stderr so a chatty server can't backpressure-block on a full pipe.
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.resume();
     child.on("error", (err) => this.failAll(new Error(`MCP process error: ${err.message}`)));
     child.on("exit", (code) => this.failAll(new Error(`MCP process exited (${code ?? "signal"}).`)));
 
@@ -86,14 +90,25 @@ export class McpStdioClient implements IMcpClient {
     this.failAll(new Error("MCP client closed."));
     const child = this.child;
     this.child = undefined;
+    this.buffer = "";
     if (child) {
       child.stdout.removeAllListeners();
+      child.stderr?.removeAllListeners();
       child.removeAllListeners();
       try {
         child.kill();
+        // SIGKILL fallback: a wedged server that ignores SIGTERM must not linger.
+        setTimeout(() => {
+          try {
+            if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+          } catch { /* already gone */ }
+        }, 2000).unref?.();
       } catch {
         /* already gone */
       }
+      try { child.stdin.destroy(); } catch { /* ignore */ }
+      try { child.stdout.destroy(); } catch { /* ignore */ }
+      try { child.stderr?.destroy(); } catch { /* ignore */ }
     }
   }
 
@@ -127,6 +142,12 @@ export class McpStdioClient implements IMcpClient {
 
   private onData(chunk: string): void {
     this.buffer += chunk;
+    // Bound growth: a server streaming without newlines can't OOM the host.
+    if (this.buffer.length > this.MAX_BUFFER) {
+      this.failAll(new Error("MCP server sent an overlong line — closing."));
+      void this.close().catch(() => undefined);
+      return;
+    }
     let nl: number;
     while ((nl = this.buffer.indexOf("\n")) !== -1) {
       const line = this.buffer.slice(0, nl).trim();

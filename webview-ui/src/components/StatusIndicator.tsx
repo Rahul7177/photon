@@ -28,7 +28,10 @@ function computeLabel(state: AppState): string | null {
 
   // Host-reported phase (set by the engine each generation / tool step).
   if (state.status === "running") {
-    return state.statusDetail ? `Running ${state.statusDetail}` : "Working";
+    const detail = state.statusDetail?.replace(/\.+$/, "").trim();
+    if (!detail) return "Working";
+    if (/^(generating|thinking|working)$/i.test(detail)) return detail;
+    return `Running ${detail}`;
   }
 
   const last = state.messages[state.messages.length - 1];

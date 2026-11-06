@@ -6,6 +6,7 @@ const MAX_SESSIONS = 40;
 // Persisted caps — prevent globalState blowup (critical audit). Live session keeps full content.
 const MAX_PERSISTED_MSG_CONTENT = 8000;
 const MAX_PERSISTED_TOOL_RESULT = 6000;
+const MAX_PERSISTED_THINKING = 2000;
 const MAX_PERSISTED_MESSAGES = 200; // per-session persisted cap (live keeps 400)
 
 /** Persists chat sessions across window reloads via globalState. */
@@ -69,6 +70,9 @@ function capForStorage(s: SessionState): SessionState {
     messages: msgs.map((m) => ({
       ...m,
       content: m.content.length > MAX_PERSISTED_MSG_CONTENT ? m.content.slice(0, MAX_PERSISTED_MSG_CONTENT) + `\n… [truncated ${m.content.length - MAX_PERSISTED_MSG_CONTENT} chars for storage]` : m.content,
+      // Reasoning traces are display-only (never fed back to the model):
+      // keep a truncated copy so the collapsed block survives reloads.
+      thinking: m.thinking && m.thinking.length > MAX_PERSISTED_THINKING ? m.thinking.slice(0, MAX_PERSISTED_THINKING) + `\n… [truncated]` : m.thinking,
       toolCalls: m.toolCalls?.map((c) => ({
         ...c,
         result: c.result && c.result.length > MAX_PERSISTED_TOOL_RESULT ? c.result.slice(0, MAX_PERSISTED_TOOL_RESULT) + `… [truncated]` : c.result,

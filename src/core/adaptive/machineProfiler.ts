@@ -1,7 +1,7 @@
 import * as os from "node:os";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
-import type { MachineProfile } from "../../shared/types";
+import type { HardwareMetrics, MachineProfile } from "../../shared/types";
 
 const execAsync = promisify(exec);
 
@@ -29,6 +29,65 @@ export async function profileMachine(): Promise<MachineProfile> {
     arch,
     gpu,
     tier: classifyMachine(totalRamBytes, gpu?.vramBytes),
+  };
+}
+
+/**
+ * Sample live GPU compute utilization, real GPU VRAM used/total/free, GPU temperature,
+ * and system RAM used/total/free in real time.
+ */
+export async function sampleHardwareMetrics(
+  fallbackGpu?: MachineProfile["gpu"]
+): Promise<HardwareMetrics> {
+  const ramTotalBytes = os.totalmem();
+  const ramFreeBytes = os.freemem();
+  const ramUsedBytes = Math.max(0, ramTotalBytes - ramFreeBytes);
+  const ramUsedPercent =
+    ramTotalBytes > 0 ? Math.round((ramUsedBytes / ramTotalBytes) * 100) : 0;
+
+  let gpuName = fallbackGpu?.name;
+  let gpuUtilPercent: number | undefined;
+  let vramUsedBytes: number | undefined;
+  let vramTotalBytes = fallbackGpu?.vramBytes;
+  let vramFreeBytes: number | undefined;
+  let gpuTempC: number | undefined;
+
+  try {
+    const { stdout } = await execAsync(
+      "nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.free,memory.total,temperature.gpu --format=csv,noheader,nounits",
+      { timeout: 2500, windowsHide: true }
+    );
+    const line = stdout.trim().split("\n")[0];
+    if (line) {
+      const parts = line.split(",").map((s) => s.trim());
+      if (parts[0]) gpuName = parts[0];
+      const util = parseFloat(parts[1]);
+      if (Number.isFinite(util)) gpuUtilPercent = Math.round(util);
+      const usedMb = parseFloat(parts[2]);
+      if (Number.isFinite(usedMb)) vramUsedBytes = Math.round(usedMb * 1024 ** 2);
+      const freeMb = parseFloat(parts[3]);
+      if (Number.isFinite(freeMb)) vramFreeBytes = Math.round(freeMb * 1024 ** 2);
+      const totalMb = parseFloat(parts[4]);
+      if (Number.isFinite(totalMb)) vramTotalBytes = Math.round(totalMb * 1024 ** 2);
+      const temp = parseFloat(parts[5]);
+      if (Number.isFinite(temp)) gpuTempC = Math.round(temp);
+    }
+  } catch {
+    // Non-NVIDIA or nvidia-smi unavailable — fall back gracefully to fallbackGpu + RAM metrics
+  }
+
+  return {
+    gpuName,
+    gpuUtilPercent,
+    vramUsedBytes,
+    vramTotalBytes,
+    vramFreeBytes,
+    gpuTempC,
+    ramUsedBytes,
+    ramTotalBytes,
+    ramFreeBytes,
+    ramUsedPercent,
+    updatedAt: Date.now(),
   };
 }
 
@@ -79,7 +138,7 @@ async function detectGpu(
 async function detectNvidiaGpu(): Promise<MachineProfile["gpu"] | undefined> {
   const { stdout } = await execAsync(
     "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits",
-    { timeout: 5000 }
+    { timeout: 5000, windowsHide: true }
   );
   const line = stdout.trim().split("\n")[0];
   if (!line) return undefined;
@@ -108,7 +167,7 @@ async function detectWindowsGpu(): Promise<MachineProfile["gpu"] | undefined> {
       "(Get-CimInstance Win32_VideoController | Select-Object -First 1 Name | ConvertTo-Json -Compress); " +
       "\"VRAM=$vram\"" +
       '"',
-    { timeout: 6000 }
+    { timeout: 6000, windowsHide: true }
   );
 
   let name: string | undefined;

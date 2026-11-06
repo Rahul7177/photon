@@ -8,17 +8,28 @@ import type {
   BenchPhase,
   BenchResult,
   ChatMessage,
+  CloudUsageSummary,
   GenerationStats,
+  HardwareMetrics,
   IndexStatus,
   IntelligenceSetting,
   MachineProfile,
   McpServerInfo,
   Mode,
   ModelInfo,
+  OllamaRuntimeModel,
+  PullProgress,
+  LocalRuntimeInfo,
+  ProviderLifecycleState,
+  ModelCapability,
+  RecommendationSet,
   PerModelConfig,
+  ProjectContextSummary,
+  ProjectMemoryNote,
   SessionState,
   SessionSummary,
   ThinkingSetting,
+  ThinkingLevel,
   TokenUsage,
   ToolCall,
 } from "./types";
@@ -32,6 +43,8 @@ export type HostMessage =
   | { type: "sessionList"; payload: { sessions: SessionSummary[]; activeId: string } }
   | { type: "messageAppended"; payload: ChatMessage }
   | { type: "messageDelta"; payload: { id: string; delta: string } }
+  | { type: "thinkingDelta"; payload: { id: string; delta: string } }
+  | { type: "thinkingDone"; payload: { id: string; elapsedMs: number } }
   | { type: "messageDone"; payload: { id: string } }
   | { type: "messageRemoved"; payload: { id: string } }
   | { type: "toolUpdate"; payload: { messageId: string; call: ToolCall } }
@@ -47,15 +60,24 @@ export type HostMessage =
   | { type: "indexStatus"; payload: IndexStatus }
   | { type: "mcpServers"; payload: McpServerInfo[] }
   | { type: "tools"; payload: ToolSummary[] }
+  | { type: "attachmentsAdded"; payload: { attachments: Attachment[]; errors: string[] } }
   | { type: "providerModels"; payload: { id: string; models: ModelInfo[]; error?: string } }
   | { type: "modelTestResult"; payload: { providerId: string; model: ModelInfo; ok: boolean; latencyMs?: number; error?: string } }
   | { type: "modelConfigs"; payload: Record<string, PerModelConfig> }
+  | { type: "ollamaRuntime"; payload: OllamaRuntimeModel[] }
+  | { type: "hardwareMetrics"; payload: HardwareMetrics }
+  | { type: "cloudUsage"; payload: CloudUsageSummary }
+  | { type: "pullProgress"; payload: PullProgress | null }
+  | { type: "providerRuntimes"; payload: LocalRuntimeInfo[] }
+  | { type: "providerLifecycle"; payload: ProviderLifecycleState }
+  | { type: "modelRecommendations"; payload: RecommendationSet }
+  | { type: "projectContext"; payload: ProjectContextSummary }
   | { type: "error"; payload: { message: string } };
 
 export interface PhotonConfig {
   autoApprove: boolean;
   adaptiveEnabled: boolean;
-  webSearchProvider: "duckduckgo" | "none";
+  webSearchProvider: "google" | "duckduckgo" | "none";
   ollamaBaseUrl: string;
   llamacppBaseUrl: string;
   numCtxOverride: number;
@@ -98,6 +120,10 @@ export interface InitPayload {
   indexStatus: IndexStatus;
   mcpServers: McpServerInfo[];
   modelConfigs: Record<string, PerModelConfig>;
+  ollamaRuntime?: OllamaRuntimeModel[];
+  hardwareMetrics?: HardwareMetrics | null;
+  cloudUsage?: CloudUsageSummary;
+  projectContext?: ProjectContextSummary | null;
 }
 
 /* ------------------------------ webview -> host ------------------------------ */
@@ -117,7 +143,7 @@ export type ViewMessage =
   | { type: "setAutoApprove"; payload: { enabled: boolean } }
   | { type: "setAdaptiveEnabled"; payload: { enabled: boolean } }
   | { type: "setIntelligence"; payload: { level: IntelligenceSetting } }
-  | { type: "setWebSearchProvider"; payload: { provider: "duckduckgo" | "none" } }
+  | { type: "setWebSearchProvider"; payload: { provider: "google" | "duckduckgo" | "none" } }
   | { type: "setProviderEnabled"; payload: { id: string; enabled: boolean } }
   | { type: "setProviderApiKey"; payload: { id: string; apiKey: string } }
   | { type: "setInterfaceMode"; payload: { mode: "local" | "cloud" } }
@@ -135,11 +161,29 @@ export type ViewMessage =
   | { type: "addCustomProvider"; payload: { label: string; baseUrl: string; apiKey?: string } }
   | { type: "removeCustomProvider"; payload: { id: string } }
   | { type: "openDiagnostics" }
+  /** Files dragged in from VS Code's Explorer arrive as URIs, not File objects. */
+  | { type: "attachPaths"; payload: { paths: string[] } }
   | { type: "setPerModelConfig"; payload: { model: string; config: PerModelConfig } }
   | { type: "removePerModelConfig"; payload: { model: string } }
   /** Legacy toggle retained for compatibility with existing settings clients. */
   | { type: "setThinkingEnabled"; payload: { enabled: boolean } }
   /** Legacy 4-level control retained for compatibility. */
-  | { type: "setThinkingLevel"; payload: { level: "off" | "low" | "medium" | "high" } }
+  | { type: "setThinkingLevel"; payload: { level: ThinkingLevel } }
   /** Full six-state control used by the current header. */
-  | { type: "setThinkingSetting"; payload: { level: ThinkingSetting } };
+  | { type: "setThinkingSetting"; payload: { level: ThinkingSetting } }
+  | { type: "unloadModel"; payload: { model?: string } }
+  | { type: "pullModel"; payload: { model: string } }
+  | { type: "cancelPull" }
+  | { type: "detectProviders" }
+  | { type: "requestRecommendations"; payload?: { goal?: ModelCapability; ctxTokens?: number } }
+  | { type: "startProvider"; payload: { id: "ollama" | "llamacpp"; modelPath?: string } }
+  | { type: "stopProvider"; payload: { id: "ollama" | "llamacpp" } }
+  | { type: "restartProvider"; payload: { id: "ollama" | "llamacpp" } }
+  | { type: "installProvider"; payload: { id: LocalRuntimeInfo["id"]; optionIndex: number } }
+  | { type: "requestHardwareMetrics" }
+  | { type: "resetCloudUsage" }
+  | { type: "requestProjectContext" }
+  | { type: "refreshProjectContext" }
+  | { type: "addProjectNote"; payload: { category: ProjectMemoryNote["category"]; title: string; content: string; relatedFiles?: string[] } }
+  | { type: "deleteProjectNote"; payload: { id: string } }
+  | { type: "clearWorkingMemory" };

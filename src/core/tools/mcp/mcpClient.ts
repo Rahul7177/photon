@@ -94,31 +94,51 @@ export class McpClient {
   }
 
   private async post(body: unknown, timeoutMs = 15000): Promise<JsonRpcResponse> {
-    const res = await fetch(this.url, {
-      method: "POST",
-      signal: AbortSignal.timeout(timeoutMs),
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-        ...(this.sessionId ? { "Mcp-Session-Id": this.sessionId } : {}),
-        ...this.headers,
-      },
-      body: JSON.stringify(body),
-    });
+    // Fail closed on cross-host redirects: follow same-host HTTPS redirects
+    // only, so a compromised server can't bounce the client to link-local.
+    let url = this.url;
+    for (let hop = 0; hop < 4; hop++) {
+      const res = await fetch(url, {
+        method: "POST",
+        signal: AbortSignal.timeout(timeoutMs),
+        redirect: "manual",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+          ...(this.sessionId ? { "Mcp-Session-Id": this.sessionId } : {}),
+          ...this.headers,
+        },
+        body: JSON.stringify(body),
+      });
 
-    const sid = res.headers.get("Mcp-Session-Id");
-    if (sid) this.sessionId = sid;
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get("location");
+        await res.body?.cancel().catch(() => undefined);
+        if (!loc) throw new Error(`MCP HTTP ${res.status} with no location.`);
+        const next = new URL(loc, url);
+        const orig = new URL(url);
+        if (next.protocol !== "https:" || next.hostname.toLowerCase() !== orig.hostname.toLowerCase()) {
+          throw new Error("Blocked MCP redirect to a different host.");
+        }
+        url = next.toString();
+        continue;
+      }
 
-    // Notifications get 202 with no body.
-    if (res.status === 202) return { jsonrpc: "2.0", id: 0 };
-    if (!res.ok) throw new Error(`MCP HTTP ${res.status}`);
+      const sid = res.headers.get("Mcp-Session-Id");
+      if (sid) this.sessionId = sid;
 
-    const ct = res.headers.get("Content-Type") ?? "";
-    const text = await res.text();
-    if (ct.includes("text/event-stream")) {
-      return parseSse(text);
+      // Notifications get 202 with no body.
+      if (res.status === 202) return { jsonrpc: "2.0", id: 0 };
+      if (!res.ok) throw new Error(`MCP HTTP ${res.status}`);
+
+      const ct = res.headers.get("Content-Type") ?? "";
+      const text = await res.text();
+      if (ct.includes("text/event-stream")) {
+        return parseSse(text);
+      }
+      return JSON.parse(text) as JsonRpcResponse;
     }
-    return JSON.parse(text) as JsonRpcResponse;
+    throw new Error("Too many MCP redirects.");
   }
 }
 

@@ -37,14 +37,14 @@ export function fitToWindow(system:LLMMessage,history:LLMMessage[],budgetTokens:
     }else dropped++;
   }
   const messages=[...kept.entries()].sort((a,b)=>a[0]-b[0]).map(([,m])=>m);
-  const usage:TokenUsage={used:systemTokens+used,window:budgetTokens,breakdown:[{label:"System + tools",tokens:systemTokens},{label:"Conversation",tokens:used}]};
+  const usage:TokenUsage={used:systemTokens+used,window,breakdown:[{label:"System + tools",tokens:systemTokens},{label:"Conversation",tokens:used}]};
   return{messages:[system,...messages],droppedCount:dropped,usage};
 }
 
 function fitNewest(system:LLMMessage,history:LLMMessage[],available:number,budgetTokens:number,window:number,model?:string):FitResult{
   const kept:LLMMessage[]=[];let historyTokens=0;let dropped=0;
   for(let i=history.length-1;i>=0;i--){const t=tokensOf(history[i],model);if(i===history.length-1||historyTokens+t<=available){kept.unshift(history[i]);historyTokens+=t;}else{dropped=i+1;break;}}
-  const usage:TokenUsage={used:tokensOf(system,model)+historyTokens,window:budgetTokens,breakdown:[{label:"System + tools",tokens:tokensOf(system,model)},{label:"Conversation",tokens:historyTokens}]};
+  const usage:TokenUsage={used:tokensOf(system,model)+historyTokens,window,breakdown:[{label:"System + tools",tokens:tokensOf(system,model)},{label:"Conversation",tokens:historyTokens}]};
   return{messages:[system,...kept],droppedCount:dropped,usage};
 }
 function tokensOf(msg:LLMMessage,model?:string):number{let t=4+estimateTokensForModel(msg.content,model);for(const call of msg.tool_calls??[])t+=estimateTokensForModel(call.function.name,model)+estimateTokensForModel(JSON.stringify(call.function.arguments),model);return t;}

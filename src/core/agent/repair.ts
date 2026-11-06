@@ -1,50 +1,52 @@
 import type { AdaptivePlan, ToolSpec } from "../../shared/types";
 
-// Hard ceiling on corrective retries for a single malformed batch. Bounded so a
-// model that can't produce a valid call never spins — after this we degrade
-// gracefully rather than loop (M9 checklist).
+// Spec §5: retry same logical step at most 2 times, then blocked
 export const MAX_REPAIRS = 2;
 
-/**
- * Build a terse corrective micro-prompt for a malformed tool call. Deliberately
- * short: it competes for the same scarce context that caused the failure, so it
- * states only the errors, the exact schema, and the required format. For tools
- * named in the errors, a worked example is included — seeing one correct call
- * fixes most format mistakes far faster than another prose explanation.
- */
 export function buildRepairPrompt(
   errors: string[],
   specs: ToolSpec[],
   plan: AdaptivePlan
 ): string {
-  const schema = specs
-    .map((s) => `${s.name}(${s.params.map((p) => `${p.name}${p.required ? "" : "?"}:${p.type}`).join(", ")})`)
+  // Continue-style: show the fenced format with the failing tool's worked
+  // example first — weak models fix a concrete example, not an abstract schema.
+  const failing = specs.filter((s) => s.example && errors.some((e) => e.startsWith(`${s.name}:`) || e.includes(`"${s.name}"`)));
+  const others = specs.filter((s) => !failing.includes(s));
+  // FIX: Always include web_search and web_fetch in the repair prompt when the
+  // failure involved a web call. Previously these could be cut by the 4-tool
+  // limit, leaving the model without the format it needs to retry correctly.
+  const webTools = specs.filter(s => (s.name === "web_search" || s.name === "web_fetch") && !failing.includes(s));
+  const hasWebFailure = errors.some(e => e.includes("web_search") || e.includes("web_fetch"));
+  const webGuaranteed = hasWebFailure ? webTools : [];
+  const ordered = [...failing, ...webGuaranteed, ...others.filter(s => !webGuaranteed.includes(s))].slice(0, 4);
+  const defs = ordered
+    .map((s) => {
+      const args = s.params.map((p) => `TOOL_ARG: ${p.name} (${p.type}, ${p.required ? "required" : "optional"})${p.description ? `\n${p.description}` : ""}\nEND_ARG`).join("\n");
+      return `\`\`\`tool_definition\nTOOL_NAME: ${s.name}\nTOOL_DESCRIPTION:\n${s.summary}\n${args}\n\`\`\``;
+    })
     .join("\n");
 
-  // Tools the model fumbled (mentioned in the error lines) get a worked example.
-  const examples = specs
-    .filter((s) => s.example && errors.some((e) => e.startsWith(`${s.name}:`) || e.includes(`"${s.name}"`)))
+  const examples = failing
     .slice(0, 2)
-    .map((s) => `Example for ${s.name}:\n${s.example}`);
-
-  const format =
-    plan.toolProtocol === "native"
-      ? "Reply with a single valid tool call (structured), nothing else."
-      : [
-          "Reply with EXACTLY one block, nothing else:",
-          "[TOOL tool_name]",
-          "arg_name: value",
-          "[/TOOL]",
-        ].join("\n");
+    .map((s) => `Correct example for ${s.name} — copy this shape exactly:\n${s.example}`);
 
   return [
-    "Your last tool call was invalid:",
+    "Your last tool call was invalid. Read the error, fix it, and try again — do NOT repeat the same call unchanged:",
     ...errors.map((e) => `- ${e}`),
     "",
-    "Valid tools and their arguments:",
-    schema,
-    ...(examples.length ? ["", ...examples] : []),
+    "Use EXACTLY this format (values are raw text, no escaping):",
+    "```tool",
+    "TOOL_NAME: <tool name>",
+    "BEGIN_ARG: <arg name>",
+    "<value>",
+    "END_ARG",
+    "```",
     "",
-    format,
+    ...(examples.length ? [...examples, ""] : []),
+    "Available tools:",
+    defs,
+    "",
+    "Reply with EXACTLY one tool block and nothing else. If this tool keeps",
+    "failing, try a DIFFERENT tool that could get the same information.",
   ].join("\n");
 }

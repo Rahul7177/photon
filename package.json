@@ -5,6 +5,14 @@
   "version": "0.1.0",
   "publisher": "photon",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/photon/photon"
+  },
+  "homepage": "https://github.com/photon/photon#readme",
+  "bugs": {
+    "url": "https://github.com/photon/photon/issues"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -93,10 +101,34 @@
           "default": 180000,
           "description": "Idle timeout (ms): how long to wait between streamed tokens before giving up. Not a cap on total generation time — slow models can run as long as they keep producing output."
         },
+        "photon.ollama.connectTimeoutMs": {
+          "type": "number",
+          "default": 300000,
+          "description": "Connect timeout (ms): how long to wait for Ollama to start responding. Covers cold model loads on slow disks/VRAM, which take minutes on consumer laptops. Raise this if turns die while a big model is loading."
+        },
+        "photon.ollama.keepAlive": {
+          "type": "string",
+          "default": "-1",
+          "description": "How long Ollama keeps a loaded model resident after use (e.g. \"30m\", \"2h\"). Longer means fewer cold loads but more VRAM/RAM held. Empty uses the Ollama server default (5m)."
+        },
+        "photon.bench.autoRun": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically run Photon Bench on every un-benchmarked local model in the background. Off by default: each benchmark loads a different model, which evicts your chat model from the GPU on single-GPU machines. You can still run the bench manually from Settings."
+        },        "photon.ollama.preloadOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Load the selected local model into memory in the background after startup/refresh, so the first prompt doesn't pay the cold-load wait. Best-effort and silent on failure."
+        },
         "photon.llamacpp.baseUrl": {
           "type": "string",
           "default": "http://localhost:8080",
           "description": "Base URL of the llama.cpp server (without /v1). llama.cpp exposes an OpenAI-compatible API at <baseUrl>/v1/chat/completions."
+        },
+        "photon.llamacpp.requestTimeoutMs": {
+          "type": "number",
+          "default": 300000,
+          "description": "Idle timeout (ms): how long to wait between streamed tokens from llama.cpp before giving up. Slow machines doing big prompt evals or swapping can go quiet for minutes — raise this instead of losing the turn."
         },
         "photon.providers.llamacpp.enabled": {
           "type": "boolean",
@@ -165,6 +197,7 @@
           "type": "string",
           "enum": [
             "duckduckgo",
+            "google",
             "none"
           ],
           "default": "duckduckgo",
@@ -265,6 +298,7 @@
     }
   },
   "scripts": {
+    "test": "tsx --test src/**/*.test.ts test/**/*.test.ts",
     "build": "npm run build:webview && npm run build:ext",
     "build:ext": "node esbuild.mjs --production",
     "build:webview": "vite build",

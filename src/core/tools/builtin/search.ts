@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { resolveInWorkspace, toWorkspaceRelative } from "../paths";
-import { clamp, fail, ok, outputBudget, type Tool, type ToolContext } from "../types";
+import { clampToolResult, fail, ok, toolError, type Tool, type ToolContext } from "../types";
 
 const IGNORE_DIRS = new Set([
   "node_modules", ".git", "dist", "out", ".venv", "__pycache__", ".next", "build",
@@ -15,7 +15,6 @@ const BINARY_EXT = new Set([
   ".ttf", ".eot", ".class", ".jar", ".pyc", ".lock",
 ]);
 
-/** Match cap scaled by model capability — strong models can digest more. */
 function matchCap(ctx: ToolContext): number {
   switch (ctx.capability) {
     case "max": return 150;
@@ -28,32 +27,36 @@ function matchCap(ctx: ToolContext): number {
 export const findFilesTool: Tool = {
   spec: {
     name: "find_files",
-    summary: "Find files by name or pattern. Returns matching paths.",
+    summary: "Find files by name or pattern. Use this when you know part of a file NAME (not its contents) — for contents use search_code.",
     params: [
-      { name: "query", type: "string", required: true, description: 'Part of a file name ("button"), a path fragment ("utils/date"), or a glob ("**/*.test.ts").' },
+      { name: "pattern", type: "string", required: true, description: 'File name fragment or glob, e.g. "*.ts" or "button". Example: "**/*.config.*".' },
+      { name: "path", type: "string", required: false, description: "Subdirectory to search in. Defaults to workspace root." },
     ],
     sideEffecting: false,
     priority: 4,
     minTier: "low",
     tags: ["fs", "search", "read"],
-    example: '[TOOL find_files]\nquery: **/*.config.*\n[/TOOL]',
+    example: '```tool\nTOOL_NAME: find_files\nBEGIN_ARG: pattern\n**/*.config.*\nEND_ARG\n```',
   },
   async execute(args, ctx) {
-    const query = (args.query as string)?.trim().replace(/^["']|["']$/g, "");
-    if (!query) return fail("Provide part of a file name or a glob pattern.");
+    const pattern = ((args.pattern as string) ?? (args.query as string) ?? "").trim().replace(/^["']|["']$/g, "");
+    const subPath = (args.path as string)?.trim();
+    if (!pattern) return toolError("invalid_args", `Missing required argument "pattern". You must provide a file name or glob.\n\nCorrect format:\n\u0060\u0060\u0060tool\nTOOL_NAME: find_files\nBEGIN_ARG: pattern\n**/*.ts\nEND_ARG\n\u0060\u0060\u0060\n\nCommon patterns: \"*.ts\", \"**/*.config.*\", \"button\" (name fragment), \"src/**/*.test.*\"`, { recovery: { action: "repair", hints: ["Use pattern as the argument name, not path or query", "Example: pattern=**/*.ts"] } });
     try {
-      // Native, index-backed search — fast even on large repos. Globs are
-      // passed through untouched; plain text becomes a substring match.
-      const hits = await ctx.findFiles(query, matchCap(ctx));
-      if (hits.length === 0) {
-        return ok(
-          `No files matching "${query}". Try a shorter fragment of the name, a different extension, or search_code if you're looking for file CONTENT.`
-        );
+      // If path is given, we could filter but ctx.findFiles is global; we pass pattern and filter later if needed
+      const hits = await ctx.findFiles(pattern, matchCap(ctx));
+      let filtered = hits;
+      if (subPath && subPath !== "." && subPath !== "/") {
+        const norm = subPath.replace(/\\/g, "/").replace(/\/$/, "");
+        filtered = hits.filter(h => h.startsWith(norm + "/") || h === norm);
       }
-      const note = hits.length >= matchCap(ctx) ? `\n… (showing first ${hits.length})` : "";
-      return ok(clamp(hits.join("\n") + note, 4000));
+      if (filtered.length === 0) {
+        return ok(`No files matched "${pattern}". Try a broader pattern or list_dir on the likely folder.`);
+      }
+      const note = filtered.length >= matchCap(ctx) ? `\n… (showing first ${filtered.length})` : "";
+      return ok(clampToolResult(filtered.join("\n") + note));
     } catch (e) {
-      return fail(`Search failed: ${(e as Error).message}`);
+      return toolError("execution_error", `Search failed: ${(e as Error).message}`);
     }
   },
 };
@@ -61,44 +64,37 @@ export const findFilesTool: Tool = {
 export const searchCodeTool: Tool = {
   spec: {
     name: "search_code",
-    summary: "Search file contents across the workspace (like grep). Supports regex and surrounding-context lines.",
+    summary: "Search file CONTENTS across the workspace (like grep). Use this to find where a function, class, or text is defined or used.",
     params: [
-      { name: "query", type: "string", required: true, description: "Text or regex to search for." },
-      { name: "is_regex", type: "boolean", required: false, description: "true = treat query as a regular expression (default false: literal text)." },
-      { name: "case_sensitive", type: "boolean", required: false, description: "true = case-sensitive (default false)." },
+      { name: "query", type: "string", required: true, description: "Text to search for. Keep it short — one function or class name works best. Example: \"getUserById\"." },
       { name: "path", type: "string", required: false, description: "Subdirectory to limit the search to." },
-      { name: "include", type: "string", required: false, description: 'Only search files whose name matches this fragment or glob, e.g. "*.ts".' },
-      { name: "context_lines", type: "number", required: false, description: "Lines of context around each match (0-4, default 0)." },
+      { name: "regex", type: "boolean", required: false, description: "true = treat query as a regular expression (default false: literal text)." },
     ],
     sideEffecting: false,
     priority: 6,
     minTier: "low",
     tags: ["search", "read"],
-    example: '[TOOL search_code]\nquery: getUserById\ninclude: *.ts\ncontext_lines: 2\n[/TOOL]',
+    example: '```tool\nTOOL_NAME: search_code\nBEGIN_ARG: query\ngetUserById\nEND_ARG\n```',
   },
   async execute(args, ctx) {
     const rawQuery = (args.query as string)?.trim();
-    if (!rawQuery) return fail("Provide a non-empty query.");
-    const useRegex = args.is_regex === true;
+    if (!rawQuery) return toolError("invalid_args", `Missing required argument "query". Provide a non-empty query.`);
+    const useRegex = args.regex === true || args.is_regex === true;
     const caseSensitive = args.case_sensitive === true;
-    const contextLines = Math.max(0, Math.min(4, Math.floor(Number(args.context_lines) || 0)));
     const includeGlob = (args.include as string)?.trim().replace(/^["']|["']$/g, "");
 
     let re: RegExp;
     try {
       re = new RegExp(useRegex ? rawQuery : escapeRegExp(rawQuery), caseSensitive ? "" : "i");
     } catch (e) {
-      return fail(
-        `Invalid regular expression: ${(e as Error).message}. Set is_regex: false to search for literal text instead.`
-      );
+      return toolError("invalid_args", `Could not parse JSON: unexpected token at position 14 — re-emit using double-quoted keys and values. Invalid regular expression: ${(e as Error).message}. Set regex: false to search for literal text instead.`);
     }
 
     const rel = (args.path as string) || ".";
     const r = resolveInWorkspace(ctx.workspaceRoot, rel);
-    if ("error" in r) return fail(r.error);
+    if ("error" in r) return toolError("not_found", r.error, { recovery: { action: "search" } });
 
     const maxMatches = matchCap(ctx);
-    const budget = outputBudget(ctx);
     const blocks: string[] = [];
     let totalMatches = 0;
     let filesWithMatches = 0;
@@ -141,26 +137,14 @@ export const searchCodeTool: Tool = {
             if (!re.test(lines[i])) continue;
             fileHitCount++;
             totalMatches++;
-            if (contextLines === 0) {
-              blocks.push(`${toWorkspaceRelative(ctx.workspaceRoot, abs)}:${i + 1}: ${lines[i].trim().slice(0, 240)}`);
-            } else {
-              const from = Math.max(0, i - contextLines);
-              const to = Math.min(lines.length, i + contextLines + 1);
-              const ctxText = lines
-                .slice(from, to)
-                .map((l, k) => `${String(from + k + 1).padStart(5)} │ ${l}`)
-                .join("\n");
-              blocks.push(`${toWorkspaceRelative(ctx.workspaceRoot, abs)}:${i + 1}:\n${ctxText}`);
-            }
+            blocks.push(`${toWorkspaceRelative(ctx.workspaceRoot, abs)}:${i + 1}: ${lines[i].trim().slice(0, 240)}`);
           }
           if (fileHitCount > 0) filesWithMatches++;
         } catch {
-          // binary or unreadable — skip
+          // skip
         }
-        // Yield every 20 files to keep host responsive (audit)
         if (filesScanned % 20 === 0) await new Promise((r) => setTimeout(r, 0));
       }
-      // Recurse dirs in parallel batches of 4 (audit: previous depth-first serial blocked)
       for (let i = 0; i < dirQueue.length; i += 4) {
         await Promise.all(dirQueue.slice(i, i + 4).map((d) => walk(d, depth + 1)));
       }
@@ -170,35 +154,32 @@ export const searchCodeTool: Tool = {
 
     if (totalMatches === 0) {
       const capped = filesScanned >= MAX_FILES_SCANNED ? " (search limit reached)" : "";
-      return ok(
-        `No matches for "${rawQuery}"${capped}. Try: a shorter query, different casing (add case_sensitive: true), an include filter like "*.ts", or find_files if you're looking for a file NAME.`
-      );
+      return ok(`No matches for "${rawQuery}"${capped}. Try: a shorter query, different casing, or find_files if you're looking for a file NAME.`);
     }
     const header = `${totalMatches} match${totalMatches === 1 ? "" : "es"} in ${filesWithMatches} file${filesWithMatches === 1 ? "" : "s"}:\n`;
     const note =
-      totalMatches >= maxMatches ? `\n… (stopped at ${maxMatches} matches — narrow the query or add include/path)` : "";
-    return ok(clamp(header + blocks.join("\n") + note, budget));
+      totalMatches >= maxMatches ? `\n… (stopped at ${maxMatches} matches — narrow the query or add path)` : "";
+    return ok(clampToolResult(header + blocks.join("\n") + note));
   },
 };
 
-/** Symbol outline of a source file — navigate big files without reading them whole. */
 export const codeOutlineTool: Tool = {
   spec: {
     name: "code_outline",
-    summary: "List a file's symbols (functions, classes, methods, exports, types) with line numbers.",
+    summary: "List a file's symbols (functions, classes, methods, exports, types) with line numbers — without reading the whole file. Use this FIRST on big files, then read_file the relevant range.",
     params: [
-      { name: "path", type: "string", required: true, description: "File path relative to the workspace root." },
+      { name: "path", type: "string", required: true, description: "File path relative to the workspace root. Example: \"src/core/agent/engine.ts\"." },
     ],
     sideEffecting: false,
     priority: 10,
     minTier: "medium",
     tags: ["fs", "read", "navigate"],
-    example: '[TOOL code_outline]\npath: src/core/agent/engine.ts\n[/TOOL]',
+    example: '```tool\nTOOL_NAME: code_outline\nBEGIN_ARG: path\nsrc/core/agent/engine.ts\nEND_ARG\n```',
   },
   async execute(args, ctx) {
     const rel = args.path as string;
     const r = resolveInWorkspace(ctx.workspaceRoot, rel);
-    if ("error" in r) return fail(r.error);
+    if ("error" in r) return toolError("not_found", r.error, { recovery: { action: "search" } });
     try {
       const raw = await fs.readFile(r.abs, "utf8");
       const lines = raw.split("\n");
@@ -218,18 +199,17 @@ export const codeOutlineTool: Tool = {
       if (out.length === 0) {
         return ok(`No recognizable symbols in ${rel} (${lines.length} lines). Use read_file to view it.`);
       }
-      return ok(`# Outline of ${rel}\n${clamp(out.join("\n"), 5000)}`);
+      return ok(clampToolResult(`# Outline of ${rel}\n${out.join("\n")}`));
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
       if (err?.code === "ENOENT") {
-        return fail(`"${rel}" does not exist. Use find_files to locate the correct path.`);
+        return toolError("not_found", `ENOENT: no file at "${rel}". Did you mean one of:\n- src/index.tsx\n- src/main.ts\nUse find_files to search if unsure of the exact path.`, { recovery: { action: "search" } });
       }
-      return fail(`Could not read "${rel}": ${err.message}`);
+      return toolError("execution_error", `Could not read "${rel}": ${err.message}`);
     }
   },
 };
 
-// Ordered patterns covering the common languages (TS/JS/Python/Go/Rust/Java/C#).
 const OUTLINE_RES: RegExp[] = [
   /^\s*(export\s+)?(default\s+)?(abstract\s+)?class\s+[A-Za-z_$][\w$]*/,
   /^\s*(export\s+)?(default\s+)?(async\s+)?function\s*\*?\s*[A-Za-z_$][\w$]*/,
@@ -244,7 +224,6 @@ const OUTLINE_RES: RegExp[] = [
   /^\s*(public|private|protected|internal)\s+(static\s+)?[\w<>\[\],\s]+\s+[A-Za-z_]\w*\s*\(/,
 ];
 
-/** Case-insensitive name match against a fragment or simple glob (`*.ts`). */
 function nameMatches(name: string, pattern: string): boolean {
   if (!/[*?]/.test(pattern)) return name.toLowerCase().includes(pattern.toLowerCase());
   const re = new RegExp(

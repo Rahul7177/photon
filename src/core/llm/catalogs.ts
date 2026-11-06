@@ -27,6 +27,7 @@ export function customModel(id: string, providerId: string): ProviderModel {
     audio: caps.includes("audio"),
     video: caps.includes("video"),
     thinking: caps.includes("thinking"),
+    thinkingLevels: reasoningLevels(id, caps),
     capabilities: caps,
     tier: "large",
   };
@@ -42,4 +43,11 @@ function inferCapabilities(id: string): string[] {
   // tools only for known tool-trained families + explicit "tool" substring
   if (/qwen2|qwen3|llama3|mistral|hermes|qwq|deepseek-r|command-r|firefunction|tool/.test(n)) caps.push("tools");
   return caps;
+}
+
+function reasoningLevels(id: string, caps: string[]): import("../../shared/types").ThinkingLevel[] {
+  if (!caps.includes("thinking")) return [];
+  return /xtrahigh|o1|o3|o4|reasoning/i.test(id)
+    ? ["off", "low", "medium", "high", "xtrahigh"]
+    : ["off", "low", "medium", "high"];
 }

@@ -1,14 +1,29 @@
-import { useRef, useState } from "react";
+import { useRef, useState, useEffect, useMemo } from "react";
 import type { Attachment, Mode, ThinkingSetting } from "../../../src/shared/types";
 import type { AppState, Actions } from "../state/store";
-import { ContextMeter } from "./ContextMeter";
-import { CapabilityBadges } from "./CapabilityBadges";
-import { readFileToAttachment, formatBytes } from "../attachments";
+import { ContextMeter, ContextIconTrigger } from "./ContextMeter";
+import { PullProgressBar } from "./PullProgressBar";
+import { formatBytes } from "../attachments";
+import { CONTEXT_PRESETS, checkContextWindowOverflow, formatK, type ContextOverflowCheck } from "../contextPresets";
+import {
+  PaperclipIcon,
+  SendArrowIcon,
+  StopSquareIcon,
+  ChatModeIcon,
+  PlanModeIcon,
+  AgentModeIcon,
+  ChevronDownIcon,
+  FileCodeIcon,
+  ImageFileIcon,
+  RefreshIcon,
+  CloseIcon,
+  BoltIcon,
+} from "./Icons";
 
-const MODES: { id: Mode; label: string; hint: string }[] = [
-  { id: "chat", label: "Chat", hint: "Talk & get code, no tools" },
-  { id: "plan", label: "Plan", hint: "Read-only investigation → step-by-step plan" },
-  { id: "agent", label: "Agent", hint: "Uses tools to edit files and run commands" },
+const MODES: { id: Mode; label: string; hint: string; icon: JSX.Element }[] = [
+  { id: "chat", label: "Chat", hint: "Direct conversation & code snippets without workspace edits", icon: <ChatModeIcon /> },
+  { id: "plan", label: "Plan", hint: "Read-only investigation → step-by-step architecture plan", icon: <PlanModeIcon /> },
+  { id: "agent", label: "Agent", hint: "Autonomous file edits, terminal execution, and verification", icon: <AgentModeIcon /> },
 ];
 
 const THINKING_OPTIONS: Array<{ value: ThinkingSetting; label: string }> = [
@@ -32,25 +47,38 @@ function ModeDropdown({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => v
   const wrapperRef = useRef<HTMLDivElement>(null);
   const currentMode = MODES.find((m) => m.id === mode) || MODES[0];
 
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    }
+    if (open) {
+      document.addEventListener("mousedown", handleClickOutside);
+      return () => document.removeEventListener("mousedown", handleClickOutside);
+    }
+  }, [open]);
+
   return (
-    <div className="mode-dropdown" ref={wrapperRef}>
+    <div className={`mode-dropdown${open ? " open" : ""}`} ref={wrapperRef}>
       <button
+        type="button"
         className="mode-dropdown-trigger"
         onClick={() => setOpen(!open)}
         title={currentMode.hint}
         aria-haspopup="listbox"
         aria-expanded={open}
       >
+        <span className="mode-dropdown-icon">{currentMode.icon}</span>
         <span>{currentMode.label}</span>
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M4 6l4 4 4-4" />
-        </svg>
+        <ChevronDownIcon />
       </button>
       {open && (
         <ul className="mode-dropdown-menu" role="listbox">
           {MODES.map((m) => (
             <li key={m.id} role="option" aria-selected={mode === m.id}>
               <button
+                type="button"
                 className={`mode-dropdown-item${mode === m.id ? " active" : ""}`}
                 onClick={() => {
                   onChange(m.id);
@@ -58,7 +86,11 @@ function ModeDropdown({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => v
                 }}
                 title={m.hint}
               >
-                {m.label}
+                <span className="mode-dropdown-icon">{m.icon}</span>
+                <div className="mode-dropdown-item-text">
+                  <span className="mode-dropdown-item-label">{m.label}</span>
+                  <span className="mode-dropdown-item-hint">{m.hint}</span>
+                </div>
               </button>
             </li>
           ))}
@@ -68,10 +100,201 @@ function ModeDropdown({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => v
   );
 }
 
-export function Composer({ state, actions }: { state: AppState; actions: Actions }) {
+function ModelDropdown({
+  state,
+  actions,
+  onPullModel,
+}: {
+  state: AppState;
+  actions: Actions;
+  onPullModel: (model: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handleClickOutside(e: MouseEvent) {
+      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    }
+    if (open) {
+      document.addEventListener("mousedown", handleClickOutside);
+      return () => document.removeEventListener("mousedown", handleClickOutside);
+    }
+  }, [open]);
+
+  const isDisabled =
+    state.models.length === 0 &&
+    (!state.recommendations || state.recommendations.models.length === 0);
+
+  const currentLabel = useMemo(() => {
+    if (!state.ready) return "Loading models…";
+    if (state.config.autoSelectModel) return "Auto-Select";
+    if (!state.selectedModel) {
+      return state.models.length === 0 ? "No models configured" : "Select model";
+    }
+    const cleanName =
+      state.config.interfaceMode === "cloud" && state.selectedModel.includes(":")
+        ? state.selectedModel.split(":").slice(1).join(":")
+        : state.selectedModel;
+    return cleanName;
+  }, [state.ready, state.config.autoSelectModel, state.selectedModel, state.config.interfaceMode, state.models.length]);
+
+  return (
+    <div className={`model-dropdown${open ? " open" : ""}`} ref={wrapperRef}>
+      <button
+        type="button"
+        className="model-dropdown-trigger"
+        onClick={() => setOpen((prev) => !prev)}
+        disabled={isDisabled}
+        title={
+          state.config.autoSelectModel
+            ? `Auto — Photon picks the model per request${state.selectedModel ? ` (last: ${state.selectedModel})` : ""}`
+            : state.selectedModel
+        }
+        aria-haspopup="listbox"
+        aria-expanded={open}
+      >
+        <span className="model-dropdown-label">{currentLabel}</span>
+        <ChevronDownIcon />
+      </button>
+
+      {open && (
+        <div className="model-dropdown-menu" role="listbox">
+          {!state.ready && (
+            <div className="model-dropdown-empty">Loading models…</div>
+          )}
+          {state.ready && state.models.length === 0 && (!state.recommendations || state.recommendations.models.length === 0) && (
+            <div className="model-dropdown-empty">No models configured</div>
+          )}
+
+          {state.ready && state.models.length > 0 && (
+            <button
+              type="button"
+              className={`model-dropdown-item${state.config.autoSelectModel ? " active" : ""}`}
+              onClick={() => {
+                actions.setAutoSelect(true);
+                setOpen(false);
+              }}
+            >
+              <span className="model-dropdown-item-title">Auto-Select</span>
+            </button>
+          )}
+
+          {state.config.interfaceMode === "local" ? (
+            <>
+              {state.models.length > 0 && (
+                <div className="model-dropdown-section-header">Installed Local Models</div>
+              )}
+              {state.models.map((m) => {
+                const isSelected = !state.config.autoSelectModel && state.selectedModel === m.name;
+                const tps = benchTps(state.benchResults, m.name);
+                return (
+                  <button
+                    key={m.name}
+                    type="button"
+                    className={`model-dropdown-item${isSelected ? " active" : ""}`}
+                    onClick={() => {
+                      actions.setModel(m.name);
+                      setOpen(false);
+                    }}
+                    title={m.name}
+                  >
+                    <span className="model-dropdown-item-title">{m.name}</span>
+                    {(m.tier || tps) && (
+                      <span className="model-dropdown-item-meta">
+                        {m.tier ? `${m.tier}` : ""}
+                        {m.tier && tps ? " · " : ""}
+                        {tps ? `${tps} tok/s` : ""}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+
+              {(() => {
+                const uninstalled = (state.recommendations?.models || []).filter(
+                  (rec) => !state.models.some((m) => m.name.toLowerCase() === rec.name.toLowerCase())
+                );
+                if (uninstalled.length === 0) return null;
+                return (
+                  <>
+                    <div className="model-dropdown-section-header">Recommended to Install</div>
+                    {uninstalled.map((rec) => (
+                      <button
+                        key={`PULL:${rec.name}`}
+                        type="button"
+                        className="model-dropdown-item pull"
+                        onClick={() => {
+                          onPullModel(rec.name);
+                          setOpen(false);
+                        }}
+                        title={`${rec.name} — ${rec.fit.label}`}
+                      >
+                        <span className="model-dropdown-item-title">+ {rec.name}</span>
+                        <span className="model-dropdown-item-meta">
+                          {rec.sizeGb} GB · {rec.recommended ? "Recommended" : rec.fit.badge}
+                        </span>
+                      </button>
+                    ))}
+                  </>
+                );
+              })()}
+            </>
+          ) : (
+            <>
+              {state.models.map((m) => {
+                const isSelected = !state.config.autoSelectModel && state.selectedModel === m.name;
+                const cleanName =
+                  m.name.includes(":") ? m.name.split(":").slice(1).join(":") : m.name;
+                return (
+                  <button
+                    key={m.name}
+                    type="button"
+                    className={`model-dropdown-item${isSelected ? " active" : ""}`}
+                    onClick={() => {
+                      actions.setModel(m.name);
+                      setOpen(false);
+                    }}
+                    title={m.name}
+                  >
+                    <span className="model-dropdown-item-title">{cleanName}</span>
+                  </button>
+                );
+              })}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function Composer({
+  state,
+  actions,
+  attachments,
+  setAttachments,
+  attachError,
+  setAttachError,
+  addFiles,
+  onOpenHardwareModal,
+  onContextWarn,
+}: {
+  state: AppState;
+  actions: Actions;
+  attachments: Attachment[];
+  setAttachments: React.Dispatch<React.SetStateAction<Attachment[]>>;
+  attachError: string | null;
+  setAttachError: (msg: string | null) => void;
+  addFiles: (files: File[]) => Promise<void>;
+  onOpenHardwareModal: () => void;
+  onContextWarn: (check: ContextOverflowCheck) => void;
+}) {
   const [text, setText] = useState("");
-  const [attachments, setAttachments] = useState<Attachment[]>([]);
-  const [attachError, setAttachError] = useState<string | null>(null);
+  const [tuningOpen, setTuningOpen] = useState(false);
+  const [confirmInstallModel, setConfirmInstallModel] = useState<string | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -86,29 +309,14 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
     setText("");
     setAttachments([]);
     setAttachError(null);
+    setTuningOpen(false);
     if (taRef.current) taRef.current.style.height = "auto";
   };
 
-  const handleFiles = async (files: File[] | FileList | null) => {
-    if (!files) return;
-    const arr = Array.from(files as FileList);
-    setAttachError(null);
-    const next: Attachment[] = [];
-    for (const file of arr) {
-      const { attachment, error } = await readFileToAttachment(file);
-      if (error) setAttachError(error);
-      else if (attachment) {
-        if (attachment.kind === "image" && !supportsVision) {
-          setAttachError(`${model?.name ?? "This model"} can't read images — attach text/code instead.`);
-          continue;
-        }
-        next.push(attachment);
-      }
-    }
-    if (next.length) setAttachments((a) => [...a, ...next]);
+  const onPickFiles = (files: FileList | null) => {
+    if (files) void addFiles(Array.from(files));
     if (fileRef.current) fileRef.current.value = "";
   };
-  const onPickFiles = (files: FileList | null) => void handleFiles(files);
 
   const onPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const items = Array.from(e.clipboardData.items);
@@ -117,9 +325,7 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
     if (fileItems.length === 0) return;
 
     e.preventDefault();
-    setAttachError(null);
-    const next: Attachment[] = [];
-
+    const files: File[] = [];
     for (const item of fileItems) {
       let file = item.getAsFile();
       if (!file && item.type.startsWith("image/")) {
@@ -129,30 +335,9 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
           { type: item.type }
         );
       }
-
-      if (file) {
-        const { attachment, error } = await readFileToAttachment(file);
-        if (error) setAttachError(error);
-        else if (attachment) {
-          if (attachment.kind === "image" && !supportsVision) {
-            setAttachError(`${model?.name ?? "This model"} can't read images — attach text/code instead.`);
-            continue;
-          }
-          next.push(attachment);
-        }
-      }
+      if (file) files.push(file);
     }
-
-    if (next.length) setAttachments((a) => [...a, ...next]);
-  };
-
-  const onDrop = async (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    const files = Array.from(e.dataTransfer.files);
-    if (files.length) await handleFiles(files);
-  };
-  const onDragOver = (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
+    if (files.length) await addFiles(files);
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -169,76 +354,118 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
   };
 
   const modelCaps = state.models.find((m) => m.name === state.selectedModel);
-  return (
-    <div className="composer" onDrop={onDrop} onDragOver={onDragOver}>
-      <ContextMeter usage={state.usage} plan={state.plan} stats={state.generationStats} compactBadgesModel={modelCaps} />
+  const thinkingLevels = modelCaps?.thinkingLevels ?? [];
+  const thinkingSupported = thinkingLevels.length > 0;
+  const thinkingOptions = thinkingSupported
+    ? THINKING_OPTIONS.filter((option) => option.value === "auto" || thinkingLevels.includes(option.value as Exclude<ThinkingSetting, "auto">))
+    : [{ value: "auto" as ThinkingSetting, label: "Auto" }];
 
-      <div className="composer-toolbar">
-        <div className="iface-toggle" title="Local: Ollama/llama.cpp with adaptive tuning. Cloud: direct provider APIs.">
-          <button
-            className={state.config.interfaceMode === "local" ? "active" : ""}
-            onClick={() => actions.setInterfaceMode("local")}
-          >
-            Local
-          </button>
-          <button
-            className={state.config.interfaceMode === "cloud" ? "active cloud" : "cloud"}
-            onClick={() => actions.setInterfaceMode("cloud")}
-          >
-            ☁ Cloud
-          </button>
-        </div>
-        <div className="model-picker-group">
-          <div className="model-picker">
-            <select
-              value={state.config.autoSelectModel ? AUTO : state.selectedModel}
-              onChange={(e) => {
-                if (e.target.value === AUTO) actions.setAutoSelect(true);
-                else actions.setModel(e.target.value);
-              }}
-              disabled={state.models.length === 0}
-              title={
-                state.config.autoSelectModel
-                  ? `Auto — Photon picks the model per request${state.selectedModel ? ` (last: ${state.selectedModel})` : ""}`
-                  : state.selectedModel
-              }
-            >
-              {!state.ready && <option value="">Loading models…</option>}
-              {state.ready && state.models.length === 0 && <option value="">No models — check Local / Cloud</option>}
-              {state.ready && state.models.length > 0 && <option value={AUTO}>🤖 Auto</option>}
-              {state.models.map((m) => {
-                const tps = benchTps(state.benchResults, m.name);
-                const display = m.name.includes(":") ? m.name.split(":").slice(1).join(":") : m.name;
-                return (
-                  <option key={m.name} value={m.name} title={m.name}>
-                    {display}
-                    {m.tier ? ` · ${m.tier}` : ""}
-                    {tps ? ` · ${tps} tok/s` : ""}
-                  </option>
-                );
-              })}
-            </select>
+  return (
+    <div className="composer">
+      {/* Progressive-Disclosure Context & Runtime Tuning Popover */}
+      {tuningOpen && (
+        <div className="tuning-popover">
+          <div className="tuning-popover-head">
+            <span className="tuning-popover-title">Context &amp; Runtime</span>
+            <div className="tuning-popover-actions">
+              <button
+                type="button"
+                className="icon-btn"
+                onClick={actions.refreshModels}
+                title="Refresh available models"
+              >
+                <RefreshIcon />
+              </button>
+              <button
+                type="button"
+                className="icon-btn"
+                onClick={() => setTuningOpen(false)}
+                title="Close"
+              >
+                <CloseIcon />
+              </button>
+            </div>
           </div>
 
-          {/* Always-visible reasoning control. Providers that do not expose native reasoning
-              simply ignore unsupported values in their adapter; Auto remains safe. */}
-          {modelCaps && (
-            <div className="model-picker thinking-picker" title="Reasoning level">
+          <ContextMeter
+            usage={state.usage}
+            plan={state.plan}
+            stats={state.generationStats}
+            ollamaRuntime={state.ollamaRuntime}
+            onOpenHardwareModal={() => {
+              setTuningOpen(false);
+              onOpenHardwareModal();
+            }}
+          />
+
+          <div className="tuning-grid">
+            <div className="tuning-field">
+              <label className="tuning-label">Context Limit</label>
               <select
-                value={state.config.thinkingLevel}
-                onChange={(e) => actions.setThinkingSetting(e.target.value as ThinkingSetting)}
-                aria-label="Reasoning level"
+                className="tuning-select"
+                value={
+                  state.config.interfaceMode === "cloud"
+                    ? 0
+                    : CONTEXT_PRESETS.some((p) => p.value === (state.config.numCtxOverride || 0))
+                      ? state.config.numCtxOverride || 0
+                      : state.config.numCtxOverride
+                }
+                disabled={state.config.interfaceMode === "cloud"}
+                onChange={(e) => {
+                  if (state.config.interfaceMode === "cloud") return;
+                  const val = parseInt(e.target.value, 10) || 0;
+                  actions.setContextWindow(val);
+                  if (val > 0) {
+                    const check = checkContextWindowOverflow(val, modelCaps, state.machine);
+                    if (check.overflows) onContextWarn(check);
+                  }
+                }}
               >
-                {THINKING_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
+                {CONTEXT_PRESETS.map((p) => (
+                  <option
+                    key={p.value}
+                    value={p.value}
+                    disabled={state.config.interfaceMode === "cloud" && p.value !== 0}
+                  >
+                    {p.value === 0
+                      ? state.config.interfaceMode === "cloud"
+                        ? `${formatK(modelCaps?.contextLength ?? state.plan?.contextWindow ?? 128000)} (Native)`
+                        : `Auto (${state.plan ? formatK(state.plan.numCtx) : "8k"})`
+                      : p.label}
+                  </option>
+                ))}
+                {state.config.interfaceMode !== "cloud" &&
+                  state.config.numCtxOverride > 0 &&
+                  !CONTEXT_PRESETS.some((p) => p.value === state.config.numCtxOverride) && (
+                    <option value={state.config.numCtxOverride}>
+                      {formatK(state.config.numCtxOverride)} ctx
+                    </option>
+                  )}
+              </select>
+            </div>
+
+            <div className="tuning-field">
+              <label className="tuning-label">Reasoning</label>
+              <select
+                className="tuning-select"
+                value={
+                  thinkingSupported && thinkingOptions.some((o) => o.value === state.config.thinkingLevel)
+                    ? state.config.thinkingLevel
+                    : "auto"
+                }
+                onChange={(e) => actions.setThinkingSetting(e.target.value as ThinkingSetting)}
+                disabled={!thinkingSupported}
+              >
+                {thinkingOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
                 ))}
               </select>
             </div>
-          )}
-
-          {modelCaps && <CapabilityBadges model={modelCaps} compact />}
+          </div>
         </div>
-      </div>
+      )}
 
       {attachError && <div className="attach-error">{attachError}</div>}
 
@@ -246,13 +473,16 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
         <div className="attach-row">
           {attachments.map((a) => (
             <div key={a.id} className="attach-chip" title={a.name}>
-              <span className="attach-kind">{a.kind === "image" ? "🖼" : "📄"}</span>
+              <span className="attach-kind">
+                {a.kind === "image" ? <ImageFileIcon /> : <FileCodeIcon />}
+              </span>
               <span className="attach-name">{a.name}</span>
               <span className="attach-size">{formatBytes(a.size)}</span>
               <button
+                type="button"
                 className="attach-remove"
                 onClick={() => setAttachments((list) => list.filter((x) => x.id !== a.id))}
-                title="Remove"
+                title="Remove attachment"
               >
                 ×
               </button>
@@ -261,47 +491,123 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
         </div>
       )}
 
-      <div className="input-wrap">
-        <input
-          ref={fileRef}
-          type="file"
-          multiple
-          hidden
-          accept={supportsVision ? "image/*,text/*,.md,.json,.csv,.log,.py,.ts,.tsx,.js,.jsx" : "text/*,.md,.json,.csv,.log,.py,.ts,.tsx,.js,.jsx"}
-          onChange={(e) => onPickFiles(e.target.files)}
-        />
-        <button
-          className="attach-btn"
-          title={supportsVision ? "Attach image or file" : "Attach text or code file"}
-          onClick={() => fileRef.current?.click()}
-          disabled={busy || !state.selectedModel}
-        >
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M13.5 7.5l-5.8 5.8a3.5 3.5 0 01-5-5l5.8-5.8a2.3 2.3 0 013.3 3.3L6.1 11.5a1.2 1.2 0 01-1.7-1.7l5-5" />
-          </svg>
-        </button>
-        <div className="input-mode-tabs" role="tablist">
-          <ModeDropdown mode={state.mode} onChange={(m) => actions.setMode(m)} />
+      {/* Real-Time Pull Progress Bar in Composer (Phase 5.4) */}
+      <PullProgressBar state={state} actions={actions} />
+
+      {/* Model Install Prompt Confirmation (Phase 5.3) */}
+      {confirmInstallModel && (
+        <div className="model-install-prompt-banner">
+          <div className="prompt-left">
+            <BoltIcon />
+            <span>Install <strong>{confirmInstallModel}</strong> now?</span>
+            {(() => {
+              const rec = state.recommendations?.models.find((m) => m.name === confirmInstallModel);
+              return rec ? <span className="prompt-fit">({rec.sizeGb} GB · {rec.fit.label})</span> : null;
+            })()}
+          </div>
+          <div className="prompt-actions">
+            <button
+              type="button"
+              className="btn primary prompt-btn"
+              onClick={() => {
+                actions.pullModel(confirmInstallModel);
+                setConfirmInstallModel(null);
+              }}
+            >
+              Install Now
+            </button>
+            <button
+              type="button"
+              className="btn ghost prompt-btn"
+              onClick={() => setConfirmInstallModel(null)}
+            >
+              Cancel
+            </button>
+          </div>
         </div>
-        <textarea
-          ref={taRef}
-          rows={1}
-          value={text}
-          placeholder={placeholder(state)}
-          onChange={(e) => setText(e.target.value)}
-          onInput={autoGrow}
-          onKeyDown={onKeyDown}
-          onPaste={onPaste}
-        />
-        {busy ? (
-          <button className="send-btn stop" title="Stop" onClick={actions.cancel}>
-            ■
-          </button>
-        ) : (
-          <button className="send-btn" title="Send" disabled={!canSend} onClick={submit}>
-            ↑
-          </button>
-        )}
+      )}
+
+      {/* Unified Elevated Composer Card */}
+      <div className="composer-card">
+        <div className="composer-input-area">
+          <textarea
+            ref={taRef}
+            rows={1}
+            value={text}
+            placeholder={placeholder(state)}
+            onChange={(e) => setText(e.target.value)}
+            onInput={autoGrow}
+            onKeyDown={onKeyDown}
+            onPaste={onPaste}
+          />
+        </div>
+
+        <div className="composer-bottom-bar">
+          <div className="composer-controls-left">
+            <input
+              ref={fileRef}
+              type="file"
+              multiple
+              hidden
+              accept={supportsVision ? "image/*,text/*,.md,.json,.csv,.log,.py,.ts,.tsx,.js,.jsx" : "text/*,.md,.json,.csv,.log,.py,.ts,.tsx,.js,.jsx"}
+              onChange={(e) => onPickFiles(e.target.files)}
+            />
+            <button
+              type="button"
+              className="attach-btn"
+              title={supportsVision ? "Attach image or code file" : "Attach text or code file"}
+              onClick={() => fileRef.current?.click()}
+              disabled={busy || !state.selectedModel}
+            >
+              <PaperclipIcon />
+            </button>
+
+            <ModeDropdown mode={state.mode} onChange={(m) => actions.setMode(m)} />
+
+            <span className="composer-divider" />
+
+            <div className="iface-toggle" title="Switch between Local (Ollama/llama.cpp) and Cloud provider APIs">
+              <button
+                type="button"
+                className={state.config.interfaceMode === "local" ? "active" : ""}
+                onClick={() => actions.setInterfaceMode("local")}
+              >
+                Local
+              </button>
+              <button
+                type="button"
+                className={state.config.interfaceMode === "cloud" ? "active" : ""}
+                onClick={() => actions.setInterfaceMode("cloud")}
+              >
+                Cloud
+              </button>
+            </div>
+
+            <ModelDropdown
+              state={state}
+              actions={actions}
+              onPullModel={(model) => setConfirmInstallModel(model)}
+            />
+          </div>
+
+          <div className="composer-controls-right">
+            <ContextIconTrigger
+              usage={state.usage}
+              plan={state.plan}
+              active={tuningOpen}
+              onClick={() => setTuningOpen((o) => !o)}
+            />
+            {busy ? (
+              <button type="button" className="send-btn stop" title="Stop generation" onClick={actions.cancel}>
+                <StopSquareIcon />
+              </button>
+            ) : (
+              <button type="button" className="send-btn" title="Send message (Enter)" disabled={!canSend} onClick={submit}>
+                <SendArrowIcon />
+              </button>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -309,12 +615,14 @@ export function Composer({ state, actions }: { state: AppState; actions: Actions
 
 function placeholder(state: AppState): string {
   if (!state.selectedModel) {
-    const hint = state.config.interfaceMode === "cloud"
-      ? "No cloud model — add one in Settings → Cloud providers…"
-      : "No local model — start Ollama or llama.cpp and pull a model…";
-    return hint;
+    return state.config.interfaceMode === "cloud"
+      ? "Configure a cloud provider in Settings → Providers to begin…"
+      : "Start Ollama or llama.cpp and select a local model to begin…";
   }
-  const verb = { chat: "Ask", plan: "Describe what to plan", agent: "Describe a task" }[state.mode];
-  const tTag = state.config.thinkingLevel !== "off" && state.config.thinkingLevel !== "auto" ? ` +${state.config.thinkingLevel}` : "";
-  return `${verb}… (${state.mode}${tTag} mode)`;
+  const verb = {
+    chat: "Ask a question about your codebase",
+    plan: "Describe a feature or refactor to plan",
+    agent: "Describe a task to build, debug, or verify",
+  }[state.mode];
+  return `${verb}…`;
 }

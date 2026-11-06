@@ -15,8 +15,9 @@ export interface AnthropicConfig {
 }
 
 /**
- * Anthropic Claude provider. Streams SSE events from /v1/messages. Photon uses
- * the block protocol for cloud models, so tool results flow as text.
+ * Anthropic Claude provider. Streams SSE events from /v1/messages with
+ * automatic ephemeral prompt caching on system instructions and tool definitions
+ * to cut multi-step input token costs by up to 90%.
  */
 export class AnthropicProvider implements LLMProvider {
   readonly id = "claude";
@@ -67,7 +68,6 @@ export class AnthropicProvider implements LLMProvider {
   async fetchLiveModels(): Promise<ModelInfo[]> {
     const out: ModelInfo[] = [];
     let afterCursor: string | undefined;
-    // Paginate through all models
     for (let page = 0; page < 10; page++) {
       const url = new URL("https://api.anthropic.com/v1/models");
       url.searchParams.set("limit", "100");
@@ -79,21 +79,20 @@ export class AnthropicProvider implements LLMProvider {
             "x-api-key": this.apiKey,
             "anthropic-version": "2023-06-01",
           },
-          signal: AbortSignal.timeout(12000),
         },
-        { retries: 1 }
+        { retries: 1, timeoutMs: 12000 }
       );
       if (!res.ok) {
         const detail = await res.text().catch(() => "");
-        throw new Error(`Anthropic model list failed (${res.status}). ${detail}`.trim());
+        throw new Error(`Anthropic model list failed (${res.status}). ${detail.slice(0, 500)}`.trim());
       }
-      const json = await res.json() as {
+      const json = (await res.json()) as {
         data?: { id: string; display_name?: string; created_at?: string }[];
         has_more?: boolean;
         last_id?: string;
       };
       for (const m of json.data ?? []) {
-        const thinking = /opus|sonnet.*4|thinking/i.test(m.id);
+        const thinking = /opus|sonnet.*4|3-7-sonnet|thinking/i.test(m.id);
         out.push({
           name: `claude:${m.id}`,
           provider: "claude",
@@ -101,7 +100,8 @@ export class AnthropicProvider implements LLMProvider {
           toolTrained: true,
           vision: true,
           thinking,
-          capabilities: thinking ? ["tools","vision","thinking"] : ["tools","vision"],
+          thinkingLevels: thinking ? ["off", "low", "medium", "high"] : [],
+          capabilities: thinking ? ["tools", "vision", "thinking"] : ["tools", "vision"],
           tier: "large",
         });
       }
@@ -117,13 +117,10 @@ export class AnthropicProvider implements LLMProvider {
     const messages: { role: "user" | "assistant"; content: string | Block[] }[] = [];
     const push = (role: "user" | "assistant", content: string | Block[]) => {
       const last = messages[messages.length - 1];
-      // Anthropic requires alternating roles; merge consecutive messages.
       if (last && last.role === role) {
         if (typeof last.content === "string" && typeof content === "string") {
           last.content += "\n\n" + content;
         } else if (Array.isArray(last.content) && Array.isArray(content)) {
-          // Merge tool_result blocks into a single user message — Anthropic
-          // requires all tool_results for one assistant turn in ONE message.
           last.content.push(...content);
         }
       } else {
@@ -136,8 +133,13 @@ export class AnthropicProvider implements LLMProvider {
         continue;
       }
       if (m.role === "tool") {
-        // Tool results ride in a user turn as tool_result blocks.
-        push("user", [{ type: "tool_result", tool_use_id: m.tool_call_id ?? "", content: m.content }]);
+        push("user", [
+          {
+            type: "tool_result",
+            tool_use_id: m.tool_call_id || `missing-${messages.length}`,
+            content: m.content,
+          },
+        ]);
         continue;
       }
       if (m.role === "assistant" && m.tool_calls?.length) {
@@ -166,17 +168,28 @@ export class AnthropicProvider implements LLMProvider {
       messages,
       stream: true,
     };
-    if (system) body.system = system;
+    if (system) {
+      // Ephemeral prompt caching on system block saves up to 90% on input tokens across turns
+      body.system = [
+        {
+          type: "text",
+          text: system,
+          cache_control: { type: "ephemeral" },
+        },
+      ];
+    }
     if (req.options?.temperature !== undefined) body.temperature = req.options.temperature;
     if (req.options?.top_p !== undefined) body.top_p = req.options.top_p;
     if (req.tools?.length) {
-      body.tools = (req.tools as { function: { name: string; description?: string; parameters?: unknown } }[]).map(
-        (t) => ({
-          name: t.function.name,
-          description: t.function.description,
-          input_schema: t.function.parameters,
-        })
-      );
+      const mappedTools = (
+        req.tools as { function: { name: string; description?: string; parameters?: unknown } }[]
+      ).map((t, idx, arr) => ({
+        name: t.function.name,
+        description: t.function.description,
+        input_schema: t.function.parameters,
+        ...(idx === arr.length - 1 ? { cache_control: { type: "ephemeral" } } : {}),
+      }));
+      body.tools = mappedTools;
     }
 
     const res = await fetchWithRetry(
@@ -195,57 +208,100 @@ export class AnthropicProvider implements LLMProvider {
     );
     if (!res.ok || !res.body) {
       const detail = await res.text().catch(() => "");
-      throw new Error(`Anthropic /v1/messages failed (${res.status}). ${detail}`.trim());
+      throw new Error(`Anthropic /v1/messages failed (${res.status}). ${detail.slice(0, 500)}`.trim());
     }
 
-    // Streaming tool_use blocks: content_block_start announces the call
-    // (id/name), then input_json_delta fragments carry the arguments JSON.
-    // Calls are emitted together on message_stop.
     const pendingCalls = new Map<number, { id: string; name: string; json: string }>();
-    // The REAL end reason arrives on message_delta ("end_turn", "max_tokens",
-    // …) — message_stop carries none. Hardcoding "stop" here previously hid
-    // token-cap cutoffs from the engine, so long outputs looked finished.
     let stopReason: string | undefined;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cachedTokens = 0;
+
     for await (const payload of streamSse(res.body, signal)) {
       const json = tryJson<{
         type?: string;
+        error?: { type?: string; message?: string };
         index?: number;
+        message?: {
+          usage?: {
+            input_tokens?: number;
+            output_tokens?: number;
+            cache_read_input_tokens?: number;
+            cache_creation_input_tokens?: number;
+          };
+        };
+        usage?: {
+          input_tokens?: number;
+          output_tokens?: number;
+          cache_read_input_tokens?: number;
+        };
         content_block?: { type?: string; id?: string; name?: string };
-        delta?: { type?: string; text?: string; partial_json?: string; stop_reason?: string };
+        delta?: {
+          type?: string;
+          text?: string;
+          thinking?: string;
+          partial_json?: string;
+          stop_reason?: string;
+        };
       }>(payload);
       if (!json) continue;
+      if (json.type === "error" || json.error) {
+        throw new Error(`Anthropic stream error: ${json.error?.message ?? payload.slice(0, 300)}`);
+      }
+      if (json.type === "message_start" && json.message?.usage) {
+        const u = json.message.usage;
+        inputTokens += (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+        cachedTokens += u.cache_read_input_tokens ?? 0;
+        outputTokens += u.output_tokens ?? 0;
+      }
       if (json.type === "content_block_start" && json.content_block?.type === "tool_use") {
-        pendingCalls.set(json.index ?? 0, {
-          id: json.content_block.id ?? "",
+        pendingCalls.set(json.index ?? pendingCalls.size, {
+          id: json.content_block.id || `call_${json.index ?? pendingCalls.size}`,
           name: json.content_block.name ?? "",
           json: "",
         });
       } else if (json.type === "content_block_delta") {
         if (json.delta?.type === "text_delta" && json.delta.text) {
           yield { message: { role: "assistant", content: json.delta.text }, done: false };
+        } else if (json.delta?.type === "thinking_delta" && json.delta.thinking) {
+          yield { message: { role: "assistant", content: "", thinking: json.delta.thinking }, done: false };
         } else if (json.delta?.type === "input_json_delta" && json.delta.partial_json) {
-          const cur = pendingCalls.get(json.index ?? 0);
+          const cur = pendingCalls.get(json.index ?? [...pendingCalls.keys()].pop() ?? 0);
           if (cur) cur.json += json.delta.partial_json;
         }
       } else if (json.type === "message_delta") {
         if (json.delta?.stop_reason) stopReason = json.delta.stop_reason;
+        if (json.usage?.output_tokens !== undefined) outputTokens = json.usage.output_tokens;
       } else if (json.type === "message_stop") {
         const calls = [...pendingCalls.values()]
           .filter((c) => c.name)
-          .map((c) => ({
-            function: { name: c.name, arguments: (tryJson<Record<string, unknown>>(c.json) ?? {}) },
-          }));
+          .map((c) => {
+            const parsed = tryJson<Record<string, unknown>>(c.json);
+            if (c.json && c.json.trim() && parsed === undefined) return null;
+            return { id: c.id, function: { name: c.name, arguments: parsed ?? {} } };
+          })
+          .filter((c): c is NonNullable<typeof c> => !!c);
         if (calls.length) {
           yield { message: { role: "assistant", content: "", tool_calls: calls }, done: false };
         }
         yield {
           message: { role: "assistant", content: "" },
           done: true,
-          done_reason: stopReason ?? "stop",
+          done_reason: stopReason ?? (calls.length ? "tool_use" : "end_turn"),
+          prompt_eval_count: inputTokens || undefined,
+          eval_count: outputTokens || undefined,
+          cached_tokens: cachedTokens || undefined,
         };
         return;
       }
     }
-    yield { done: true };
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    yield {
+      message: { role: "assistant", content: "" },
+      done: true,
+      prompt_eval_count: inputTokens || undefined,
+      eval_count: outputTokens || undefined,
+      cached_tokens: cachedTokens || undefined,
+    };
   }
 }

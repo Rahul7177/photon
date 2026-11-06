@@ -44,12 +44,13 @@ export {
   estimateMessageTokens,
   estimateMessagesTokens,
 } from "./adaptive/tokens";
-export { profileMachine } from "./adaptive/machineProfiler";
+export { profileMachine, sampleHardwareMetrics } from "./adaptive/machineProfiler";
 export { profileModel } from "./adaptive/modelProfiler";
+export { CloudUsageTracker, estimateCloudCost, getModelPricing, type CloudPricing } from "./telemetry/cloudUsage";
 
 // --- Agent turn loop (M9 repair) ------------------------------------------
 export { AgentEngine, type EngineDeps, type TurnEmitter } from "./agent/engine";
-export { runCloudTurn, cloudHistoryFromSession, type CloudEmitter, type CloudTurnInput } from "./agent/cloudEngine";
+export { runCloudTurn, cloudHistoryFromSession, normalizeCloudToolCall, type CloudEmitter, type CloudTurnInput } from "./agent/cloudEngine";
 export { cloudTools } from "./tools/cloud/cloudTools";
 export { buildCloudSystemPrompt, type CloudSystemInput } from "./prompts/cloudSystem";
 export { fitToWindow, type FitResult } from "./agent/contextManager";

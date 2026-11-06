@@ -1,60 +1,106 @@
-import type { AdaptivePlan, GenerationStats, ModelInfo, TokenUsage } from "../../../src/shared/types";
-import { CapabilityBadges } from "./CapabilityBadges";
+import type { AdaptivePlan, GenerationStats, OllamaRuntimeModel, TokenUsage } from "../../../src/shared/types";
+import { ChartIcon, ContextGaugeIcon } from "./Icons";
 
 /** Format a token count for display, e.g. 1200 → "1.2k". */
-function fmtTokens(n: number): string {
+export function fmtTokens(n: number): string {
   if (n < 1000) return `${n}`;
   return `${(n / 1000).toFixed(1)}k`;
+}
+
+export function computeContextMetrics(
+  usage: TokenUsage | null,
+  plan: AdaptivePlan | null
+): { used: number; window: number; pct: number; warn: boolean; tooltip: string } {
+  const effectiveBudget = plan ? Math.max(2048, plan.numCtx - (plan.maxOutputTokens ?? 1024)) : 0;
+  const window = usage?.window ?? plan?.numCtx ?? effectiveBudget ?? 0;
+  const used = usage?.used ?? 0;
+  const pct = window > 0 ? Math.min(100, (used / window) * 100) : 0;
+  const warn = pct > 80;
+  const breakdown = usage?.breakdown ?? [];
+  const tooltip = breakdown.length
+    ? breakdown.map((b) => `${b.label}: ${fmtTokens(b.tokens)}`).join("\n") +
+      `\n─────────────` +
+      `\nContext: ${fmtTokens(used)} / ${fmtTokens(window)} (${pct.toFixed(0)}%)`
+    : `Context window: ${fmtTokens(used)} / ${fmtTokens(window)} tokens (${pct.toFixed(0)}%)`;
+
+  return { used, window, pct, warn, tooltip };
+}
+
+export function ContextIconTrigger({
+  usage,
+  plan,
+  active,
+  onClick,
+}: {
+  usage: TokenUsage | null;
+  plan: AdaptivePlan | null;
+  active: boolean;
+  onClick: () => void;
+}) {
+  const { used, window, pct, warn, tooltip } = computeContextMetrics(usage, plan);
+
+  return (
+    <button
+      type="button"
+      className={`ctx-icon-trigger${active ? " active" : ""}${warn ? " warn" : ""}`}
+      onClick={onClick}
+      title={`${tooltip}\nClick to tune context & runtime`}
+      aria-label={`Context window ${fmtTokens(used)} of ${fmtTokens(window)} tokens`}
+      aria-expanded={active}
+    >
+      <ContextGaugeIcon pct={pct} />
+    </button>
+  );
 }
 
 export function ContextMeter({
   usage,
   plan,
   stats,
-  compactBadgesModel,
+  ollamaRuntime,
+  onOpenHardwareModal,
 }: {
   usage: TokenUsage | null;
   plan: AdaptivePlan | null;
   stats?: GenerationStats | null;
-  compactBadgesModel?: ModelInfo;
+  ollamaRuntime?: OllamaRuntimeModel[];
+  onOpenHardwareModal?: () => void;
 }) {
-  const effectiveBudget = plan ? Math.max(2048, plan.numCtx - (plan.maxOutputTokens ?? 1024)) : 0;
-  const window = usage?.window ?? effectiveBudget ?? plan?.numCtx ?? 0;
-  const used = usage?.used ?? 0;
-  const pct = window > 0 ? Math.min(100, (used / window) * 100) : 0;
-  const warn = pct > 80;
+  const { used, window, pct, warn, tooltip } = computeContextMetrics(usage, plan);
   const live = stats && stats.tps > 0;
-
-  // Phase 1.2: Build a rich breakdown tooltip from TokenUsage.breakdown
-  const breakdown = usage?.breakdown ?? [];
-  const breakdownTooltip = breakdown.length
-    ? breakdown.map((b) => `${b.label}: ${fmtTokens(b.tokens)}`).join("\n") +
-      `\n─────────────` +
-      `\nUsed: ${fmtTokens(used)} / ${fmtTokens(window)} (${pct.toFixed(0)}%)`
-    : `${used.toLocaleString()} / ${window.toLocaleString()} tokens`;
+  const hasLoadedModel = (ollamaRuntime ?? []).length > 0;
 
   return (
-    <div className="context-meter">
+    <div className="context-meter-popover-section">
       <div className="meter-label">
-        <span className="meter-tokens" title={breakdownTooltip}>
-          {fmtTokens(used)} / {fmtTokens(window)}
+        <span className="meter-tokens" title={tooltip}>
+          <span className="meter-tokens-used">{fmtTokens(used)}</span>
+          <span className="meter-tokens-sep">/</span>
+          <span>{fmtTokens(window)}</span>
+          <span className="meter-tokens-pct">({pct.toFixed(0)}%)</span>
         </span>
-        {compactBadgesModel && <CapabilityBadges model={compactBadgesModel} compact />}
         {live && (
-          <span className="meter-tps" title={`${stats.totalTokens} tokens in ${(stats.elapsedMs / 1000).toFixed(1)}s`}>
+          <span
+            className="meter-tps"
+            title={`${stats.totalTokens} tokens in ${(stats.elapsedMs / 1000).toFixed(1)}s`}
+          >
             {stats.tps} tok/s
           </span>
         )}
-        {plan && (
-          <span className="plan-chip" title={(plan.rationale ?? []).join("\n")}>
-            {plan.intelligence}
-            {plan.intelligenceAuto ? " (auto)" : ""} ·{" "}
-            {plan.toolProtocol === "native" ? "native" : "block"} ·{" "}
-            {fmtTokens(plan.numCtx)} ctx
-          </span>
+        {onOpenHardwareModal && (
+          <button
+            type="button"
+            className={`hw-chart-btn ${hasLoadedModel ? "loaded" : ""}`}
+            onClick={onOpenHardwareModal}
+            title="Open live hardware & token telemetry"
+          >
+            <ChartIcon />
+            <span>Telemetry</span>
+            {hasLoadedModel && <span className="hw-chart-dot" />}
+          </button>
         )}
       </div>
-      <div className="meter-bar">
+      <div className="meter-bar" title={tooltip}>
         <div className={`meter-fill ${warn ? "warn" : ""}`} style={{ width: `${pct}%` }} />
       </div>
     </div>

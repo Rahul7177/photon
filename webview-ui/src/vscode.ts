@@ -9,13 +9,21 @@ interface VsCodeApi {
 declare function acquireVsCodeApi(): VsCodeApi;
 
 // acquireVsCodeApi may only be called once per webview.
-export const vscode: VsCodeApi = acquireVsCodeApi();
+export const vscode: VsCodeApi =
+  typeof acquireVsCodeApi === "function"
+    ? acquireVsCodeApi()
+    : {
+        postMessage: () => {},
+        getState: () => undefined,
+        setState: () => {},
+      };
 
 export function post(msg: ViewMessage): void {
   vscode.postMessage(msg);
 }
 
 export function onHostMessage(handler: (msg: HostMessage) => void): () => void {
+  if (typeof window === "undefined") return () => {};
   const listener = (e: MessageEvent) => handler(e.data as HostMessage);
   window.addEventListener("message", listener);
   return () => window.removeEventListener("message", listener);

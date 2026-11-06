@@ -53,8 +53,9 @@ export async function buildWorkspaceMap(
       lines.push(`${indent}${e.name}${e.isDirectory() ? "/" : ""}`);
       count++;
 
-      // Only descend two levels deep to keep the map shallow and cheap.
-      if (e.isDirectory() && node.depth < 2) {
+      // Descend three levels deep so models see src/core/... structure
+      // (two levels misses the actual source tree in nested workspaces).
+      if (e.isDirectory() && node.depth < 3) {
         queue.push({ abs: path.join(node.abs, e.name), rel, depth: node.depth + 1 });
       }
     }

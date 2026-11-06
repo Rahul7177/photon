@@ -1,9 +1,7 @@
-import { AgentEngine } from "../core/agent/engine";
-import { runUnifiedTurn } from "../core/agent/unifiedEngine";
 import { PhotonController } from "./PhotonController";
-import type { AdaptivePlan, ChatMessage, ThinkingSetting, ToolCall } from "../shared/types";
+import type { AdaptivePlan, ThinkingSetting, ToolCall } from "../shared/types";
 import type { ProviderManager } from "../core/llm/providerManager";
-import { setCloudToolPolicy, type CloudToolPolicy } from "../core/tools/cloud/cloudTools";
+import { setCloudToolPolicy, getCloudToolPolicy, classifyCloudToolPolicy } from "../core/tools/cloud/cloudTools";
 
 interface UnifiedEmitter {
   onAssistantStart(id:string):void; onDelta(id:string,delta:string):void; onContent(id:string,content:string):void; onAssistantCancel(id:string):void;
@@ -13,6 +11,7 @@ interface UnifiedEmitter {
 }
 
 const THINKING_KEY="photon.thinkingSetting";
+const THINKING_MIGRATED_KEY="photon.thinkingAutoDefaultV1";
 
 /**
  * Keep the existing local unified runtime, but NEVER replace the dedicated
@@ -24,43 +23,60 @@ const THINKING_KEY="photon.thinkingSetting";
  * exploration and pure external-information requests receive web tools first.
  */
 export function installUnifiedRuntime():void{
-  const localProto=AgentEngine.prototype as any;
-  if(!localProto.__photonUnified){
-    localProto.runTurn=function(session:ChatMessage|any,plan:AdaptivePlan,emitter:UnifiedEmitter,signal:AbortSignal){
-      const d=this.deps;
-      return runUnifiedTurn(session,plan,emitter,signal,{provider:d.client,tools:d.registry.all(),workspaceName:d.workspaceName,workspaceMap:d.workspaceMap,retrieveContext:d.retrieveContext,buildToolContext:d.toolContext,reserveOutputTokens:d.reserveOutputTokens});
-    };
-    localProto.__photonUnified=true;
-  }
-
   const controllerProto=PhotonController.prototype as any;
   if(!controllerProto.__photonThinkingWired){
     const originalInitialize=controllerProto.initialize;
     controllerProto.initialize=async function(){
       const stored=(this.context?.globalState?.get?.(THINKING_KEY) as ThinkingSetting|undefined)??"auto";
-      this.thinkingLevel=stored;
+      // One-time migration: "off" used to be the default, so long-time installs
+      // have it persisted without ever choosing it — leaving thinking-capable
+      // models (qwen3, deepseek-r1, gpt-oss…) silent with no trace in chat.
+      // Move those installs to "auto" once; an explicit later choice of "off"
+      // is respected because the flag is already set by then.
+      let level=stored;
+      try{
+        if(!this.context?.globalState?.get?.(THINKING_MIGRATED_KEY)){
+          if(level==="off")level="auto";
+          await this.context?.globalState?.update?.(THINKING_KEY,level);
+          await this.context?.globalState?.update?.(THINKING_MIGRATED_KEY,true);
+        }
+      }catch{/* best-effort: a failed migration must never block startup */}
+      this.thinkingLevel=level;
       await originalInitialize.call(this);
+      this.normalizeThinkingForModel?.();
+      this.pushConfig?.();
     };
 
     const originalHandle=controllerProto.handleMessage;
     controllerProto.handleMessage=async function(msg:any){
       const result=await originalHandle.call(this,msg);
+      // Note: the controller route already applies the fast UI update for
+      // setThinkingLevel/Enabled. This wrapper only adds persistence +
+      // re-plan, guarded by actual change so the double-handling is idempotent.
       if(msg?.type==="setThinkingSetting"){
         const level=msg.payload.level as ThinkingSetting;
-        this.thinkingLevel=level;
+        const next=this.isThinkingLevelSupported?.(level) === false ? "auto" : level;
+        if(next===this.thinkingLevel)return result;
+        this.thinkingLevel=next;
         await this.context.globalState.update(THINKING_KEY,level);
         this.recomputePlan?.();
         this.pushPlan?.();
         this.pushConfig?.();
       }else if(msg?.type==="setThinkingLevel"){
         const level=msg.payload.level as ThinkingSetting;
-        this.thinkingLevel=level;
+        const next=this.isThinkingLevelSupported?.(level) === false ? "auto" : level;
+        // Route already set thinkingLevel; only persist + re-plan on real change
+        // of the persisted key to avoid duplicate writes.
+        const stored=this.context.globalState.get?.(THINKING_KEY);
+        if(stored===level&&next===this.thinkingLevel)return result;
+        this.thinkingLevel=next;
         await this.context.globalState.update(THINKING_KEY,level);
         this.recomputePlan?.();
         this.pushPlan?.();
         this.pushConfig?.();
       }else if(msg?.type==="setThinkingEnabled"){
         const level:ThinkingSetting=msg.payload.enabled?"medium":"off";
+        if(level===this.thinkingLevel)return result;
         this.thinkingLevel=level;
         await this.context.globalState.update(THINKING_KEY,level);
         this.recomputePlan?.();
@@ -85,36 +101,15 @@ export function installUnifiedRuntime():void{
         if(messages[i]?.role==="user"){lastUser=String(messages[i]?.content??"");break;}
       }
       const policy=classifyCloudToolPolicy(plan?.mode,lastUser);
+      const prev=getCloudToolPolicy();
       setCloudToolPolicy(policy);
       try{
         return await originalRunCloudTurn.call(this,session,plan,emitter,signal);
       }finally{
-        setCloudToolPolicy("all");
+        setCloudToolPolicy(prev);
       }
     };
 
     controllerProto.__photonThinkingWired=true;
   }
-}
-
-function classifyCloudToolPolicy(mode:unknown,text:string):CloudToolPolicy{
-  const t=text.trim().toLowerCase();
-  if(!t) return "all";
-
-  // Deterministic guard: greetings, thanks and other social acknowledgements
-  // must never make a cloud model inspect the workspace.
-  if(/^(hi|hello|hey|hiya|yo|thanks|thank you|thx|ok|okay|great|cool|nice|good morning|good afternoon|good evening)[\s,!.?]*$/i.test(t)){
-    return "none";
-  }
-
-  // Agent/plan modes always need the full tool set.
-  if(mode==="agent"||mode==="plan") return "all";
-
-  const workspaceIntent=/\b(file|files|folder|directory|workspace|repo|repository|codebase|code|class|function|symbol|bug|error|stack trace|edit|modify|change|implement|refactor|debug|fix|write|read|search files|list files|build|test|compile|lint|run command|search|find|show|open|list|get|create|add|remove|delete|rename|move|copy|update|set|configure|install|uninstall|run|start|stop|restart|check|test|debug|format|lint|deploy|push|pull|commit|merge|branch|clone|init|setup)\b/i.test(t);
-  const externalIntent=/\b(weather|temperature|forecast|news|current|today|tonight|latest|live|recent|price|prices|stock|stocks|market|release|version|time|date|traffic|search|lookup|find out|what is|what are|how to|who is|where is)\b/i.test(t);
-
-  if(externalIntent && !workspaceIntent) return "web";
-  // Chat mode: still pass tools so the model can search/fetch when needed.
-  // Only deny tools for purely social/greeting messages (handled above).
-  return "all";
 }

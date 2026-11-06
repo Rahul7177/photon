@@ -42,7 +42,7 @@ export async function* streamSse(
 
   try {
     while (true) {
-      if (signal?.aborted) break;
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       let done: boolean;
       let value: Uint8Array | undefined;
       try {
@@ -50,7 +50,7 @@ export async function* streamSse(
         done = res.done;
         value = res.value;
       } catch (e) {
-        if (signal?.aborted || (e as Error).name === "AbortError") break;
+        if (signal?.aborted || (e as Error).name === "AbortError") throw new DOMException("Aborted", "AbortError");
         await reader.cancel().catch(() => {});
         throw e;
       }
@@ -69,6 +69,14 @@ export async function* streamSse(
           yield* dispatch();
         }
         // `event:`/`id:`/`retry:`/comment lines carry no payload for our use.
+      }
+    }
+    // Flush any residual buffer line not terminated by a newline
+    if (buffer.trim()) {
+      const line = buffer.replace(/\r$/, "");
+      if (line.startsWith("data:")) {
+        const rest = line.slice(5);
+        dataLines.push(rest.startsWith(" ") ? rest.slice(1) : rest);
       }
     }
     // Flush any final event not terminated by a blank line.
@@ -114,30 +122,61 @@ const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 export async function fetchWithRetry(
   url: string,
   init: RequestInit,
-  opts?: { retries?: number; signal?: AbortSignal }
+  opts?: { retries?: number; signal?: AbortSignal; timeoutMs?: number }
 ): Promise<Response> {
   const retries = opts?.retries ?? 2;
-  const signal = opts?.signal ?? init.signal;
+  const userSignal = opts?.signal ?? init.signal;
   let lastError: unknown;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
+    // Per-attempt timeout: a stale AbortSignal.timeout baked into init must not
+    // poison retries. Combine user abort with a fresh timeout each attempt.
+    const timeoutMs = opts?.timeoutMs;
+    const attemptTimeout = timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined;
+    const combined = userSignal && attemptTimeout
+      ? (AbortSignal as unknown as { any: (s: AbortSignal[]) => AbortSignal }).any
+        ? AbortSignal.any([userSignal, attemptTimeout])
+        : userSignal
+      : attemptTimeout ?? userSignal;
+    // Strip a potentially-expired init.signal; use the fresh combined signal.
+    const { signal: _ignored, ...rest } = init;
     try {
-      const res = await fetch(url, init);
+      const res = await fetch(url, { ...rest, signal: combined });
       if (!RETRYABLE_STATUS.has(res.status) || attempt === retries) return res;
-      // Drain the body so the socket is released back to the pool.
+      // Honor Retry-After on 429/503 when present (bounded).
+      const retryAfter = Number(res.headers.get("Retry-After"));
       await res.text().catch(() => {});
       lastError = new Error(`HTTP ${res.status}`);
+      if (userSignal?.aborted) throw new DOMException("Aborted", "AbortError");
+      const base = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter * 1000, 10000) : 700 * 2 ** attempt;
+      await sleepAbortable(base + Math.random() * 300, userSignal);
     } catch (e) {
-      if (signal?.aborted) throw e;
+      // Only the user's abort fails fast; per-attempt timeouts/transients retry.
+      if (userSignal?.aborted) throw e;
       lastError = e;
       if (attempt === retries) throw e;
+      if (attempt < retries) {
+        await sleepAbortable(700 * 2 ** attempt + Math.random() * 300, userSignal).catch(() => {
+          throw new DOMException("Aborted", "AbortError");
+        });
+        continue;
+      }
+      throw e;
     }
-    const delay = 700 * 2 ** attempt + Math.random() * 300;
-    await new Promise((r) => setTimeout(r, delay));
-    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    if (userSignal?.aborted) throw new DOMException("Aborted", "AbortError");
   }
   // Unreachable — the loop always returns or throws.
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function sleepAbortable(ms: number, signal?: AbortSignal | null): Promise<void> {
+  if (!signal) return new Promise((r) => setTimeout(r, ms));
+  if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, ms);
+    const onAbort = () => { clearTimeout(t); reject(new DOMException("Aborted", "AbortError")); };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /**

@@ -1,6 +1,6 @@
 import { useState, useMemo } from "react";
 import type { AppState, Actions } from "../state/store";
-import { ClockIcon, GearIcon, LightbulbIcon, RefreshIcon, PlusIcon } from "./Icons";
+import { ClockIcon, GearIcon, LightbulbIcon, PlusIcon, BrainIcon, PhotonLogoIcon, CloseIcon } from "./Icons";
 import { SessionHistory } from "./SessionHistory";
 import { TransparencyPanel } from "./TransparencyPanel";
 
@@ -8,10 +8,12 @@ export function Header({
   state,
   actions,
   onOpenSettings,
+  onOpenContextModal,
 }: {
   state: AppState;
   actions: Actions;
   onOpenSettings: () => void;
+  onOpenContextModal: () => void;
 }) {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
@@ -22,28 +24,81 @@ export function Header({
     return s?.title ?? "";
   }, [state.activeSessionId, state.sessions]);
 
+  const hasHandoffReady = Boolean(
+    state.projectContext?.latestHandoff &&
+    state.selectedModel &&
+    state.projectContext.latestHandoff.fromModel !== state.selectedModel
+  );
+
+  const indexedCount = state.projectContext?.totalFiles ?? 0;
+
   return (
     <header className="header">
       <div className="header-row">
-        <span className="session-title">{sessionTitle || "New Chat"}</span>
+        <div className="header-brand-group">
+          <span className="header-logo" aria-hidden title="Photon">
+            <PhotonLogoIcon size={16} />
+          </span>
+          <span className={`session-title ${!sessionTitle ? "brand-wordmark" : ""}`}>
+            {sessionTitle || "Photon"}
+          </span>
+        </div>
+
         <div className="header-actions">
+          {state.pullProgress && state.pullProgress.phase === "pulling" && (
+            <div className="header-pull-pill" title={state.pullProgress.status}>
+              <span className="pull-spinner" />
+              <span className="header-pull-text">
+                {state.pullProgress.model} ({state.pullProgress.percent !== undefined ? `${state.pullProgress.percent}%` : "pulling"})
+              </span>
+              <button
+                type="button"
+                className="header-pull-cancel"
+                onClick={actions.cancelPull}
+                title="Cancel download"
+              >
+                <CloseIcon />
+              </button>
+            </div>
+          )}
           <button
-            className={`icon-btn ${state.config.autoSelectModel ? "active" : ""}`}
-            title="Why this model? (Auto Mode)"
-            onClick={() => setAutoOpen((o) => !o)}
+            type="button"
+            className={`icon-btn ctx-header-btn ${indexedCount > 0 ? "indexed" : ""} ${hasHandoffReady ? "handoff-ready" : ""}`}
+            style={{ position: "relative" }}
+            title={
+              hasHandoffReady
+                ? `Cross-Model Handoff Ready (${state.projectContext?.latestHandoff?.fromModel} → ${state.selectedModel})`
+                : `Project Context & Memory (${indexedCount} files indexed)`
+            }
+            onClick={() => {
+              actions.requestProjectContext();
+              onOpenContextModal();
+            }}
+            aria-label="Project Context & Memory"
           >
-            <LightbulbIcon />
+            <BrainIcon />
+            {hasHandoffReady && <span className="ctx-handoff-dot" />}
           </button>
-          <button className="icon-btn" title="Chat history" onClick={() => setHistoryOpen((o) => !o)}>
+          {state.config.autoSelectModel && (
+            <button
+              className="icon-btn active"
+              title="Auto-routing active — inspect model selection"
+              onClick={() => setAutoOpen((o) => !o)}
+            >
+              <LightbulbIcon />
+            </button>
+          )}
+          <button
+            className={`icon-btn ${historyOpen ? "active" : ""}`}
+            title="Session history"
+            onClick={() => setHistoryOpen((o) => !o)}
+          >
             <ClockIcon />
           </button>
-          <button className="icon-btn" title="Refresh models" onClick={actions.refreshModels}>
-            <RefreshIcon />
-          </button>
-          <button className="icon-btn" title="New chat" onClick={actions.newSession}>
+          <button className="icon-btn" title="New session" onClick={actions.newSession}>
             <PlusIcon />
           </button>
-          <button className="icon-btn" title="Settings" onClick={onOpenSettings}>
+          <button className="icon-btn" title="Settings & Providers" onClick={onOpenSettings}>
             <GearIcon />
           </button>
           {autoOpen && <TransparencyPanel state={state} actions={actions} onClose={() => setAutoOpen(false)} />}

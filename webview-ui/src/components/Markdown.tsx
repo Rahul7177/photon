@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 
 /**
  * Tiny dependency-free markdown renderer. Handles fenced code blocks (with a
@@ -8,10 +8,13 @@ import { useEffect, useRef, useState } from "react";
  * IMPORTANT: the inline parser is a single-pass, indexOf-based scanner with NO
  * shared regex state and NO recursion, so it can never infinite-loop or
  * catastrophically backtrack no matter what the model emits.
+ *
+ * Memoized: MessageList re-renders on every streaming delta, and without memo
+ * every historic bubble would re-parse its markdown per token.
  */
-export function Markdown({ text, streaming }: { text: string; streaming?: boolean }) {
+export const Markdown = memo(function Markdown({ text, streaming }: { text: string; streaming?: boolean }) {
   const prepared = streaming ? hideDanglingMarkers(text) : text;
-  const blocks = splitFences(prepared);
+  const blocks = useMemo(() => splitFences(prepared), [prepared]);
   return (
     <div className="md">
       {blocks.map((b, i) =>
@@ -23,7 +26,7 @@ export function Markdown({ text, streaming }: { text: string; streaming?: boolea
       )}
     </div>
   );
-}
+});
 
 /**
  * While streaming, drop a single trailing unpaired inline marker so partial

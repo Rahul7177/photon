@@ -1,7 +1,7 @@
 import type { AdaptivePlan, BenchResult, ComplexityAssessment, ModelCapabilityProfile, ModelInfo, ModelTier, TaskAnalysis, ToolCall, ToolSpec, VerificationKind, VerificationPlan } from "../../shared/types";
 
-const LOCAL_CORE_TOOLS = ["list_dir","find_files","search_code","read_file","edit_file","write_file","get_diagnostics","run_command"] as const;
-const LOCAL_EXTENDED_TOOLS = ["code_outline","move_path","todo_write","think","web_search","web_fetch"] as const;
+const LOCAL_CORE_TOOLS = ["query_project_context","list_dir","find_files","search_code","read_file","edit_file","write_file","get_diagnostics","run_command"] as const;
+const LOCAL_EXTENDED_TOOLS = ["update_project_context","code_outline","move_path","todo_write","think","web_search","web_fetch"] as const;
 
 export function analyzeTask(prompt:string,mode:"chat"|"plan"|"agent",attachmentCount=0):TaskAnalysis{
   const text=(prompt??"").toLowerCase();const fileRefs=new Set<string>();
@@ -14,7 +14,14 @@ export function analyzeTask(prompt:string,mode:"chat"|"plan"|"agent",attachmentC
   const ambiguity=/\b(maybe|somewhere|around|similar|something|it|that|the thing)\b/i.test(prompt)&&fileRefs.size===0?"medium":"low";const estimatedSteps=Math.max(1,Math.min(20,1+referenceCount+(scope==="codebase"?4:scope==="multi_file"?2:0)+verification.length));return{scope,reasoning,risk,verification:[...new Set(verification)],ambiguity,estimatedSteps};
 }
 
-export function isFreshInfoRequest(prompt:string):boolean{const text=prompt??"";const current=/\b(today|tonight|now|right now|currently|current|latest|recent|live|real[- ]?time|as of|this morning|this afternoon|this evening)\b/i.test(text);const external=/\b(price|prices|stock|stocks|share|shares|nifty|sensex|market|weather|forecast|news|exchange rate|forex|currency|bitcoin|crypto|score|scores|standings|schedule|release|version|updates?|time|date)\b/i.test(text);const explicitWeb=/\bweb search\b|\b(search|check|look up|browse|find).{0,40}\b(web|internet|online)\b/i.test(text);return explicitWeb||(current&&external);}
+export function isFreshInfoRequest(prompt:string):boolean{
+  const text=prompt??"";
+  const current=/\b(today|tonight|now|right now|currently|current|latest|recent|live|real[- ]?time|as of|this morning|this afternoon|this evening)\b/i.test(text);
+  const external=/\b(price|prices|stock|stocks|share|shares|nifty|sensex|market|weather|forecast|news|exchange rate|forex|currency|bitcoin|crypto|score|scores|standings|schedule|release|version|updates?|time|date)\b/i.test(text);
+  const inherentlyRealTime=/\b(weather|forecast|bitcoin|crypto|stock prices?|exchange rates?|live scores?)\b/i.test(text);
+  const explicitWeb=/\bweb search\b|\b(search|check|look up|browse|find).{0,40}\b(web|internet|online)\b/i.test(text);
+  return explicitWeb||inherentlyRealTime||(current&&external);
+}
 export function toComplexity(task:TaskAnalysis,promptTokens:number):ComplexityAssessment{const level=task.scope==="codebase"||task.reasoning==="high"||promptTokens>1200?"complex":task.scope==="multi_file"||task.reasoning==="medium"||promptTokens>350?"moderate":"simple";const minContextTokens=level==="complex"?12288:level==="moderate"?6144:2048;return{level,minContextTokens,signals:{filesReferenced:Math.max(0,task.estimatedSteps-1-(task.scope==="codebase"?4:task.scope==="multi_file"?2:0)-task.verification.length),estimatedSteps:task.estimatedSteps,keywords:[],promptTokens,scope:task.scope,reasoning:task.reasoning,risk:task.risk,verification:task.verification,ambiguity:task.ambiguity},task};}
 export function capabilityForModel(model:ModelInfo,bench?:BenchResult):ModelCapabilityProfile{const tier=model.tier??"small";const baseMap:Record<string,number>={tiny:.38,small:.55,medium:.72,large:.88};const base=baseMap[tier]??.55;const p:ModelCapabilityProfile={reasoning:Math.min(1,base+(model.thinking?.08:0)),coding:Math.min(1,base+(model.toolTrained?.04:0)),toolCalling:model.toolTrained?Math.min(.95,base+.12):Math.max(.25,base-.10),schemaAdherence:model.toolTrained?Math.min(.92,base+.08):Math.max(.25,base-.08),contextRetention:Math.min(.96,base+.03),editFidelity:Math.min(.94,base+.02),recovery:Math.max(.25,base-.03),verification:Math.min(.94,base+.04),speed:.5};if(bench){p.speed=Math.max(.05,Math.min(1,Math.log1p(Math.max(0,bench.tokensPerSec))/Math.log1p(100)));if(bench.capabilityProfile)return clampProfile({...p,...bench.capabilityProfile});p.toolCalling=bench.toolCallReliability;p.schemaAdherence=bench.toolCallReliability;p.reasoning=taskPassRate(bench,"reasoning",p.reasoning);p.recovery=taskPassRate(bench,"recovery",p.recovery);p.editFidelity=taskPassRate(bench,"edit",p.editFidelity);p.verification=taskPassRate(bench,"verification",p.verification);p.contextRetention=taskPassRate(bench,"context",p.contextRetention);p.coding=taskPassRate(bench,"edit",p.coding);}return clampProfile(p);}
 function taskPassRate(bench:BenchResult,id:string,fallback:number){const t=bench.tasks.find(x=>x.id===id);return t?(t.passed?Math.min(1,fallback+.12):Math.max(0,fallback-.18)):fallback;}
@@ -24,23 +31,88 @@ export function rankTools(specs:ToolSpec[],task:TaskAnalysis,phase:"orient"|"edi
 function scoreTool(tool:ToolSpec,task:TaskAnalysis,phase:string,verification:Set<VerificationKind>,failures:Map<string,number>):number{let score=100-tool.priority;const tags=new Set(tool.tags??[]);const risk=tool.risk??(tool.sideEffecting?"workspace_write":"read");if(phase==="orient"&&(tags.has("read")||tags.has("search")||tags.has("navigate")||tags.has("web")) )score+=35;if(phase==="edit"&&(tags.has("write")||risk==="workspace_write"))score+=40;if(phase==="verify"&&(tags.has("verify")||tool.name==="run_command"||tool.name==="get_diagnostics"))score+=45;if(task.risk==="destructive"&&(risk==="destructive"||risk==="execute"))score-=30;if(task.verification.length&&(tool.verifyAfter??[]).some(v=>verification.has(v)))score+=15;if((failures.get(tool.name)??0)>=2)score+=5;return score;}
 
 /** Intelligence changes the amount of assistance, never whether the local
- * model can access its core workspace tools. */
-export function selectToolSpecs(specs:ToolSpec[],plan:AdaptivePlan,phase:"orient"|"edit"|"verify"|"final"):ToolSpec[]{
-  let usable=plan.mode==="plan"?specs.filter(s=>!s.sideEffecting):[...specs];if(plan.mode==="chat")return usable.filter(s=>s.name==="web_search"||s.name==="web_fetch").slice(0,Math.max(1,plan.maxTools));
+ * model can access its core workspace tools. `freshInfo` promotes the web
+ * tools to the front — they are the only way to answer a current/external
+ * question, and a weak model otherwise picks the first spec it sees. */
+export function selectToolSpecs(specs:ToolSpec[],plan:AdaptivePlan,phase:"orient"|"edit"|"verify"|"final",freshInfo=false):ToolSpec[]{
+  let usable=plan.mode==="plan"?specs.filter(s=>!s.sideEffecting):[...specs];if(plan.mode==="chat")return usable.filter(s=>s.name==="web_search"||s.name==="web_fetch"||s.name==="query_project_context").slice(0,Math.max(1,plan.maxTools));
   const byName=new Map(usable.map(s=>[s.name,s]));const core=LOCAL_CORE_TOOLS.map(n=>byName.get(n)).filter((s):s is ToolSpec=>!!s);const extended=LOCAL_EXTENDED_TOOLS.map(n=>byName.get(n)).filter((s):s is ToolSpec=>!!s);const task=plan.task??analyzeTask("",plan.mode);const coreRanked=rankTools(core,task,phase);const ranked=rankTools(usable,task,phase);const ordered:ToolSpec[]=[];const push=(s:ToolSpec)=>{if(!ordered.some(x=>x.name===s.name))ordered.push(s);};for(const s of coreRanked)push(s);
   // Web tools are always available — they are the only way to get current/external facts.
   // Other extended tools (code_outline, move_path, todo_write, think) are gated by intelligence.
   const webTools=extended.filter(s=>s.name==="web_search"||s.name==="web_fetch");
   const otherExtended=extended.filter(s=>s.name!=="web_search"&&s.name!=="web_fetch");
   for(const s of webTools)push(s);
-  const levelRank:Record<string,number>={low:0,medium:1,high:2,max:3};const extraCount=levelRank[plan.intelligence]??0;if(extraCount>=1)for(const s of otherExtended)push(s);for(const s of ranked)push(s);return ordered.slice(0,Math.max(1,plan.maxTools));
+  for(const s of otherExtended)push(s);for(const s of ranked)push(s);
+  let out=ordered.slice(0,Math.max(1,plan.maxTools));
+  if(freshInfo){
+    const web=out.filter(s=>s.name==="web_search"||s.name==="web_fetch");
+    if(web.length)out=[...web,...out.filter(s=>s.name!=="web_search"&&s.name!=="web_fetch")];
+  }
+  return out;
+}
+
+/** The model narrated its intent ("I'll read the file next") instead of
+ * emitting a tool call. Detected only on short, unstructured prose so a real
+ * deliverable — a plan, a numbered answer, code — is never mistaken for it. */
+export function looksLikeNarration(text:string):boolean{
+  const t=(text??"").trim();
+  if(t.length<8)return false;
+  // Code/fenced output and structured answers are deliverables, not narration.
+  if(/```/.test(t))return false;
+  const lines=t.split("\n").map(l=>l.trim()).filter(Boolean);
+  if(lines.filter(l=>/^(?:[-*•]|\d+[.)]|#{1,6}\s|>\s|\|)/.test(l)).length>=2)return false;
+  // Narration is a short burst of prose; anything long is a real answer.
+  if(t.length>420||lines.length>6)return false;
+  if(!/\b(?:i['’](?:ll|m going to)|i will|i am going to|let me|let['’]s|going to|now (?:i|let)|next,? i|then i)\b/i.test(t))return false;
+  if(!/\b(?:search|look(?: up| for| into)?|check|read|open|find|list|inspect|review|examine|run|execute|create|write|edit|modify|update|fix|add|remove|delete|move|copy|browse|fetch|start|proceed|try|use|go to|navigate|grab|pull)\b/i.test(t))return false;
+  // Future/intent framing rather than a completed statement.
+  return /\b(?:will|going to|now|next|then|should|need to|want to|first|after)\b/i.test(t);
+}
+
+/** Fenced code blocks (and inline code) removed, prose lines rejoined. A model
+ *  that pastes a file/command output and then narrates its next tool call
+ *  ("To replace the content, I will use edit_file… Let me proceed") would
+ *  otherwise dodge narration detection, which treats fenced output as a
+ *  deliverable — and the turn dies right before the tool runs. */
+export function stripFencedCode(text:string):string{
+  return (text??"")
+    .replace(/```[\s\S]*?```/g," ")
+    .replace(/`[^`\n]*`/g," ")
+    .split("\n").map(l=>l.trim()).filter(Boolean).join("\n").trim();
+}
+/** Contextually appropriate tool to nudge a non-acting model toward. Always
+ * returns a name present in `specs` so the nudge never points at a tool the
+ * model cannot call. */
+export function suggestFirstTool(specs:ToolSpec[],lastUser:string):string{
+  const have=new Map(specs.map(s=>[s.name,s] as const));
+  const firstOf=(...candidates:string[]):string|undefined=>{for(const c of candidates)if(have.has(c))return c;return undefined;};
+  const text=(lastUser??"").toLowerCase();
+  const hasUrl=/https?:\/\/|www\./.test(text);
+  const wantsWeb=/\b(current|latest|today|now|recent|live|real[- ]?time|weather|price|prices|stock|stocks|market|news|score|schedule|release|version|as of|forecast|exchange rate|currency|bitcoin|crypto)\b/.test(text)||hasUrl;
+  const wantsFetch=/\b(fetch|download|scrape|page|url|link|website|webpage|article|documentation|docs)\b/.test(text);
+  if(wantsWeb&&wantsFetch&&hasUrl)return firstOf("web_fetch","web_search")??"web_search";
+  if(wantsWeb)return firstOf("web_search","web_fetch")??"web_search";
+  if(/\b(?:grep|search (?:for |the code|the project|the workspace)|find (?:all )?(?:occurrences|usages|references)|which files? contain|text string|symbol)\b/.test(text))
+    return firstOf("search_code","find_files")??"search_code";
+  if(/\b(?:find|locate|where is|which files?|glob|\*\.|list (?:the )?(?:files|directory|folder)|directory tree|outline|structure)\b/.test(text))
+    return firstOf("find_files","list_dir")??"list_dir";
+  if(/\b(?:run|execute|test|tests|build|compile|lint|start|serve|npm|npx|pnpm|yarn|node |git )\b/.test(text))
+    return firstOf("run_command","get_diagnostics")??"run_command";
+  if(/\b(?:read|show|open|view|what('| i)s in|contents of|lines?\b)\b/.test(text)||/\.[a-z0-9]{1,8}\b/.test(text))
+    return firstOf("read_file","list_dir")??"read_file";
+  if(/\b(?:edit|write|fix|add|remove|delete|rename|replace|create|update|implement|change|move)\b/.test(text))
+    return firstOf("edit_file","write_file")??"edit_file";
+  const fallback=firstOf("list_dir","read_file","search_code")
+    ??specs.find(s=>(s.tags??[]).includes("read"))?.name
+    ??specs[0]?.name;
+  return fallback??"list_dir";
 }
 
 /** Native JSON tool calling is an optimization, not the local fallback path.
  * A local model must demonstrate high tool-call and schema reliability before
  * Photon trusts its provider-native interface. Without a benchmark result,
  * local models stay on the tolerant Photon block protocol. */
-export function shouldUseNativeToolProtocol(model:ModelInfo,capabilities:ModelCapabilityProfile,bench:BenchResult|undefined,intelligence:import("../../shared/types").IntelligenceLevel):boolean{const isLocal=!model.provider||model.provider==="ollama"||model.provider==="llamacpp";if(!isLocal)return true;if(intelligence==="low")return false;return!!bench&&bench.toolCallReliability>=.80&&capabilities.schemaAdherence>=.82&&capabilities.toolCalling>=.82;}
+export function shouldUseNativeToolProtocol(model:ModelInfo,capabilities:ModelCapabilityProfile,bench:BenchResult|undefined,intelligence:import("../../shared/types").IntelligenceLevel):boolean{const isLocal=!model.provider||model.provider==="ollama"||model.provider==="llamacpp";if(!isLocal)return true;if(model.capabilities?.some(c=>c.toLowerCase()==="tools"))return true;if(intelligence==="low")return false;return!!bench&&bench.toolCallReliability>=.80&&capabilities.schemaAdherence>=.82&&capabilities.toolCalling>=.82;}
 export function executionFingerprint(call:ToolCall,mutationEpoch:number):string{return`${call.name}|${JSON.stringify(stableNormalize(call.args))}|epoch:${mutationEpoch}`;}
 function stableNormalize(value:unknown):unknown{if(Array.isArray(value))return value.map(stableNormalize);if(value&&typeof value==="object")return Object.fromEntries(Object.entries(value as Record<string,unknown>).sort(([a],[b])=>a.localeCompare(b)).map(([k,v])=>[k,stableNormalize(v)]));return value;}
 export function canRunInParallel(a:ToolSpec,b:ToolSpec):boolean{const ar=a.risk??(a.sideEffecting?"workspace_write":"read");const br=b.risk??(b.sideEffecting?"workspace_write":"read");return(a.concurrency??"serial")==="safe_parallel"&&(b.concurrency??"serial")==="safe_parallel"&&ar==="read"&&br==="read";}

@@ -26,7 +26,7 @@ export interface PhotonContext {
 
 export function bootPhoton(context: vscode.ExtensionContext, output: vscode.OutputChannel): PhotonContext {
   const cfg = vscode.workspace.getConfiguration("photon");
-  const client = new OllamaClient({ baseUrl: cfg.get<string>("ollama.baseUrl", "http://localhost:11434"), timeoutMs: cfg.get<number>("ollama.requestTimeoutMs", 180000), keepAlive: "30m" });
+  const client = new OllamaClient({ baseUrl: cfg.get<string>("ollama.baseUrl", "http://localhost:11434"), timeoutMs: cfg.get<number>("ollama.requestTimeoutMs", 180000), connectTimeoutMs: cfg.get<number>("ollama.connectTimeoutMs", 300000), keepAlive: cfg.get<string>("ollama.keepAlive", "30m")?.trim() || undefined });
   const ollama = new OllamaProvider(client);
   const llm = new ProviderManager([ollama as any]);
   const bridged = bridgeLegacyProvider(llm as any);

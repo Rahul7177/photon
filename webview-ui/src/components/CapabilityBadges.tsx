@@ -2,58 +2,52 @@ import type { ModelInfo } from "../../../src/shared/types";
 
 export function CapabilityBadges({ model, compact }: { model: ModelInfo | undefined; compact?: boolean }) {
   if (!model) return null;
-  const badges: { key: string; label: string; icon: string; short: string; title: string; active: boolean }[] = [
+  const badges: { key: string; label: string; short: string; title: string; active: boolean }[] = [
     {
       key: "tools",
       label: "Tools",
-      icon: "◈",
-      short: "tools",
+      short: "Tools",
       title: model.toolTrained ? "Native tool calling" : "Block-protocol tools (works for every model)",
       active: true,
     },
     {
       key: "vision",
       label: "Vision",
-      icon: "◉",
-      short: "vision",
+      short: "Vision",
       title: model.vision ? "Image input (vision)" : "No image input",
       active: !!model.vision,
     },
     {
       key: "audio",
       label: "Audio",
-      icon: "♫",
-      short: "audio",
+      short: "Audio",
       title: model.audio ? "Audio input" : "No audio input",
       active: !!model.audio,
     },
     {
       key: "video",
       label: "Video",
-      icon: "▶",
-      short: "video",
+      short: "Video",
       title: model.video ? "Video input" : "No video input",
       active: !!model.video,
     },
     {
       key: "thinking",
       label: "Thinking",
-      icon: "✦",
-      short: "think",
+      short: "Reasoning",
       title: model.thinking ? "Extended thinking / reasoning" : "No extended reasoning",
       active: !!model.thinking,
     },
   ];
 
   if (compact) {
-    // Only show active caps, very small
     const active = badges.filter((b) => b.active);
     if (!active.length) return null;
     return (
       <span className="cap-badges compact" title={active.map((b) => b.label).join(" · ")}>
         {active.map((b) => (
           <span key={b.key} className={`cap-badge on cap-${b.key}`} title={b.title}>
-            {b.icon}
+            {b.short}
           </span>
         ))}
       </span>
@@ -68,7 +62,7 @@ export function CapabilityBadges({ model, compact }: { model: ModelInfo | undefi
           className={`cap-badge ${b.active ? "on" : "off"} cap-${b.key}`}
           title={b.title}
         >
-          <span className="cap-icon">{b.icon}</span>
+          <span className="cap-dot" />
           <span className="cap-label">{b.short}</span>
         </span>
       ))}

@@ -2,33 +2,66 @@ import { exec } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { ToolCall } from "../../../shared/types";
-import { locateEdit } from "../builtin/files";
-import { codeOutlineTool } from "../builtin/search";
-import { listDirTool } from "../builtin/files";
-import { searchCodeTool } from "../builtin/search";
-import { readFileTool } from "../builtin/files";
+import type { Mode, ToolCall } from "../../../shared/types";
+import { locateEdit, listDirTool, readFileTool } from "../builtin/files";
+import { codeOutlineTool, findFilesTool, searchCodeTool } from "../builtin/search";
+import { getDiagnosticsTool } from "../builtin/verify";
+import { todoWriteTool } from "../builtin/plan";
 import { webSearchTool, webFetchTool } from "../builtin/web";
+import { queryProjectContextTool, updateProjectContextTool } from "../builtin/context";
+import { getProjectContextManager } from "../../context/projectContext";
 import { resolveInWorkspace } from "../paths";
 import { clamp, fail, ok, outputBudget, type Tool } from "../types";
+import { analyzeCommandSecurity } from "../security";
 
 /**
  * The CLOUD tool set — used only by CloudEngine's native tool-calling loop.
  *
  * Deliberately separate from the local (block-protocol) tools: names and shapes
  * follow the conventions capable models already know from agentic coding tools
- * while reusing Photon's hardened public-web search/fetch implementations.
+ * while reusing Photon's hardened workspace and web implementations.
  *
  * The active policy is set by the cloud runtime for each request:
  *   all  = normal coding/agent task
  *   web  = pure external-information request
- *   none = conversational turn with no tool need
+ *   none = conversational turn with no tool need (0 tool schemas sent)
  */
 export type CloudToolPolicy = "all" | "web" | "none";
 let activeCloudToolPolicy: CloudToolPolicy = "all";
 
 export function setCloudToolPolicy(policy: CloudToolPolicy): void {
   activeCloudToolPolicy = policy;
+}
+
+export function getCloudToolPolicy(): CloudToolPolicy {
+  return activeCloudToolPolicy;
+}
+
+/**
+ * Request-aware tool surface: greetings get no tools, pure external-info
+ * requests get web tools first, agent/plan modes get mode-appropriate tools.
+ */
+export function classifyCloudToolPolicy(mode: unknown, text: string): CloudToolPolicy {
+  const t = text.trim().toLowerCase();
+  if (!t) return "all";
+  if (
+    /^(hi|hello|hey|hiya|yo|thanks|thank you|thx|ok|okay|great|cool|nice|good morning|good afternoon|good evening)[\s,!.?]*$/i.test(
+      t
+    )
+  ) {
+    return "none";
+  }
+  if (mode === "agent" || mode === "plan") return "all";
+  const workspaceIntent =
+    /\b(file|files|folder|directory|workspace|repo|repository|codebase|code|class|function|symbol|bug|error|stack trace|edit|modify|change|implement|refactor|debug|fix|write|read|search files|list files|build|test|compile|lint|run command|search|find|show|open|list|get|create|add|remove|delete|rename|move|copy|update|set|configure|install|uninstall|run|start|stop|restart|check|format|deploy|push|pull|commit|merge|branch|clone|init|setup)\b/i.test(
+      t
+    );
+  const externalIntent =
+    /\b(weather|temperature|forecast|news|current|today|tonight|latest|live|recent|price|prices|stock|stocks|market|release|version|time|date|traffic|search|lookup|find out|what is|what are|how to|who is|where is)\b/i.test(
+      t
+    );
+  if (externalIntent && !workspaceIntent) return "web";
+  return "all";
 }
 
 interface WebSearchState {
@@ -45,7 +78,7 @@ const COMMAND_MAX_BUFFER = 1024 * 1024;
 export const cloudReadFile: Tool = {
   spec: {
     name: "read_file",
-    summary: "Read the contents of a file at the given path.",
+    summary: "Read the contents of a file at the given path. Prefer start_line/end_line for large files to save tokens.",
     params: [
       { name: "path", type: "string", required: true, description: "File path relative to the workspace root." },
       { name: "start_line", type: "number", required: false, description: "Optional 1-based first line (for large files)." },
@@ -75,12 +108,13 @@ export const cloudWriteFile: Tool = {
     const content = (args.content as string) ?? "";
     const r = resolveInWorkspace(ctx.workspaceRoot, rel);
     if ("error" in r) return fail(r.error);
-    const approved = await ctx.requestApproval(mkCall("write_to_file", args));
+    const approved = await ctx.requestApproval(mkCall("write_to_file", args, ctx.pendingCallId));
     if (!approved) return fail("User declined the write.");
     try {
       await fs.mkdir(path.dirname(r.abs), { recursive: true });
       await fs.writeFile(r.abs, content, "utf8");
       const lines = content.split("\n").length;
+      void getProjectContextManager(ctx.workspaceRoot)?.recordFileEdit(rel, `Wrote file (${lines} lines)`);
       return ok(`Wrote ${rel} (${lines} lines).`);
     } catch (e) {
       return fail(`Could not write "${rel}": ${(e as Error).message}`);
@@ -117,10 +151,15 @@ export const cloudReplaceInFile: Tool = {
     }
     const result = locateEdit(original, find, replace, args.replace_all === true);
     if ("error" in result) return fail(`${result.error} (in ${rel})`);
-    const approved = await ctx.requestApproval(mkCall("replace_in_file", args));
+    const approved = await ctx.requestApproval(mkCall("replace_in_file", args, ctx.pendingCallId));
     if (!approved) return fail("User declined the edit.");
     try {
       await fs.writeFile(r.abs, result.text, "utf8");
+      const startLine = original.slice(0, result.firstIndex).split("\n").length;
+      void getProjectContextManager(ctx.workspaceRoot)?.recordFileEdit(
+        rel,
+        `Edited at line ~${startLine} (${result.count} replacement${result.count === 1 ? "" : "s"})`
+      );
       return ok(`Edited ${rel} (${result.count} replacement${result.count === 1 ? "" : "s"}).`);
     } catch (e) {
       return fail(`Could not write "${rel}": ${(e as Error).message}`);
@@ -143,27 +182,64 @@ export const cloudExecuteCommand: Tool = {
   async execute(args, ctx) {
     const command = (args.command as string)?.trim();
     if (!command) return fail("Provide a command.");
+    if (findShellChaining(command)) {
+      return fail(
+        `Run one command at a time — chaining is not allowed. Split into separate calls. Got: "${command.slice(0, 120)}"`
+      );
+    }
     if (!ctx.workspaceRoot) return fail("No workspace folder is open.");
     const requested = Number(args.timeout_ms);
-    const timeoutMs = Number.isFinite(requested) && requested > 0 ? Math.min(Math.floor(requested), 600_000) : COMMAND_TIMEOUT_MS;
-    const approved = await ctx.requestApproval(mkCall("execute_command", args));
-    if (!approved) return fail("User declined to run the command.");
+    const timeoutMs =
+      Number.isFinite(requested) && requested > 0
+        ? Math.min(Math.floor(requested), 600_000)
+        : COMMAND_TIMEOUT_MS;
+    const secAnalysis = analyzeCommandSecurity(command);
+    const toolCall = mkCall("execute_command", args, ctx.pendingCallId);
+    if (secAnalysis.isDangerous) {
+      toolCall.risk = "critical";
+      toolCall.statusDetail = `High-risk action: ${secAnalysis.reason}`;
+    }
+    const approved = await ctx.requestApproval(toolCall);
+    if (!approved) return fail(secAnalysis.isDangerous ? `User declined high-risk action: ${secAnalysis.reason}` : "User declined to run the command.");
     ctx.log(`$ ${command}`);
     return new Promise((resolve) => {
       let child: ReturnType<typeof exec> | undefined;
       const onAbort = () => child?.kill();
-      child = exec(command, { cwd: ctx.workspaceRoot, timeout: timeoutMs, maxBuffer: COMMAND_MAX_BUFFER, windowsHide: true }, (error, stdout, stderr) => {
-        ctx.signal.removeEventListener("abort", onAbort);
-        const out = [stdout, stderr].filter(Boolean).join("\n").trim();
-        if (ctx.signal.aborted) return resolve(fail("Command cancelled."));
-        const code = error ? ((error as unknown as { code?: number }).code ?? 1) : 0;
-        const header = `Exit code ${code}.`;
-        if (code !== 0) return resolve(fail(`${header}\n${clamp(out || error?.message || "(no output)", outputBudget(ctx))}`));
-        resolve(ok(`${header}\n${clamp(out || "(no output)", outputBudget(ctx))}`));
-      });
+      child = exec(
+        command,
+        { cwd: ctx.workspaceRoot, timeout: timeoutMs, maxBuffer: COMMAND_MAX_BUFFER, windowsHide: true },
+        (error, stdout, stderr) => {
+          ctx.signal.removeEventListener("abort", onAbort);
+          const out = [stdout, stderr].filter(Boolean).join("\n").trim();
+          if (ctx.signal.aborted) return resolve(fail("Command cancelled."));
+          const code = error ? ((error as unknown as { code?: number }).code ?? 1) : 0;
+          const header = `Exit code ${code}.`;
+          const outputText = `${header}\n${clamp(out || error?.message || "(no output)", outputBudget(ctx))}`;
+          if (code !== 0) {
+            // Return full stdout and stderr so the cloud model knows exactly why the command or test failed
+            return resolve(fail(outputText));
+          }
+          resolve(ok(outputText));
+        }
+      );
       ctx.signal.addEventListener("abort", onAbort, { once: true });
     });
   },
+};
+
+export const cloudFindFiles: Tool = {
+  spec: {
+    name: "find_files",
+    summary: "Find files by name or glob pattern (e.g. '*.tsx' or 'auth'). Much faster and more token-efficient than recursive list_files.",
+    params: [
+      { name: "pattern", type: "string", required: true, description: "File name fragment or glob pattern (e.g. '**/*.ts', 'Button')." },
+      { name: "path", type: "string", required: false, description: "Optional subdirectory to restrict the search." },
+    ],
+    sideEffecting: false,
+    priority: 5,
+    tags: ["fs", "search", "read"],
+  },
+  execute: findFilesTool.execute,
 };
 
 export const cloudSearchFiles: Tool = {
@@ -177,7 +253,7 @@ export const cloudSearchFiles: Tool = {
       { name: "is_regex", type: "boolean", required: false, description: "Treat query as a regex (default false)." },
     ],
     sideEffecting: false,
-    priority: 5,
+    priority: 6,
     tags: ["search", "read"],
   },
   execute: searchCodeTool.execute,
@@ -192,7 +268,7 @@ export const cloudListFiles: Tool = {
       { name: "recursive", type: "boolean", required: false, description: "Also list subdirectories (default false)." },
     ],
     sideEffecting: false,
-    priority: 6,
+    priority: 7,
     tags: ["fs", "read"],
   },
   execute: listDirTool.execute,
@@ -204,16 +280,47 @@ export const cloudListDefinitions: Tool = {
     summary: "List the top-level code definitions (functions, classes, types) defined in a source file.",
     params: [{ name: "path", type: "string", required: true, description: "File path relative to the workspace root." }],
     sideEffecting: false,
-    priority: 7,
+    priority: 8,
     tags: ["fs", "read", "navigate"],
   },
   execute: codeOutlineTool.execute,
 };
 
+export const cloudGetDiagnostics: Tool = {
+  spec: {
+    name: "get_diagnostics",
+    summary: "Get VS Code compiler/linter errors and warnings for a file or the workspace. Call this after editing code instead of running a full build command.",
+    params: [
+      { name: "path", type: "string", required: false, description: "Optional file path relative to workspace root. Omit for workspace-wide diagnostics." },
+    ],
+    sideEffecting: false,
+    priority: 9,
+    tags: ["verify", "read"],
+  },
+  execute: getDiagnosticsTool.execute,
+};
+
+export const cloudTodoWrite: Tool = {
+  spec: {
+    name: "todo_write",
+    summary: "Create or update a task checklist for complex multi-step engineering tasks.",
+    params: [
+      { name: "action", type: "string", required: false, description: '"set", "update", or "get". Default "set".' },
+      { name: "items", type: "string", required: false, description: 'JSON array like [{"id":1,"task":"...","status":"pending"}].' },
+      { name: "id", type: "number", required: false, description: "Item id to update." },
+      { name: "status", type: "string", required: false, description: '"pending", "in_progress", "done", or "blocked".' },
+    ],
+    sideEffecting: false,
+    priority: 10,
+    tags: ["plan"],
+  },
+  execute: todoWriteTool.execute,
+};
+
 /** Public web search for cloud models, with evidence enrichment and loop protection. */
 export const cloudWebSearch: Tool = {
   ...webSearchTool,
-  spec: { ...webSearchTool.spec, priority: 8, minTier: undefined },
+  spec: { ...webSearchTool.spec, priority: 11, minTier: undefined },
   async execute(args, ctx) {
     const query = (args.query as string)?.trim();
     if (!query) return fail("Provide a search query.");
@@ -253,7 +360,7 @@ export const cloudWebSearch: Tool = {
 };
 
 /** Public HTTPS fetch available to cloud models using the same hardened implementation as local Photon. */
-export const cloudWebFetch: Tool = { ...webFetchTool, spec: { ...webFetchTool.spec, priority: 9, minTier: undefined } };
+export const cloudWebFetch: Tool = { ...webFetchTool, spec: { ...webFetchTool.spec, priority: 12, minTier: undefined } };
 
 export const cloudAskFollowup: Tool = {
   spec: {
@@ -261,10 +368,12 @@ export const cloudAskFollowup: Tool = {
     summary: "Ask the user a question when you need information to proceed.",
     params: [{ name: "question", type: "string", required: true, description: "The question to ask." }],
     sideEffecting: false,
-    priority: 10,
+    priority: 13,
     tags: ["lifecycle"],
   },
-  async execute(args) { return ok((args.question as string) ?? ""); },
+  async execute(args) {
+    return ok((args.question as string) ?? "");
+  },
 };
 
 export const cloudAttemptCompletion: Tool = {
@@ -276,24 +385,56 @@ export const cloudAttemptCompletion: Tool = {
     priority: 0,
     tags: ["lifecycle"],
   },
-  async execute(args) { return ok((args.result as string) ?? ""); },
+  async execute(args) {
+    return ok((args.result as string) ?? "");
+  },
 };
 
-export function cloudTools(): Tool[] {
-  const lifecycle = [cloudAskFollowup, cloudAttemptCompletion];
-  if (activeCloudToolPolicy === "none") return lifecycle;
-  if (activeCloudToolPolicy === "web") return [cloudWebSearch, cloudWebFetch, ...lifecycle];
+/**
+ * Returns the minimal, mode-appropriate cloud tool list to save input tokens,
+ * eliminate unnecessary ceremony steps for frontier models, and prevent unintended
+ * side-effects in Chat/Plan modes.
+ */
+export function cloudTools(mode: Mode = "agent", extraMcpTools: Tool[] = []): Tool[] {
+  if (activeCloudToolPolicy === "none") return [];
+
+  const webOnly = [cloudWebSearch, cloudWebFetch];
+  if (activeCloudToolPolicy === "web") {
+    return webOnly;
+  }
+
+  const readOnlyWorkspace = [
+    cloudReadFile,
+    cloudFindFiles,
+    cloudSearchFiles,
+    cloudListFiles,
+    cloudListDefinitions,
+    cloudGetDiagnostics,
+  ];
+
+  if (mode === "chat") {
+    return [...readOnlyWorkspace, ...webOnly];
+  }
+  if (mode === "plan") {
+    return [...readOnlyWorkspace, ...webOnly];
+  }
+
+  // Full Agent mode suite + approved MCP server tools.
+  // Frontier cloud models do not need pseudo-tools (attempt_completion, ask_followup, todo_write)
+  // or context management ceremony (query_project_context/update_project_context) clogging
+  // their schemas because context is already pre-injected and they deliver results natively.
   return [
     cloudReadFile,
     cloudWriteFile,
     cloudReplaceInFile,
     cloudExecuteCommand,
+    cloudFindFiles,
     cloudSearchFiles,
     cloudListFiles,
     cloudListDefinitions,
-    cloudWebSearch,
-    cloudWebFetch,
-    ...lifecycle,
+    cloudGetDiagnostics,
+    ...webOnly,
+    ...extraMcpTools,
   ];
 }
 
@@ -311,9 +452,44 @@ function normalizeSearchQuery(query: string): string {
 }
 
 function isFreshOrExactQuery(query: string): boolean {
-  return /\b(today|now|right now|current|currently|latest|live|recent|as of|price|prices|weather|temperature|forecast|news|market|stock|stocks|gold|silver|bitcoin|crypto|exchange rate|rate|version|release|traffic)\b/i.test(query);
+  return /\b(today|now|right now|current|currently|latest|live|recent|as of|price|prices|weather|temperature|forecast|news|market|stock|stocks|gold|silver|bitcoin|crypto|exchange rate|rate|version|release|traffic)\b/i.test(
+    query
+  );
 }
 
-function mkCall(name: string, args: Record<string, unknown>): ToolCall {
-  return { id: randomUUID(), name, args, status: "proposed", sideEffecting: true };
+function mkCall(name: string, args: Record<string, unknown>, existingId?: string): ToolCall {
+  return { id: existingId ?? randomUUID(), name, args, status: "proposed", sideEffecting: true };
+}
+
+/** Detect shell chaining/substitution outside quotes (mirrors builtin terminal guard). */
+function findShellChaining(cmd: string): string | null {
+  let sq = false,
+    dq = false,
+    esc = false;
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (esc) {
+      esc = false;
+      continue;
+    }
+    if (c === "\\") {
+      esc = true;
+      continue;
+    }
+    if (c === "'" && !dq) {
+      sq = !sq;
+      continue;
+    }
+    if (c === '"' && !sq) {
+      dq = !dq;
+      continue;
+    }
+    if (sq || dq) continue;
+    const two = cmd.slice(i, i + 2);
+    if (two === "&&" || two === "||") return two;
+    if (c === ";" || c === "|" || c === "&" || c === "`" || c === ">" || c === "<") return c;
+    if (two === "$(") return "$(";
+    if (c === "\n" || c === "\r") return "\\n";
+  }
+  return null;
 }

@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import type {
@@ -5,17 +6,23 @@ import type {
   Attachment,
   AutoDecision,
   ChatMessage,
+  CloudUsageSummary,
+  HardwareMetrics,
   IndexStatus,
   IntelligenceSetting,
   MachineProfile,
   Mode,
+  ModelCapability,
   ModelInfo,
+  OllamaRuntimeModel,
   SessionState,
+  ThinkingLevel,
   ToolCall,
 } from "../shared/types";
 import type { HostMessage, PhotonConfig, ToolSummary, ViewMessage } from "../shared/protocol";
 import { OllamaClient } from "../core/ollama/client";
-import { profileMachine } from "../core/adaptive/machineProfiler";
+import { profileMachine, sampleHardwareMetrics } from "../core/adaptive/machineProfiler";
+import { CloudUsageTracker } from "../core/telemetry/cloudUsage";
 import { buildPlan } from "../core/adaptive/orchestrator";
 import { planRequest } from "../core/adaptive/autoMode";
 import { runBench } from "../core/bench/bench";
@@ -43,6 +50,10 @@ import { BenchStore } from "./benchStore";
 import { ProjectStore } from "./projectStore";
 import { IndexService } from "./indexService";
 import { ModelConfigStore } from "./modelConfigStore";
+import { getProjectContextManager, ProjectContextManager } from "../core/context/projectContext";
+import { LocalProcessManager, installOptions, type StartableId } from "./localProcessManager";
+import { recommendModels, MODEL_CATALOG } from "../core/adaptive/modelAdvisor";
+import { ModelInstaller } from "../core/ollama/modelInstaller";
 import { loadProjectConfig, type ProjectConfig } from "./projectConfig";
 import { SessionRegistry, PhotonSession } from "../photon-core/session/store";
 import { AgentRegistry, PhotonAgent } from "../photon-core/agent/agent";
@@ -115,7 +126,7 @@ export class PhotonController {
    *  (direct provider APIs, native tool calling, no adaptive limits). */
   private interfaceMode: "local" | "cloud" = "local";
   /** Extended thinking level for supported models. */
-  private thinkingLevel: "off" | "low" | "medium" | "high" = "off";
+  private thinkingLevel: ThinkingLevel = "off";
   private plan: AdaptivePlan | null = null;
   private userNumCtx: number | undefined;
   private session: SessionState;
@@ -134,6 +145,12 @@ export class PhotonController {
   private reachable = false;
   private pendingApprovals = new Map<string, (approved: boolean) => void>();
   private rawPost: Post = () => {};
+  /** One-click start/stop of local providers (Ollama, llama-server). */
+  private readonly localProcs = new LocalProcessManager();
+  /** Streams ollama pull with progress, disk pre-check and cancel. */
+  private readonly installer = new ModelInstaller({
+    pull: (model, onChunk, signal) => this.client.pullModel(model, onChunk, signal),
+  });
   /** Updates the status-bar item (active model + reachability). */
   private statusUpdater?: (text: string, tooltip: string) => void;
   /** Guards the one-time expensive setup so a webview re-mount can't re-run it. */
@@ -141,11 +158,23 @@ export class PhotonController {
   /** Last successfully fetched per-provider live model lists, so a webview
    *  remount can repaint the settings cards without refetching. */
   private liveModelCache = new Map<string, ModelInfo[]>();
+  /** Maintains project-wide symbol index, file outlines, smart path resolution and cross-model handoff. */
+  private ctxMgr?: ProjectContextManager;
+  /** Live hardware metrics (GPU util, VRAM, RAM, temperature). */
+  private latestHardwareMetrics: HardwareMetrics | null = null;
+  /** Models currently loaded in Ollama's memory. */
+  private latestOllamaRuntime: OllamaRuntimeModel[] = [];
+  /** Concurrency guard for hardware sampling. */
+  private samplingHardware = false;
+  /** Tracks session and cumulative cloud token usage and cost. */
+  private cloudUsageTracker: CloudUsageTracker;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly output: vscode.OutputChannel
   ) {
+    const persistedCloudUsage = this.context.globalState.get<CloudUsageSummary>("photon.cloudUsage.total");
+    this.cloudUsageTracker = new CloudUsageTracker(persistedCloudUsage);
     const cfg = vscode.workspace.getConfiguration("photon");
     this.client = new OllamaClient({
       baseUrl: cfg.get<string>("ollama.baseUrl", "http://localhost:11434"),
@@ -226,6 +255,37 @@ export class PhotonController {
     });
     this.session = this.freshSession();
 
+    // Wire up Project Context Manager: maintains symbol index, smart paths, and cross-model memory
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (root) {
+      this.ctxMgr = getProjectContextManager(root);
+      if (this.ctxMgr) {
+        this.ctxMgr.onDidUpdate((summary) => {
+          this.safePost({ type: "projectContext", payload: summary });
+        });
+      }
+      const folder = vscode.workspace.workspaceFolders?.[0];
+      if (folder) {
+        const ctxWatcher = vscode.workspace.createFileSystemWatcher(
+          new vscode.RelativePattern(
+            folder,
+            "**/*.{ts,tsx,js,jsx,mjs,cjs,py,go,rs,java,c,cpp,h,cs,rb,php,swift,kt,vue,svelte,md,json,yaml,yml}"
+          )
+        );
+        const onFileChange = (uri: vscode.Uri) => {
+          const rel = vscode.workspace.asRelativePath(uri, false);
+          void this.ctxMgr?.indexSingleFile(rel);
+        };
+        ctxWatcher.onDidCreate(onFileChange);
+        ctxWatcher.onDidChange(onFileChange);
+        ctxWatcher.onDidDelete((uri) => {
+          const rel = vscode.workspace.asRelativePath(uri, false);
+          this.ctxMgr?.removeFile(rel);
+        });
+        this.context.subscriptions.push(ctxWatcher);
+      }
+    }
+
     // Deterministic teardown on extension deactivate — abort work, close every
     // MCP connection, dispose the index watcher. Prevents process/connection leaks.
     this.context.subscriptions.push({
@@ -233,6 +293,8 @@ export class PhotonController {
         this.turnAbort?.abort();
         this.benchAbort?.abort();
         this.index.dispose();
+        this.installer.cancel();
+        this.localProcs.dispose();
         void this.mcp.dispose();
       },
     });
@@ -286,6 +348,8 @@ export class PhotonController {
   setStatusUpdater(fn: (text: string, tooltip: string) => void) {
     this.statusUpdater = fn;
     this.updateStatusBar();
+    this.sendRecommendations();
+    void this.detectProviders();
   }
 
   /** Model names available for the status-bar quick-pick command. */
@@ -353,10 +417,15 @@ export class PhotonController {
     }
 
     this.machine = await profileMachine().catch(() => null);
+    void this.pushHardwareMetrics();
     await this.rebuildProviders();
     await this.connectAndLoad();
     await this.setupMcp();
     await this.configureIndex();
+    if (this.ctxMgr) {
+      await this.ctxMgr.ensureInitialized().catch(() => undefined);
+      void this.ctxMgr.scanWorkspace(false);
+    }
     this.recomputePlan();
     // Benchmark newly-seen models in the background — never blocks init (M7).
     void this.kickOffBench();
@@ -444,6 +513,8 @@ export class PhotonController {
       this.safePost({ type: "providerModels", payload: { id, models } });
     }
     this.updateStatusBar();
+    this.sendRecommendations();
+    void this.detectProviders();
   }
 
   /** Ping every configured provider and, if any is reachable, load the model list. */
@@ -488,6 +559,113 @@ export class PhotonController {
     this.pushPlan();
     this.pushConfig();
     this.updateStatusBar();
+    this.sendRecommendations();
+    void this.detectProviders();
+  }
+
+  /** Push recommendations to the webview based on the latest hardware profile & installed models. */
+  private sendRecommendations(goal?: ModelCapability, ctxTokens?: number): void {
+    if (this.machine) this.machine = { ...this.machine, freeRamBytes: os.freemem() };
+    const installed = this.models.map((m) => m.name);
+    this.safePost({
+      type: "modelRecommendations",
+      payload: recommendModels(this.machine, { goal, ctxTokens, installed }),
+    });
+  }
+
+  /** Detect local runtimes and push them (with install guidance) to the webview. */
+  private async detectProviders(): Promise<void> {
+    const runtimes = await this.localProcs.detect();
+    for (const r of runtimes) {
+      if (r.state === "not_installed") r.installOptions = installOptions(r.id, process.platform);
+    }
+    this.safePost({ type: "providerRuntimes", payload: runtimes });
+  }
+
+  /** One-click provider start; refreshes the model catalog once it is ready. */
+  private async startLocalProvider(id: StartableId, modelPath?: string): Promise<void> {
+    const sub = this.localProcs.onState((s) => this.safePost({ type: "providerLifecycle", payload: s }));
+    try {
+      let llamacpp;
+      if (id === "llamacpp") {
+        const selected = this.selectedModel ?? "";
+        const path = modelPath ?? (selected.startsWith("llamacpp:") ? selected.replace(/^llamacpp:/, "") : "");
+        const lc = this.modelConfigs.effective(selected)?.llamacpp;
+        const cfg = vscode.workspace.getConfiguration("photon");
+        let port: number | undefined;
+        try { port = Number(new URL(cfg.get<string>("llamacpp.baseUrl", "http://localhost:8080")).port) || undefined; } catch { /* default */ }
+        llamacpp = { modelPath: path, ctx: lc?.ctx ?? this.modelConfigs.effective(selected)?.numCtx, ngl: lc?.ngl, np: lc?.np, fa: lc?.fa, ctk: lc?.ctk, ctv: lc?.ctv, extraArgs: lc?.extraArgs, port };
+      }
+      const state = await this.localProcs.start(id, { llamacpp });
+      if (state.phase === "running") {
+        await this.refresh();
+        void vscode.window.showInformationMessage(`Photon: ${id === "ollama" ? "Ollama" : "llama.cpp"} is running.`);
+      }
+    } finally {
+      sub.dispose();
+      await this.detectProviders();
+    }
+  }
+
+  /** One-click model install: pre-flight disk check, live progress, cancel support, then auto-activation. */
+  private async installModel(modelName: string): Promise<void> {
+    try {
+      const sizeGb = MODEL_CATALOG.find((m) => m.name.toLowerCase() === modelName.toLowerCase())?.sizeGb;
+      const outcome = await this.installer.install(modelName, {
+        estimatedSizeBytes: sizeGb ? Math.round(sizeGb * 1024 ** 3) : undefined,
+        onProgress: (p) => this.safePost({ type: "pullProgress", payload: p }),
+      });
+      switch (outcome.status) {
+        case "done": {
+          this.safePost({
+            type: "pullProgress",
+            payload: { model: modelName, phase: "done", status: `${modelName} installed and ready to code!`, percent: 100 },
+          });
+          await this.refresh();
+          this.activateInstalledModel(modelName);
+          void vscode.window.showInformationMessage(`Photon: ${modelName} installed and ready to code!`);
+          setTimeout(() => this.safePost({ type: "pullProgress", payload: null }), 4000);
+          return;
+        }
+        case "cancelled":
+          this.safePost({ type: "pullProgress", payload: null });
+          return;
+        case "blocked":
+          this.safePost({
+            type: "pullProgress",
+            payload: { model: modelName, phase: "error", status: "Cannot start download", error: outcome.message },
+          });
+          return;
+        case "error":
+          this.safePost({
+            type: "pullProgress",
+            payload: { model: modelName, phase: "error", status: "Failed", error: outcome.message, resumable: outcome.resumable },
+          });
+          return;
+      }
+    } catch (e) {
+      this.safePost({
+        type: "pullProgress",
+        payload: { model: modelName, phase: "error", status: "Failed", error: (e as Error).message },
+      });
+    }
+  }
+
+  /** Select a freshly pulled model. */
+  private activateInstalledModel(modelName: string): void {
+    try {
+      const match = this.models.find((m) => m.name.toLowerCase() === modelName.toLowerCase());
+      if (!match) return;
+      this.autoSelect = false;
+      this.selectedModel = match.name;
+      this.recomputePlan();
+      this.pushPlan();
+      this.pushConfig();
+      this.safePost({
+        type: "models",
+        payload: { models: this.modelsForUi(), selected: this.selectedModel, ollamaReachable: this.reachable },
+      });
+    } catch {}
   }
 
   /** Re-check the connection + reload models, then notify the webview. */
@@ -503,6 +681,7 @@ export class PhotonController {
       },
     });
     this.pushPlan();
+    this.sendRecommendations();
     // A refreshed model list may make the embedding model (un)available, and may
     // surface new models to benchmark.
     await this.configureIndex();
@@ -1046,6 +1225,37 @@ export class PhotonController {
       case "deleteSession":
         await this.deleteSession(msg.payload.id);
         return;
+      case "detectProviders":
+        return this.detectProviders();
+      case "requestRecommendations":
+        this.sendRecommendations(msg.payload?.goal, msg.payload?.ctxTokens);
+        return;
+      case "startProvider":
+        return this.startLocalProvider(msg.payload.id, msg.payload.modelPath);
+      case "stopProvider":
+        await this.localProcs.stop(msg.payload.id);
+        return this.detectProviders();
+      case "restartProvider":
+        await this.localProcs.restart(msg.payload.id);
+        return this.detectProviders();
+      case "installProvider": {
+        const opt = installOptions(msg.payload.id, process.platform)[msg.payload.optionIndex];
+        if (!opt) return;
+        if (opt.kind === "url") {
+          void vscode.env.openExternal(vscode.Uri.parse(opt.value));
+        } else {
+          const term = vscode.window.createTerminal({ name: "Photon: install" });
+          term.show();
+          term.sendText(opt.value, true);
+        }
+        return;
+      }
+      case "pullModel":
+        void this.installModel(msg.payload.model);
+        return;
+      case "cancelPull":
+        this.installer.cancel();
+        return;
       case "refreshModels":
         return this.refresh();
       case "toolApproval": {
@@ -1214,6 +1424,48 @@ export class PhotonController {
         this.pushPlan();
         return;
       }
+      case "requestProjectContext":
+        if (this.ctxMgr) {
+          this.safePost({ type: "projectContext", payload: this.ctxMgr.getSummary() });
+        }
+        return;
+      case "refreshProjectContext":
+        if (this.ctxMgr) {
+          await this.ctxMgr.scanWorkspace(true);
+          this.safePost({ type: "projectContext", payload: this.ctxMgr.getSummary() });
+        }
+        return;
+      case "addProjectNote":
+        if (this.ctxMgr) {
+          this.ctxMgr.addNote(msg.payload);
+        }
+        return;
+      case "deleteProjectNote":
+        if (this.ctxMgr) {
+          this.ctxMgr.deleteNote(msg.payload.id);
+        }
+        return;
+      case "clearWorkingMemory":
+        if (this.ctxMgr) {
+          this.ctxMgr.clearWorkingMemory();
+        }
+        return;
+      case "requestHardwareMetrics":
+        await this.pushHardwareMetrics();
+        return;
+      case "resetCloudUsage":
+        this.cloudUsageTracker.reset();
+        void this.context.globalState.update("photon.cloudUsage.total", undefined);
+        this.pushCloudUsage();
+        return;
+      case "unloadModel":
+        if (msg.payload.model) {
+          await this.client.unloadModel(msg.payload.model).catch((e) => {
+            this.output.appendLine(`[unloadModel] Error unloading ${msg.payload.model}: ${(e as Error).message}`);
+          });
+        }
+        await this.pushHardwareMetrics();
+        return;
     }
   }
 
@@ -1390,9 +1642,34 @@ export class PhotonController {
         (m) => !(m.role === "assistant" && !m.content.trim() && !m.toolCalls?.length && !m.notice)
       );
       touched = touched || session.messages.length !== before;
+      if (this.ctxMgr) {
+        const lastUserMsg = [...session.messages].reverse().find((m) => m.role === "user");
+        const lastAsstMsg = [...session.messages].reverse().find((m) => m.role === "assistant" && m.content.trim());
+        const toolsUsed: { name: string; args: Record<string, unknown>; ok: boolean }[] = [];
+        for (const m of session.messages) {
+          if (m.role === "assistant" && m.toolCalls) {
+            for (const tc of m.toolCalls) {
+              toolsUsed.push({
+                name: tc.name,
+                args: tc.args ?? {},
+                ok: tc.status === "done",
+              });
+            }
+          }
+        }
+        if (lastUserMsg && lastAsstMsg) {
+          this.ctxMgr.recordTurnHandoff({
+            fromModel: plan.model,
+            userPrompt: lastUserMsg.content,
+            assistantResponse: lastAsstMsg.content,
+            toolsUsed,
+          });
+        }
+      }
       await this.persistActiveSession(session);
       if (touched) this.safePost({ type: "sessionLoaded", payload: session });
       this.pushSessionList();
+      void this.pushHardwareMetrics();
     }
   }
 
@@ -1499,7 +1776,7 @@ export class PhotonController {
             session.messages.push(current);
           }
           current.streaming = false;
-          current.notice = `⚠️ ${message}`;
+          current.notice = message;
           this.safePost({ type: "messageAppended", payload: { ...current } });
         }
         if (!isLive()) return;
@@ -1550,22 +1827,36 @@ export class PhotonController {
     // system prompt is built before that patch runs.
     const lastUser = [...session.messages].reverse().find((m) => m.role === "user")?.content ?? "";
     const toolPolicy = classifyCloudToolPolicyForPrompt(plan.mode, String(lastUser));
+    const projectContextDigest = this.ctxMgr?.buildPromptDigest({
+      userQuery: String(lastUser),
+      activeModel: plan.model,
+      maxTokens: 2000,
+    });
     const system = buildCloudSystemPrompt({
       mode: plan.mode,
       workspaceName: vscode.workspace.workspaceFolders?.[0]?.name,
       workspaceMap,
       toolPolicy,
+      projectContextDigest,
     });
     await runCloudTurn({
       provider: this.providers,
       model: plan.model,
       system,
       history: cloudHistoryFromSession(session.messages),
-      tools: cloudTools(),
+      tools: cloudTools(plan.mode),
       contextWindow: model.contextLength ?? 128_000,
       ctx: this.buildToolContext(signal),
       emitter,
       signal,
+      onStepUsage: (usage) => {
+        this.cloudUsageTracker.recordStep(usage);
+        void this.context.globalState.update(
+          "photon.cloudUsage.total",
+          this.cloudUsageTracker.getSummary()
+        );
+        this.pushCloudUsage();
+      },
     });
   }
 
@@ -1711,6 +2002,8 @@ export class PhotonController {
   private pushConfig(): void {
     this.safePost({ type: "config", payload: this.buildConfig() });
     this.updateStatusBar();
+    this.sendRecommendations();
+    void this.detectProviders();
   }
 
   private toolSummaries(): ToolSummary[] {
@@ -1723,6 +2016,48 @@ export class PhotonController {
   /** Re-push the tool list (changes when MCP servers connect/disconnect). */
   private pushTools(): void {
     this.safePost({ type: "tools", payload: this.toolSummaries() });
+  }
+
+  private pushCloudUsage(): void {
+    this.safePost({ type: "cloudUsage", payload: this.cloudUsageTracker.getSummary() });
+  }
+
+  private async pushHardwareMetrics(): Promise<void> {
+    if (this.samplingHardware) return;
+    this.samplingHardware = true;
+    try {
+      const hw = await sampleHardwareMetrics(this.machine?.gpu).catch(() => null);
+      if (hw) {
+        this.latestHardwareMetrics = hw;
+        this.safePost({ type: "hardwareMetrics", payload: hw });
+      }
+
+      if (this.reachable) {
+        const psModels = await this.client.listRunning().catch(() => []);
+        const runtimeModels: OllamaRuntimeModel[] = psModels.map((m) => {
+          const size = m.size ?? 0;
+          const vram = m.size_vram ?? 0;
+          const gpuPercent = size > 0 ? Math.min(100, Math.round((vram / size) * 100)) : (vram > 0 ? 100 : 0);
+          return {
+            name: m.name ?? m.model,
+            sizeBytes: size,
+            vramBytes: vram,
+            gpuPercent,
+            contextLength: m.context_length ?? 0,
+            expiresAt: m.expires_at,
+          };
+        });
+        this.latestOllamaRuntime = runtimeModels;
+        this.safePost({ type: "ollamaRuntime", payload: runtimeModels });
+      } else {
+        this.latestOllamaRuntime = [];
+        this.safePost({ type: "ollamaRuntime", payload: [] });
+      }
+
+      this.pushCloudUsage();
+    } finally {
+      this.samplingHardware = false;
+    }
   }
 
   private buildInitPayload() {
@@ -1741,6 +2076,10 @@ export class PhotonController {
       indexStatus: this.index.getStatus(),
       mcpServers: this.mcp.list(),
       modelConfigs: this.modelConfigs.all(),
+      projectContext: this.ctxMgr?.getSummary() ?? null,
+      hardwareMetrics: this.latestHardwareMetrics,
+      ollamaRuntime: this.latestOllamaRuntime,
+      cloudUsage: this.cloudUsageTracker.getSummary(),
     };
   }
 

@@ -1,76 +1,53 @@
-import type { AppState } from "../state/store";
+import type { AppState, Actions } from "../state/store";
+import { BrainIcon, CodeIcon, PhotonLogoIcon, SparkleIcon } from "./Icons";
 
-const MODE_LABELS: Record<string, string> = {
-  chat: "Chat",
-  plan: "Plan",
-  agent: "Agent",
-};
+const SUGGESTIONS = [
+  { text: "Explain project architecture & key files", icon: <BrainIcon /> },
+  { text: "Find potential bugs and edge cases", icon: <SparkleIcon /> },
+  { text: "Help me refactor and optimize code", icon: <CodeIcon size={13} /> },
+];
 
-export function Hero({ state }: { state: AppState }) {
-  const model = state.models.find((m) => m.name === state.selectedModel);
-  const modeLabel = MODE_LABELS[state.mode] ?? state.mode;
-  const engineLabel = state.config.interfaceMode === "cloud" ? "Cloud" : "Local";
-
+export function Hero({
+  actions,
+}: {
+  state?: AppState;
+  actions?: Actions;
+  onOpenSettings?: (tab?: "general" | "tools" | "models" | "providers" | "advanced") => void;
+  onOpenHardwareModal?: () => void;
+}) {
   return (
     <div className="hero-wrapper">
+      {/* Moving blurred gradient background (Photon website triad: #FF2D2D, #FF6B2D, #FFC02E) */}
+      <div className="hero-aurora-bg" aria-hidden="true">
+        <div className="aurora-blob aurora-blob-1" />
+        <div className="aurora-blob aurora-blob-2" />
+        <div className="aurora-blob aurora-blob-3" />
+        <div className="aurora-blob aurora-blob-4" />
+      </div>
+
+      {/* Matte vignette finish */}
+      <div className="hero-matte-overlay" aria-hidden="true" />
+
+      {/* Foreground Branding */}
       <div className="hero">
-        {/* Photon brand mark */}
-        <div className="hero-brand">
-          <span className="hero-brand-icon" aria-hidden>
-            <svg width="48" height="48" viewBox="0 0 24 24" fill="none">
-              <defs>
-                <radialGradient id="hero-core" cx="50%" cy="45%" r="55%">
-                  <stop offset="0%" stopColor="#ffeab3" />
-                  <stop offset="50%" stopColor="#ff8a2d" />
-                  <stop offset="100%" stopColor="#ff2d2d" />
-                </radialGradient>
-              </defs>
-              <circle cx="12" cy="12" r="3" fill="url(#hero-core)" />
-              <ellipse cx="12" cy="12" rx="10" ry="4.5" stroke="var(--red)" strokeWidth="1.2" opacity="0.7" transform="rotate(30 12 12)" />
-              <ellipse cx="12" cy="12" rx="10" ry="4.5" stroke="var(--orange)" strokeWidth="1.2" opacity="0.7" transform="rotate(-30 12 12)" />
-            </svg>
-          </span>
-          <h1 className="hero-brand-title">PHOTON</h1>
+        <div className="hero-emblem" aria-hidden="true">
+          <PhotonLogoIcon size={38} />
         </div>
+        <h1 className="hero-brand-title">Photon</h1>
 
-        {/* Model + mode summary */}
-        <div className="hero-info">
-          <span className="hero-info-badge">{engineLabel}</span>
-          <span className="hero-info-sep">·</span>
-          <span className="hero-info-badge">{modeLabel}</span>
-          {model && (
-            <>
-              <span className="hero-info-sep">·</span>
-              <span className="hero-info-model">
-                {(() => {
-                  const display = model.name.includes(":") ? model.name.split(":").slice(1).join(":") : model.name;
-                  return display;
-                })()}
-              </span>
-              {model.contextLength && (
-                <>
-                  <span className="hero-info-sep">·</span>
-                  <span className="hero-info-ctx">{model.contextLength.toLocaleString()} ctx</span>
-                </>
-              )}
-            </>
-          )}
-        </div>
-
-        {/* Quick action hints */}
-        <div className="hero-hints">
-          <div className="hero-hint">
-            <span className="hero-hint-icon">💬</span>
-            <span>Ask anything about your code</span>
-          </div>
-          <div className="hero-hint">
-            <span className="hero-hint-icon">📝</span>
-            <span>Describe what to plan or build</span>
-          </div>
-          <div className="hero-hint">
-            <span className="hero-hint-icon">🤖</span>
-            <span>Let the agent handle a task</span>
-          </div>
+        {/* Minimal Gemini-style prompt suggestions */}
+        <div className="hero-suggestions">
+          {SUGGESTIONS.map((s, idx) => (
+            <button
+              key={idx}
+              type="button"
+              className="hero-suggestion-item"
+              onClick={() => actions?.send(s.text)}
+            >
+              <span className="hero-suggestion-icon">{s.icon}</span>
+              <span className="hero-suggestion-text">{s.text}</span>
+            </button>
+          ))}
         </div>
       </div>
     </div>

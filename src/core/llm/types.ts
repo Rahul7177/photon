@@ -16,6 +16,10 @@ export interface LLMToolCall {
 export interface LLMMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
+  /** Provider-native reasoning trace for this chunk (Ollama `thinking`,
+   *  DeepSeek-style `reasoning_content`, Anthropic thinking blocks, Gemini
+   *  thought parts). Display-only: never fed back into model context. */
+  thinking?: string;
   tool_calls?: LLMToolCall[];
   tool_call_id?: string;
   name?: string;
@@ -44,8 +48,12 @@ export interface LLMChatChunk {
   message?: LLMMessage;
   done: boolean;
   done_reason?: string;
+  prompt_eval_count?: number;
+  prompt_eval_duration?: number;
   eval_count?: number;
   eval_duration?: number;
+  /** Cached input tokens reported by cloud providers (Anthropic, Gemini, OpenAI). */
+  cached_tokens?: number;
 }
 
 export interface LLMProvider {
@@ -70,6 +78,7 @@ export interface ProviderModel {
   audio?: boolean;
   video?: boolean;
   thinking?: boolean;
+  thinkingLevels?: ModelInfo["thinkingLevels"];
   capabilities?: string[];
   tier?: ModelInfo["tier"];
 }

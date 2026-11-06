@@ -1,86 +1,102 @@
-import type { AdaptivePlan, IntelligenceLevel, ToolSpec } from "../../shared/types";
+import type { AdaptivePlan, ToolSpec } from "../../shared/types";
 
 /**
- * Render the tool instructions injected into the system prompt for the
- * photon-block protocol. Verbosity scales with intelligence so low-tier models
- * spend fewer of their scarce context tokens on scaffolding.
+ * Continue-style tool instructions for small local models.
+ * Primary format is the fenced block (raw values, no JSON escaping).
+ * The <tool_call> JSON envelope is still accepted by the parser as an
+ * alternative for single-line args — see parse.ts leniency.
+ * Spec §4: Tool definitions budget ~250-400 tok, filtered per mode.
  */
 export function renderToolInstructions(
   tools: ToolSpec[],
   plan: AdaptivePlan
 ): string {
   if (tools.length === 0) return "";
-  const list = tools.map((t) => renderToolSpec(t, plan.intelligence)).join("\n");
-
-  if (plan.intelligence === "low") {
-    // Terse but COMPLETE: every mechanic a weak model needs to form a valid
-    // call (one arg per line, fenced multi-line values, stop-and-wait). Omitting
-    // these saves ~30 tokens and costs whole failed turns.
-    return [
-      "TOOLS. Call ONE tool, then stop and wait for its result.",
-      "Format — use exactly:",
-      "[TOOL tool_name]",
-      "arg_name: value",
-      "[/TOOL]",
-      "Each argument on its own line as name: value.",
-      "Long values (file contents): leave the value empty, put a ``` fence on the next lines, then close the fence.",
-      "Use only the tools listed below. Do not invent names or arguments.",
-      "",
-      list,
-    ].join("\n");
-  }
-
-  const parallel = plan.allowParallelTools
-    ? "You may call more than one tool if needed."
-    : "Call ONE tool, then stop and wait for its result before continuing.";
+  const terse = plan.intelligence === "low";
+  const list = tools.map((t) => renderToolSpec(t, terse)).join("\n");
+  // Show worked examples for up to 3 tools — small models copy patterns,
+  // and a single example at the top is too easy to forget by tool #5.
+  const exampleCount = plan.intelligence === "max" ? 5 : plan.intelligence === "high" ? 4 : 3;
+  const examples = tools.slice(0, Math.min(exampleCount, tools.length))
+    .map((t) => renderExampleCall(t, terse))
+    .join("\n\n");
 
   return [
-    "## Tools",
-    "You can act on the workspace by calling tools. To call a tool, write a block:",
+    "You have access to tools. To call a tool, respond with EXACTLY one tool block, then stop.",
     "",
-    "[TOOL tool_name]",
-    "arg_name: value",
-    "[/TOOL]",
+    "PRIMARY FORMAT — use this (values are raw text, NO escaping needed):",
+    "```tool",
+    "TOOL_NAME: <tool name>",
+    "BEGIN_ARG: <arg name>",
+    "<value — raw text, can span many lines>",
+    "END_ARG",
+    "```",
     "",
-    "Rules:",
-    `- ${parallel}`,
-    "- Put each argument on its own line as `name: value`.",
-    "- For long text (like file contents), put the value in a fenced code block on the next lines.",
-    "- After a tool block, stop writing — the result will be given back to you.",
-    "- Only use the tools listed below. Do not invent tool names or arguments.",
+    "Examples:",
+    examples,
     "",
-    "Available tools:",
+    "ALTERNATIVE FORMAT — only for single-line values (never for file contents):",
+    "<tool_call>",
+    '{"tool": "<name>", "args": { ... }}',
+    "</tool_call>",
+    "",
+    "Available tools for this mode:",
     list,
+    "",
+    "RULES FOR TOOL USE:",
+    "1. Call exactly ONE tool per response, then STOP — write nothing after the closing fence/tag.",
+    "2. Always start the tool block on a new line. The tool block MUST be the last thing in your response.",
+    "3. Do NOT use XML tags like <function=...> and do NOT invent tools or arguments not listed above.",
+    "4. If the request can be addressed with a listed tool, USE IT rather than guessing from memory.",
+    "5. Do not perform actions with hypothetical files — use list_dir/find_files to confirm paths first.",
+    "6. Never write a <tool_result> block yourself. Photon runs the tool and gives you the real result.",
+    "7. CRITICAL — Web & current info: If the user asks about anything that changes over time (latest",
+    "   versions, news, prices, weather, current events, recent releases, live data), you MUST call",
+    "   web_search FIRST. Never answer these from memory — your training data is outdated. Call the tool.",
+    "8. CRITICAL — File edits: Before changing an existing file, call read_file first.",
+    "   For ADD/APPEND requests use append_file(path, content) — it preserves all old content.",
+    "   append_file requires EXACTLY two arguments: path and content. Never omit either one.",
+    "   Example: TOOL_NAME: append_file, BEGIN_ARG: path, temp.md, END_ARG, BEGIN_ARG: content, your text, END_ARG.",
+    "   For targeted updates use edit_file with old_str copied from read_file and new_str.",
+    "   write_file is CREATE-ONLY. Never use it on an existing file.",
   ].join("\n");
 }
 
-function renderToolSpec(t: ToolSpec, level: IntelligenceLevel): string {
-  const args = t.params
-    .map((p) => `${p.name}${p.required ? "" : "?"}:${p.type}`)
-    .join(", ");
-  if (level === "low") {
-    return `- ${t.name}(${args}) — ${t.summary}`;
+function renderToolSpec(t: ToolSpec, terse: boolean): string {
+  const lines = ["```tool_definition", `TOOL_NAME: ${t.name}`];
+  if (t.summary) lines.push(`TOOL_DESCRIPTION:\n${t.summary}`);
+  for (const p of t.params) {
+    const req = p.required ? "required" : "optional";
+    if (terse) {
+      lines.push(`TOOL_ARG: ${p.name} (${p.type}, ${req})`);
+    } else {
+      lines.push(`TOOL_ARG: ${p.name} (${p.type}, ${req})`);
+      if (p.description) lines.push(p.description);
+    }
+    lines.push("END_ARG");
   }
-  const paramLines = t.params
-    .map(
-      (p) =>
-        `    - ${p.name} (${p.type}${p.required ? ", required" : ", optional"}): ${p.description}`
-    )
-    .join("\n");
-  const effect = t.sideEffecting ? " [changes your workspace]" : "";
-  return `- **${t.name}**${effect}: ${t.summary}${paramLines ? "\n" + paramLines : ""}`;
+  lines.push("```");
+  return lines.join("\n");
 }
 
-/** Build the Ollama-native `tools` JSON schema array for tool-trained models.
- *  The worked example is folded into the description: structured-calling models
- *  are typically capable ones with context to spare, and a concrete example
- *  measurably reduces argument mistakes. */
+/** Worked example for the first tool — small models copy patterns, not abstract rules. */
+function renderExampleCall(t: ToolSpec, terse: boolean): string {
+  if (t.example && t.example.includes("```tool")) return t.example;
+  const args = t.params
+    .filter((p) => p.required)
+    .map((p) => `BEGIN_ARG: ${p.name}\n<${p.name}>\nEND_ARG`)
+    .join("\n");
+  return ["```tool", `TOOL_NAME: ${t.name}`, args || "BEGIN_ARG: path\nsrc/index.ts\nEND_ARG", "```"]
+    .filter(Boolean)
+    .join("\n");
+}
+
 export function toNativeTools(tools: ToolSpec[]): unknown[] {
   return tools.map((t) => ({
     type: "function",
     function: {
       name: t.name,
-      description: t.example ? `${t.summary}\n\nExample:\n${t.example}` : t.summary,
+      description: t.summary,
       parameters: {
         type: "object",
         properties: Object.fromEntries(
@@ -95,12 +111,12 @@ export function toNativeTools(tools: ToolSpec[]): unknown[] {
   }));
 }
 
-/** Format a tool result for feeding back into the conversation. */
+/** Spec §3.1: Photon result envelope */
 export function renderToolResult(
   name: string,
   result: string,
   ok: boolean
 ): string {
-  const status = ok ? "RESULT" : "ERROR";
-  return `[${status} ${name}]\n${result}\n[/${status}]`;
+  const status = ok ? "ok" : "error";
+  return `<tool_result tool="${name}" status="${status}">\n${result}\n</tool_result>`;
 }

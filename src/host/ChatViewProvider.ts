@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import type { ViewMessage } from "../shared/protocol";
 import { PhotonController } from "./PhotonController";
 
-export class ChatViewProvider implements vscode.WebviewViewProvider {
+export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   public static readonly viewType = "photon.chat";
   public controller: PhotonController;
   private view?: vscode.WebviewView;
@@ -17,6 +17,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
+    // Record the view resolution – useful for diagnostics without affecting performance.
+    console.debug(`[ChatViewProvider] resolveWebviewView called for view type=${view.viewType}`);
     this.view = view;
     view.webview.options = {
       enableScripts: true,
@@ -27,6 +29,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.controller.setPost((msg) => view.webview.postMessage(msg));
     // The view can be resolved more than once (container closed then reopened).
     // Drop the previous binding so listeners never stack across re-resolves.
+    // Ensure any previous listener is cleaned up before attaching a new one.
     this.messageSub?.dispose();
     this.messageSub = view.webview.onDidReceiveMessage((msg: ViewMessage) => {
       void this.controller.handleMessage(msg);
@@ -42,6 +45,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.view?.show?.(true);
   }
 
+  dispose(): void {
+    this.messageSub?.dispose();
+    this.messageSub = undefined;
+    this.view = undefined;
+  }
+
   post(msg: ViewMessage): void {
     // Re-enter the controller as if the message came from the webview
     // (used by command palette actions).
@@ -54,8 +63,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       webview.asWebviewUri(
         vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "assets", file)
       );
-    const scriptUri = asset("index.js");
-    const styleUri = asset("index.css");
+    const scriptUri = `${asset("index.js")}?v=${nonce}`;
+    const styleUri = `${asset("index.css")}?v=${nonce}`;
     const csp = [
       `default-src 'none'`,
       `img-src ${webview.cspSource} https: data:`,
@@ -74,7 +83,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <link rel="stylesheet" href="${styleUri}" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Bungee+Spice&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&family=Sora:wght@600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <title>Photon</title>
 </head>
 <body>

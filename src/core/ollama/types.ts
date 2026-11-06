@@ -18,6 +18,31 @@ export interface OllamaTagModel {
   };
 }
 
+/** Response from GET /api/ps (currently loaded models in GPU/RAM). */
+export interface OllamaPsResponse {
+  models: OllamaPsModel[];
+}
+
+export interface OllamaPsModel {
+  name: string;
+  model: string;
+  size: number;
+  digest: string;
+  details?: OllamaTagModel["details"];
+  expires_at?: string;
+  size_vram?: number;
+  context_length?: number;
+}
+
+/** Streamed chunk from POST /api/pull. */
+export interface OllamaPullChunk {
+  status: string;
+  digest?: string;
+  total?: number;
+  completed?: number;
+  error?: string;
+}
+
 export interface OllamaShowResponse {
   license?: string;
   modelfile?: string;
@@ -33,6 +58,8 @@ export interface OllamaShowResponse {
 export interface OllamaChatMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
+  /** Reasoning trace streamed when the request sets `think: true`. */
+  thinking?: string;
   tool_calls?: OllamaToolCall[];
   /** Base64-encoded images (no data: prefix) for vision models. */
   images?: string[];
@@ -57,6 +84,7 @@ export interface OllamaChatRequest {
   stream?: boolean;
   options?: OllamaChatOptions;
   tools?: unknown[];
+  think?: boolean | string;
   keep_alive?: string | number;
 }
 
