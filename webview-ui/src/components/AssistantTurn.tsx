@@ -3,7 +3,7 @@ import type { Attachment, ChatMessage, ToolCall } from "../../../src/shared/type
 import type { Actions } from "../state/store";
 import { Markdown } from "./Markdown";
 import { TurnProcess } from "./TurnProcess";
-import { AttachmentThumb, MessageActions, NoticeBubble, hasVisibleText } from "./Message";
+import { AttachmentThumb, MessageActions, NoticeBubble, CheckpointPill, hasVisibleText } from "./Message";
 
 /**
  * Renders an entire assistant turn (which may span multiple agentic steps,
@@ -95,6 +95,19 @@ export const AssistantTurn = memo(function AssistantTurn({
       {notices.map((n, i) => (
         <NoticeBubble key={i} notice={n} />
       ))}
+
+      {(() => {
+        const cpMsg = messages.find((m) => m.checkpointId && m.checkpointFiles && m.checkpointFiles.length > 0);
+        if (!cpMsg || !cpMsg.checkpointId || !cpMsg.checkpointFiles) return null;
+        return (
+          <CheckpointPill
+            checkpointId={cpMsg.checkpointId}
+            files={cpMsg.checkpointFiles}
+            checkpointNumber={cpMsg.checkpointNumber}
+            actions={actions}
+          />
+        );
+      })()}
 
       {!isStreaming && hasContent && (
         <MessageActions content={fullContent} isUser={false} />

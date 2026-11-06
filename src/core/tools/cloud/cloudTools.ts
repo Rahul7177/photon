@@ -111,6 +111,7 @@ export const cloudWriteFile: Tool = {
     const approved = await ctx.requestApproval(mkCall("write_to_file", args, ctx.pendingCallId));
     if (!approved) return fail("User declined the write.");
     try {
+      await ctx.checkpointTracker?.recordBeforeChange(rel);
       await fs.mkdir(path.dirname(r.abs), { recursive: true });
       await fs.writeFile(r.abs, content, "utf8");
       const lines = content.split("\n").length;
@@ -154,6 +155,7 @@ export const cloudReplaceInFile: Tool = {
     const approved = await ctx.requestApproval(mkCall("replace_in_file", args, ctx.pendingCallId));
     if (!approved) return fail("User declined the edit.");
     try {
+      await ctx.checkpointTracker?.recordBeforeChange(rel);
       await fs.writeFile(r.abs, result.text, "utf8");
       const startLine = original.slice(0, result.firstIndex).split("\n").length;
       void getProjectContextManager(ctx.workspaceRoot)?.recordFileEdit(

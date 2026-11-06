@@ -18,6 +18,7 @@ import {
   RefreshIcon,
   CloseIcon,
   BoltIcon,
+  RewindIcon,
 } from "./Icons";
 
 const MODES: { id: Mode; label: string; hint: string; icon: JSX.Element }[] = [
@@ -36,6 +37,37 @@ const THINKING_OPTIONS: Array<{ value: ThinkingSetting; label: string }> = [
 ];
 
 const AUTO = "__auto__";
+
+const SLASH_COMMANDS: Array<{
+  cmd: string;
+  desc: string;
+  run: (actions: Actions, setText: (t: string) => void) => void;
+}> = [
+  {
+    cmd: "/revert",
+    desc: "Select a checkpoint (#1, #2, …) to restore files and rewind chat",
+    run: (actions, setText) => {
+      actions.openRevertModal();
+      setText("");
+    },
+  },
+  {
+    cmd: "/rewind",
+    desc: "Instantly rollback the most recent file changes and rewind chat",
+    run: (actions, setText) => {
+      actions.send("/rewind");
+      setText("");
+    },
+  },
+  {
+    cmd: "/compact",
+    desc: "Compact conversation history to optimize context window",
+    run: (actions, setText) => {
+      actions.compactContext();
+      setText("");
+    },
+  },
+];
 
 function benchTps(results: { model: string; tokensPerSec: number }[], model: string): number | undefined {
   const r = results.find((b) => b.model === model);
@@ -295,8 +327,36 @@ export function Composer({
   const [text, setText] = useState("");
   const [tuningOpen, setTuningOpen] = useState(false);
   const [confirmInstallModel, setConfirmInstallModel] = useState<string | null>(null);
+  const [slashIndex, setSlashIndex] = useState(0);
+  const [slashDismissed, setSlashDismissed] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  // Automatically insert draft prompt (e.g. from checkpoint rollback / rewind chat)
+  useEffect(() => {
+    if (typeof state.draftPrompt === "string" && state.draftPrompt.length > 0) {
+      setText(state.draftPrompt);
+      actions.clearDraftPrompt();
+      if (taRef.current) {
+        taRef.current.focus();
+        setTimeout(() => {
+          if (taRef.current) {
+            taRef.current.style.height = "auto";
+            taRef.current.style.height = Math.min(taRef.current.scrollHeight, 160) + "px";
+          }
+        }, 30);
+      }
+    }
+  }, [state.draftPrompt, actions]);
+
+  const filteredSlash = useMemo(() => {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("/") || slashDismissed) return [];
+    const query = trimmed.toLowerCase();
+    return SLASH_COMMANDS.filter((c) => c.cmd.toLowerCase().startsWith(query) || query === "/");
+  }, [text, slashDismissed]);
+
+  const showSlashMenu = filteredSlash.length > 0;
 
   const busy = state.status === "thinking" || state.status === "running";
   const canSend = (text.trim().length > 0 || attachments.length > 0) && !!state.selectedModel && !busy;
@@ -304,8 +364,24 @@ export function Composer({
   const supportsVision = model?.vision === true;
 
   const submit = () => {
+    const trimmed = text.trim();
+    if (trimmed === "/revert") {
+      actions.openRevertModal();
+      setText("");
+      if (taRef.current) taRef.current.style.height = "auto";
+      return;
+    }
+    if (trimmed.startsWith("/revert ")) {
+      const num = parseInt(trimmed.slice(8).replace(/#/g, "").trim(), 10);
+      if (!isNaN(num)) {
+        actions.revertToNumber(num);
+        setText("");
+        if (taRef.current) taRef.current.style.height = "auto";
+        return;
+      }
+    }
     if (!canSend) return;
-    actions.send(text.trim(), attachments.length ? attachments : undefined);
+    actions.send(trimmed, attachments.length ? attachments : undefined);
     setText("");
     setAttachments([]);
     setAttachError(null);
@@ -341,6 +417,33 @@ export function Composer({
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (showSlashMenu) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSlashIndex((i) => (i + 1) % filteredSlash.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSlashIndex((i) => (i - 1 + filteredSlash.length) % filteredSlash.length);
+        return;
+      }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+        e.preventDefault();
+        const selected = filteredSlash[slashIndex] || filteredSlash[0];
+        if (selected) {
+          selected.run(actions, setText);
+          if (taRef.current) taRef.current.style.height = "auto";
+        }
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setSlashDismissed(true);
+        return;
+      }
+    }
+
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       submit();
@@ -392,6 +495,10 @@ export function Composer({
             plan={state.plan}
             stats={state.generationStats}
             ollamaRuntime={state.ollamaRuntime}
+            onCompact={() => {
+              actions.compactContext();
+              setTuningOpen(false);
+            }}
             onOpenHardwareModal={() => {
               setTuningOpen(false);
               onOpenHardwareModal();
@@ -527,6 +634,42 @@ export function Composer({
         </div>
       )}
 
+      {/* Slash Commands Dropdown Menu */}
+      {showSlashMenu && (
+        <div className="slash-menu-popover">
+          <div className="slash-menu-head">
+            <span>Commands</span>
+            <span className="slash-menu-hint">↑↓ to navigate · Enter to select · Esc to dismiss</span>
+          </div>
+          <div className="slash-menu-list">
+            {filteredSlash.map((item, idx) => (
+              <button
+                key={item.cmd}
+                type="button"
+                className={`slash-menu-item${idx === slashIndex ? " active" : ""}`}
+                onClick={() => {
+                  item.run(actions, setText);
+                  if (taRef.current) taRef.current.focus();
+                }}
+                onMouseEnter={() => setSlashIndex(idx)}
+              >
+                <div className="slash-item-left">
+                  <span className="slash-item-icon">
+                    {item.cmd === "/revert" || item.cmd === "/rewind" ? (
+                      <RewindIcon size={13} />
+                    ) : (
+                      <BoltIcon />
+                    )}
+                  </span>
+                  <span className="slash-item-cmd">{item.cmd}</span>
+                </div>
+                <span className="slash-item-desc">{item.desc}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Unified Elevated Composer Card */}
       <div className="composer-card">
         <div className="composer-input-area">
@@ -535,7 +678,11 @@ export function Composer({
             rows={1}
             value={text}
             placeholder={placeholder(state)}
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => {
+              setText(e.target.value);
+              setSlashDismissed(false);
+              setSlashIndex(0);
+            }}
             onInput={autoGrow}
             onKeyDown={onKeyDown}
             onPaste={onPaste}

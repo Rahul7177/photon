@@ -34,6 +34,7 @@ export interface ToolContext {
   capability:IntelligenceLevel;
   getDiagnostics:(path?:string)=>Promise<DiagnosticInfo[]>;
   todos:TodoItem[];
+  checkpointTracker?: { recordBeforeChange: (relPath: string) => Promise<void> };
 }
 // §4 Context budget rules for 6K window
 export const CONTEXT_BUDGETS = {

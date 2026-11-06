@@ -36,6 +36,25 @@ export function BackIcon() {
   );
 }
 
+export function RewindIcon({ size = 13 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <path d="M2.5 6.5h7a3.5 3.5 0 1 1 0 7H4" />
+      <path d="m5.5 3.5-3 3 3 3" />
+    </svg>
+  );
+}
+
 export function TrashIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">

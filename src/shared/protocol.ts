@@ -72,7 +72,33 @@ export type HostMessage =
   | { type: "providerLifecycle"; payload: ProviderLifecycleState }
   | { type: "modelRecommendations"; payload: RecommendationSet }
   | { type: "projectContext"; payload: ProjectContextSummary }
+  | { type: "contextCompacted"; payload: { tokensSaved: number; pctSaved: number; totalTokens: number; window: number } }
+  | { type: "compactingStatus"; payload: { active: boolean } }
+  | {
+      type: "checkpointRollbackDone";
+      payload: {
+        checkpointId: string;
+        revertedFiles: string[];
+        deletedFiles: string[];
+        rewindChat: boolean;
+        restoredPrompt?: string;
+        messages?: ChatMessage[];
+        checkpoints?: CheckpointSummary[];
+      };
+    }
+  | { type: "checkpointsList"; payload: { checkpoints: CheckpointSummary[] } }
+  | { type: "openRevertModal"; payload?: { checkpoints?: CheckpointSummary[] } }
   | { type: "error"; payload: { message: string } };
+
+export interface CheckpointSummary {
+  id: string;
+  checkpointNumber: number;
+  timestamp: number;
+  label: string;
+  filesCount: number;
+  files: string[];
+  messageId: string;
+}
 
 export interface PhotonConfig {
   autoApprove: boolean;
@@ -186,4 +212,8 @@ export type ViewMessage =
   | { type: "refreshProjectContext" }
   | { type: "addProjectNote"; payload: { category: ProjectMemoryNote["category"]; title: string; content: string; relatedFiles?: string[] } }
   | { type: "deleteProjectNote"; payload: { id: string } }
-  | { type: "clearWorkingMemory" };
+  | { type: "clearWorkingMemory" }
+  | { type: "compactContext"; payload?: { focus?: string } }
+  | { type: "rollbackCheckpoint"; payload: { checkpointId: string; rewindChat?: boolean } }
+  | { type: "getCheckpoints"; payload?: { sessionId?: string } }
+  | { type: "revertToNumber"; payload: { checkpointNumber: number } };

@@ -4,7 +4,8 @@ import { Markdown } from "./Markdown";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolCard } from "./ToolCard";
 import { TurnProcess } from "./TurnProcess";
-import { FileCodeIcon, ErrorCrossIcon, ChevronRightIcon } from "./Icons";
+import { FileCodeIcon, ErrorCrossIcon, ChevronRightIcon, BoltIcon, RewindIcon } from "./Icons";
+import { fmtTokens } from "./ContextMeter";
 import type { Actions } from "../state/store";
 
 export const Message = memo(function Message({ message, pendingApproval, actions }: {
@@ -12,6 +13,11 @@ export const Message = memo(function Message({ message, pendingApproval, actions
   pendingApproval?: ToolCall | null;
   actions?: Actions;
 }) {
+  const isCompacted = message.isCompacted || message.content.includes("[Context Compaction Summary]");
+  if (isCompacted) {
+    return <CompactedMessage message={message} />;
+  }
+
   const isUser = message.role === "user";
   const attachments = message.attachments ?? [];
   const toolCalls = message.toolCalls ?? [];
@@ -76,12 +82,153 @@ export const Message = memo(function Message({ message, pendingApproval, actions
 
       {notice && <NoticeBubble notice={notice} />}
 
+      {message.checkpointId && message.checkpointFiles && message.checkpointFiles.length > 0 && (
+        <CheckpointPill
+          checkpointId={message.checkpointId}
+          files={message.checkpointFiles}
+          checkpointNumber={message.checkpointNumber}
+          actions={actions}
+        />
+      )}
+
       {!message.streaming && hasContent && (
         <MessageActions content={message.content} isUser={isUser} />
       )}
     </div>
   );
 });
+
+export function CheckpointPill({
+  checkpointId,
+  files,
+  checkpointNumber,
+  actions,
+}: {
+  checkpointId: string;
+  files: string[];
+  checkpointNumber?: number;
+  actions?: Actions;
+}) {
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const count = files.length;
+  const fileListText = files.slice(0, 3).join(", ") + (count > 3 ? ` +${count - 3} more` : "");
+  const numLabel = checkpointNumber !== undefined ? `#${checkpointNumber}` : "";
+
+  return (
+    <div className="checkpoint-pill-wrap">
+      <button
+        type="button"
+        className="checkpoint-pill-btn"
+        onClick={() => setConfirmOpen((o) => !o)}
+        title={`Checkpoint ${numLabel}: ${count} file(s) modified (${fileListText})\nClick to rollback workspace to this point.`}
+      >
+        <span className="checkpoint-pill-icon"><RewindIcon /></span>
+        <span className="checkpoint-pill-text">
+          Checkpoint {numLabel ? `${numLabel} ` : ""}({count} file{count === 1 ? "" : "s"})
+        </span>
+        <span className="checkpoint-pill-action">Revert ›</span>
+      </button>
+
+      {confirmOpen && (
+        <div className="checkpoint-confirm-popover" onClick={(e) => e.stopPropagation()}>
+          <div className="checkpoint-confirm-head">
+            <span className="checkpoint-confirm-title">Rollback to Checkpoint {numLabel}</span>
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={() => setConfirmOpen(false)}
+              title="Close"
+            >
+              ×
+            </button>
+          </div>
+          <div className="checkpoint-confirm-body">
+            <p className="checkpoint-confirm-desc">
+              Restore <strong>{count} file{count === 1 ? "" : "s"}</strong> to their exact state before this turn:
+            </p>
+            <ul className="checkpoint-confirm-file-list">
+              {files.map((f) => (
+                <li key={f} title={f}>
+                  <code>{f}</code>
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div className="checkpoint-confirm-actions">
+            <button
+              type="button"
+              className="btn primary btn-sm"
+              onClick={() => {
+                actions?.rollbackCheckpoint(checkpointId, true);
+                setConfirmOpen(false);
+              }}
+              title="Revert modified files and rewind conversation to this point"
+            >
+              Revert &amp; Rewind Chat
+            </button>
+            <button
+              type="button"
+              className="btn ghost btn-sm"
+              onClick={() => {
+                actions?.rollbackCheckpoint(checkpointId, false);
+                setConfirmOpen(false);
+              }}
+              title="Revert modified files on disk, but keep conversation history"
+            >
+              Files Only
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function CompactedMessage({ message }: { message: ChatMessage }) {
+  const [open, setOpen] = useState(false);
+  const stats = message.compactStats;
+  const rawNotice = message.notice || "";
+
+  return (
+    <div className={`msg-compact-wrapper ${open ? "open" : ""}`}>
+      <div className="msg-compact-card">
+        <button
+          type="button"
+          className="msg-compact-header"
+          onClick={() => setOpen((o) => !o)}
+          aria-expanded={open}
+          title={open ? "Collapse compacted context" : "Expand to view preserved context details"}
+        >
+          <div className="msg-compact-title-group">
+            <span className="msg-compact-icon">
+              <BoltIcon />
+            </span>
+            <span className="msg-compact-title">Context Window Compacted</span>
+            {stats ? (
+              <span className="msg-compact-badge">
+                Saved {fmtTokens(stats.tokensSaved)} ({stats.pctSaved}%)
+              </span>
+            ) : rawNotice ? (
+              <span className="msg-compact-badge">{rawNotice.replace(/^⚡\s*/, "")}</span>
+            ) : null}
+          </div>
+          <div className="msg-compact-toggle">
+            <span className="msg-compact-toggle-text">{open ? "Hide details" : "View digest"}</span>
+            <span className={`msg-compact-chevron ${open ? "open" : ""}`}>
+              <ChevronRightIcon />
+            </span>
+          </div>
+        </button>
+
+        {open && (
+          <div className="msg-compact-body">
+            <Markdown text={message.content.replace(/^⚡\s*\*\*\[Context Compaction Summary\]\*\*\s*/i, "")} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function summarizeErrorNotice(raw: string): { summary: string; detail: string } {
   const cleaned = raw.replace(/^⚠️\s*/, "").trim();

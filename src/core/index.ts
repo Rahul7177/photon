@@ -54,6 +54,25 @@ export { runCloudTurn, cloudHistoryFromSession, normalizeCloudToolCall, type Clo
 export { cloudTools } from "./tools/cloud/cloudTools";
 export { buildCloudSystemPrompt, type CloudSystemInput } from "./prompts/cloudSystem";
 export { fitToWindow, type FitResult } from "./agent/contextManager";
+export {
+  compactSessionMessages,
+  shouldAutoCompact,
+  extractCompactionCandidates,
+  buildNativeCompactionSummary,
+  summarizeWithProviderModel,
+  DEFAULT_AUTO_COMPACT_THRESHOLD,
+  MIN_MESSAGES_FOR_COMPACTION,
+  type CompactionResult,
+  type CompactionOptions,
+  type CompactionCandidateSet,
+} from "./agent/compactor";
+export {
+  CheckpointManager,
+  getCheckpointManager,
+  type Checkpoint,
+  type FileSnapshot,
+  type CheckpointRollbackResult,
+} from "./checkpoints/checkpointManager";
 export { buildRepairPrompt, MAX_REPAIRS } from "./agent/repair";
 
 // --- Capability profiler / Photon Bench (M7) ------------------------------

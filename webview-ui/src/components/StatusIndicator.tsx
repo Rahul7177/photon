@@ -20,6 +20,10 @@ export function StatusIndicator({ state }: { state: AppState }) {
 function computeLabel(state: AppState): string | null {
   if (state.pendingApproval) return null; // approval UI takes over
 
+  if (state.isCompacting || /compact/i.test(state.statusDetail || "")) {
+    return "Compacting context window";
+  }
+
   // A tool actively running wins — name it so the user knows what's happening.
   for (let i = state.messages.length - 1; i >= 0; i--) {
     const running = state.messages[i].toolCalls?.find((c) => c.status === "running");

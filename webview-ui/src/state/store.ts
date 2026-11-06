@@ -29,7 +29,7 @@ import type {
   ToolCall,
   TokenUsage,
 } from "../../../src/shared/types";
-import type { HostMessage, PhotonConfig, ToolSummary } from "../../../src/shared/protocol";
+import type { HostMessage, PhotonConfig, ToolSummary, CheckpointSummary } from "../../../src/shared/protocol";
 import { onHostMessage, post } from "../vscode";
 
 export interface AppState {
@@ -70,6 +70,10 @@ export interface AppState {
   localRuntimes: LocalRuntimeInfo[];
   providerLifecycle: Record<string, ProviderLifecycleState>;
   projectContext: ProjectContextSummary | null;
+  isCompacting: boolean;
+  checkpoints: CheckpointSummary[];
+  draftPrompt: string | null;
+  revertModalOpen: boolean;
 }
 
 const initialConfig: PhotonConfig = {
@@ -127,6 +131,10 @@ export const initial: AppState = {
   localRuntimes: [],
   providerLifecycle: {},
   projectContext: null,
+  isCompacting: false,
+  checkpoints: [],
+  draftPrompt: null,
+  revertModalOpen: false,
 };
 
 type LocalAction =
@@ -135,7 +143,10 @@ type LocalAction =
   | { type: "_setMode"; mode: Mode }
   | { type: "_setModel"; model: string }
   | { type: "_fetchProviderModels"; id: string }
-  | { type: "_testModel"; providerId: string; model: ModelInfo };
+  | { type: "_testModel"; providerId: string; model: ModelInfo }
+  | { type: "_setDraftPrompt"; prompt: string | null }
+  | { type: "_openRevertModal" }
+  | { type: "_closeRevertModal" };
 export type Action = HostMessage | LocalAction;
 
 export function reducer(state: AppState, msg: Action): AppState {
@@ -150,9 +161,13 @@ export function reducer(state: AppState, msg: Action): AppState {
     case "models": return { ...state, models: msg.payload.models, selectedModel: msg.payload.selected, ollamaReachable: msg.payload.ollamaReachable };
     case "sessionLoaded": {
       const isSameSession = msg.payload.id === state.activeSessionId;
+      const isCompactedOrPruned = isSameSession && (
+        msg.payload.messages.some((m) => m.isCompacted || m.content.includes("[Context Compaction Summary]")) ||
+        msg.payload.messages.length < state.messages.length
+      );
       return {
         ...state,
-        messages: isSameSession
+        messages: isSameSession && !isCompactedOrPruned
           ? mergeMessages(state.messages, msg.payload.messages)
           : msg.payload.messages,
         mode: msg.payload.mode,
@@ -208,6 +223,32 @@ export function reducer(state: AppState, msg: Action): AppState {
     case "providerRuntimes": return { ...state, localRuntimes: msg.payload };
     case "providerLifecycle": return { ...state, providerLifecycle: { ...state.providerLifecycle, [msg.payload.id]: msg.payload } };
     case "projectContext": return { ...state, projectContext: msg.payload };
+    case "contextCompacted": {
+      return {
+        ...state,
+        isCompacting: false,
+        usage: {
+          used: msg.payload.totalTokens,
+          window: msg.payload.window,
+          breakdown: [{ label: "Compacted Context", tokens: msg.payload.totalTokens }],
+        },
+      };
+    }
+    case "compactingStatus": return { ...state, isCompacting: msg.payload.active };
+    case "checkpointRollbackDone": {
+      return {
+        ...state,
+        checkpoints: msg.payload.checkpoints ?? state.checkpoints,
+        messages: msg.payload.rewindChat && msg.payload.messages ? msg.payload.messages : state.messages,
+        draftPrompt: msg.payload.rewindChat && typeof msg.payload.restoredPrompt === "string" ? msg.payload.restoredPrompt : state.draftPrompt,
+        revertModalOpen: false,
+      };
+    }
+    case "checkpointsList": return { ...state, checkpoints: msg.payload.checkpoints };
+    case "openRevertModal": return { ...state, revertModalOpen: true, checkpoints: msg.payload?.checkpoints ?? state.checkpoints };
+    case "_openRevertModal": return { ...state, revertModalOpen: true };
+    case "_closeRevertModal": return { ...state, revertModalOpen: false };
+    case "_setDraftPrompt": return { ...state, draftPrompt: msg.prompt };
     case "error": {
       const errText = msg.payload.message;
       const hasNoticeAlready = state.messages.some(
@@ -348,6 +389,13 @@ export function useAppState() {
     removeAvailableModel: (name: string) => post({ type: "removeAvailableModel", payload: { name } }),
     addCustomProvider: (label: string, baseUrl: string, apiKey?: string) => post({ type: "addCustomProvider", payload: { label, baseUrl, apiKey } }),
     removeCustomProvider: (id: string) => post({ type: "removeCustomProvider", payload: { id } }),
+    compactContext: (focus?: string) => post({ type: "compactContext", payload: { focus } }),
+    rollbackCheckpoint: (checkpointId: string, rewindChat = true) => post({ type: "rollbackCheckpoint", payload: { checkpointId, rewindChat } }),
+    openRevertModal: () => dispatch({ type: "_openRevertModal" }),
+    closeRevertModal: () => dispatch({ type: "_closeRevertModal" }),
+    clearDraftPrompt: () => dispatch({ type: "_setDraftPrompt", prompt: null }),
+    revertToNumber: (checkpointNumber: number) => post({ type: "revertToNumber", payload: { checkpointNumber } }),
+    getCheckpoints: () => post({ type: "getCheckpoints" }),
   }), []);
   return { state, dispatch, actions };
 }

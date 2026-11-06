@@ -4,6 +4,7 @@ import type { ChatMessage } from "../../../src/shared/types";
 import { Message } from "./Message";
 import { AssistantTurn } from "./AssistantTurn";
 import { Approval } from "./Approval";
+import { BoltIcon } from "./Icons";
 
 type TurnGroup =
   | { kind: "user"; id: string; message: ChatMessage }
@@ -104,6 +105,22 @@ export function MessageList({
           actions={actions}
           onResolved={() => dispatch({ type: "_clearApproval" })}
         />
+      )}
+
+      {state.isCompacting && (
+        <div className="msg-compact-wrapper in-progress" role="status" aria-live="polite">
+          <div className="msg-compact-card in-progress">
+            <div className="msg-compact-header in-progress">
+              <div className="msg-compact-title-group">
+                <span className="msg-compact-icon pulse">
+                  <BoltIcon />
+                </span>
+                <span className="msg-compact-title">Compacting Context Window...</span>
+                <span className="msg-compact-badge pulse">Compressing earlier turns</span>
+              </div>
+            </div>
+          </div>
+        </div>
       )}
 
       <div ref={endRef} />

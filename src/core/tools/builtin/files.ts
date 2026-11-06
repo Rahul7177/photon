@@ -474,6 +474,7 @@ export const writeFileTool: Tool = {
     const approved = await ctx.requestApproval(mkCall("write_file", args, ctx.pendingCallId));
     if (!approved) return toolError("permission_denied", "User declined the file write.");
     try {
+      await ctx.checkpointTracker?.recordBeforeChange(rel);
       await fs.mkdir(path.dirname(r.abs), { recursive: true });
       await fs.writeFile(r.abs, content, "utf8");
       const lines = content.split("\n").length;
@@ -604,6 +605,7 @@ export const editFileTool: Tool = {
       const approved = await ctx.requestApproval(mkCall("edit_file", args, ctx.pendingCallId));
       if (!approved) return toolError("permission_denied", "User declined the edit.");
       try {
+        await ctx.checkpointTracker?.recordBeforeChange(rel);
         await fs.writeFile(r.abs, newStr, "utf8");
         const lines = newStr.split("\n").length;
         return ok(`Replaced ${rel} (whole file, ${lines} line${lines === 1 ? "" : "s"}).`);
@@ -626,6 +628,7 @@ export const editFileTool: Tool = {
     const approved = await ctx.requestApproval(mkCall("edit_file", args, ctx.pendingCallId));
     if (!approved) return toolError("permission_denied", "User declined the edit.");
     try {
+      await ctx.checkpointTracker?.recordBeforeChange(rel);
       await fs.writeFile(r.abs, result.text, "utf8");
       const startLine = original.slice(0, result.firstIndex).split("\n").length;
       const newLines = result.text.split("\n").length;
@@ -679,6 +682,7 @@ export const appendFileTool: Tool = {
     if (!await ctx.requestApproval(mkCall("append_file", args, ctx.pendingCallId))) return toolError("permission_denied", "User declined the append.");
     const separator = original.length && !original.endsWith("\n") ? "\n" : "";
     try {
+      await ctx.checkpointTracker?.recordBeforeChange(String(args.path));
       await fs.appendFile(resolved.abs, separator + content, "utf8");
       return ok(`Appended content to ${String(args.path)}. Existing content was preserved.`);
     } catch (e) {
@@ -716,6 +720,8 @@ export const movePathTool: Tool = {
     const approved = await ctx.requestApproval(mkCall("move_path", args, ctx.pendingCallId));
     if (!approved) return toolError("permission_denied", "User declined the move.");
     try {
+      await ctx.checkpointTracker?.recordBeforeChange(fromRel);
+      await ctx.checkpointTracker?.recordBeforeChange(toRel);
       await fs.mkdir(path.dirname(dst.abs), { recursive: true });
       await fs.rename(src.abs, dst.abs);
       return ok(`Moved ${fromRel} → ${toRel}.`);

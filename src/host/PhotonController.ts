@@ -34,6 +34,8 @@ import { runCloudTurn, cloudHistoryFromSession } from "../core/agent/cloudEngine
 import { cloudTools } from "../core/tools/cloud/cloudTools";
 import { buildCloudSystemPrompt } from "../core/prompts/cloudSystem";
 import { buildWorkspaceMap } from "../core/tools/workspaceMap";
+import { compactSessionMessages, shouldAutoCompact } from "../core/agent/compactor";
+import { CheckpointManager, getCheckpointManager } from "../core/checkpoints/checkpointManager";
 import type { DiagnosticInfo, ToolContext } from "../core/tools/types";
 import { ProviderManager } from "../core/llm/providerManager";
 import { OllamaProvider } from "../core/llm/providers/ollamaProvider";
@@ -160,6 +162,8 @@ export class PhotonController {
   private liveModelCache = new Map<string, ModelInfo[]>();
   /** Maintains project-wide symbol index, file outlines, smart path resolution and cross-model handoff. */
   private ctxMgr?: ProjectContextManager;
+  /** Checkpoint Manager tracks pre-mutation file states for 1-click turn rollbacks. */
+  private checkpointMgr?: CheckpointManager;
   /** Live hardware metrics (GPU util, VRAM, RAM, temperature). */
   private latestHardwareMetrics: HardwareMetrics | null = null;
   /** Models currently loaded in Ollama's memory. */
@@ -283,6 +287,10 @@ export class PhotonController {
           this.ctxMgr?.removeFile(rel);
         });
         this.context.subscriptions.push(ctxWatcher);
+      }
+      this.checkpointMgr = getCheckpointManager(root);
+      if (this.checkpointMgr) {
+        void this.checkpointMgr.ensureInitialized();
       }
     }
 
@@ -506,6 +514,7 @@ export class PhotonController {
   /** Push the full current state to the (possibly freshly re-mounted) webview. */
   private postInit(): void {
     this.safePost({ type: "init", payload: this.buildInitPayload() });
+    this.pushSessionCheckpoints();
     if (this.lastDecision) this.safePost({ type: "decision", payload: this.lastDecision });
     // Repaint cached provider model lists so settings cards don't look empty
     // after a panel close/reopen.
@@ -1217,6 +1226,7 @@ export class PhotonController {
         await this.persistActiveSession(previous);
         this.pushPlan();
         this.pushSessionList();
+        this.pushSessionCheckpoints();
         return;
       }
       case "switchSession":
@@ -1466,6 +1476,18 @@ export class PhotonController {
         }
         await this.pushHardwareMetrics();
         return;
+      case "compactContext":
+        await this.runCompactCommand(msg.payload?.focus, false);
+        return;
+      case "rollbackCheckpoint":
+        await this.handleRollbackCheckpoint(msg.payload.checkpointId, msg.payload.rewindChat);
+        return;
+      case "revertToNumber":
+        await this.handleRevertToNumber(String(msg.payload.checkpointNumber));
+        return;
+      case "getCheckpoints":
+        this.pushSessionCheckpoints();
+        return;
     }
   }
 
@@ -1503,6 +1525,32 @@ export class PhotonController {
     }
   }
   private async runPrompt(text: string, attachments?: Attachment[]): Promise<void> {
+    const trimmed = text.trim();
+    if (trimmed === "/compact" || trimmed.startsWith("/compact ")) {
+      const focus = trimmed.slice(8).trim() || undefined;
+      await this.runCompactCommand(focus, false);
+      return;
+    }
+    if (trimmed === "/rewind") {
+      await this.handleRewindLatest();
+      return;
+    }
+    if (trimmed === "/revert") {
+      const summaries = this.checkpointMgr?.getSessionCheckpointSummaries(this.session.id) ?? [];
+      this.safePost({ type: "openRevertModal", payload: { checkpoints: summaries } });
+      return;
+    }
+    if (trimmed.startsWith("/revert ")) {
+      const arg = trimmed.slice(8).trim();
+      if (arg) {
+        await this.handleRevertToNumber(arg);
+      } else {
+        const summaries = this.checkpointMgr?.getSessionCheckpointSummaries(this.session.id) ?? [];
+        this.safePost({ type: "openRevertModal", payload: { checkpoints: summaries } });
+      }
+      return;
+    }
+
     if (this.modelsForUi().length === 0) {
       this.safePost({
         type: "error",
@@ -1579,6 +1627,16 @@ export class PhotonController {
     this.safePost({ type: "decision", payload: decision });
     this.pushPlan();
     this.updateStatusBar();
+
+    // Auto context compaction: if conversation tokens reach >= 75% of context window,
+    // compact history before running the turn (like GitHub Copilot & Claude Code).
+    const activeCtxWindow = this.plan?.numCtx || (this.plan as any)?.contextWindow || 32768;
+    if (shouldAutoCompact(this.session.messages, activeCtxWindow, this.plan?.model, 0.75)) {
+      this.output.appendLine(
+        `[compactor] Context usage >= 75% of ${activeCtxWindow} tokens — auto-compacting session before turn.`
+      );
+      await this.runCompactCommand(undefined, true);
+    }
     // Phase 0.1 harness exercise — keep legacy AgentEngine as active path; harness behind flag logs parity
     if (vscode.workspace.getConfiguration("photon").get<boolean>("experimental.harness", false)) {
       try {
@@ -1607,6 +1665,7 @@ export class PhotonController {
       session.title = text.slice(0, 40);
     }
     await this.persistActiveSession(session);
+    this.checkpointMgr?.beginTurn(session.id, userMsg.id, text);
 
     const abort = new AbortController();
     this.turnAbort = abort;
@@ -1666,10 +1725,243 @@ export class PhotonController {
           });
         }
       }
+
+      if (this.checkpointMgr) {
+        const cp = await this.checkpointMgr.commitTurn(userMsg.id);
+        if (cp && cp.modifiedFilesCount > 0) {
+          userMsg.checkpointId = cp.id;
+          userMsg.checkpointFiles = Object.keys(cp.files);
+          userMsg.checkpointNumber = cp.checkpointNumber;
+          const lastAsst = [...session.messages].reverse().find((m) => m.role === "assistant");
+          if (lastAsst) {
+            lastAsst.checkpointId = cp.id;
+            lastAsst.checkpointFiles = Object.keys(cp.files);
+            lastAsst.checkpointNumber = cp.checkpointNumber;
+          }
+          touched = true;
+          this.pushSessionCheckpoints();
+        }
+      }
+
       await this.persistActiveSession(session);
       if (touched) this.safePost({ type: "sessionLoaded", payload: session });
       this.pushSessionList();
       void this.pushHardwareMetrics();
+    }
+  }
+
+  /**
+   * Compact the active session's context window (automatic or user-triggered).
+   * Follows GitHub Copilot and Claude Code compaction architecture.
+   */
+  private async runCompactCommand(focus?: string, isAuto = false): Promise<void> {
+    const session = this.session;
+    const window = this.plan?.numCtx || (this.plan as any)?.contextWindow || 32768;
+    const model = this.selectedModel || this.plan?.model;
+
+    this.output.appendLine(
+      `[compactor] Running ${isAuto ? "automatic" : "manual"} context compaction (messages=${session.messages.length}, window=${window}, model=${model})`
+    );
+
+    // Notify the UI that context compaction is actively running in the chat
+    this.safePost({ type: "compactingStatus", payload: { active: true } });
+    this.safePost({
+      type: "status",
+      payload: {
+        kind: "running",
+        detail: "Compacting context window",
+      },
+    });
+
+    try {
+      const result = await compactSessionMessages({
+        messages: session.messages,
+        contextWindow: window,
+        model,
+        provider: this.providers,
+        force: !isAuto,
+        focus,
+        threshold: 0.75,
+      });
+
+      if (!result.compacted) {
+        if (!isAuto) {
+          this.safePost({
+            type: "status",
+            payload: {
+              kind: "idle",
+              detail: "Context window is already clean and optimal. No compaction needed yet.",
+            },
+          });
+        }
+        return;
+      }
+
+      session.messages = result.newMessages;
+      session.updatedAt = Date.now();
+      await this.persistActiveSession(session);
+
+      const newUsed = result.tokensAfter;
+      this.safePost({
+        type: "tokenUsage",
+        payload: {
+          used: newUsed,
+          window,
+          breakdown: [
+            { label: "Compacted Context", tokens: newUsed },
+          ],
+        },
+      });
+
+      this.safePost({ type: "sessionLoaded", payload: session });
+      this.safePost({
+        type: "contextCompacted",
+        payload: {
+          tokensSaved: result.tokensSaved,
+          pctSaved: result.pctSaved,
+          totalTokens: result.tokensAfter,
+          window,
+        },
+      });
+
+      this.output.appendLine(
+        `[compactor] Compacted: ${result.messagesBefore} -> ${result.messagesAfter} messages. Saved ${result.tokensSaved} tokens (${result.pctSaved}% of window) using ${result.strategy}.`
+      );
+    } finally {
+      this.safePost({ type: "compactingStatus", payload: { active: false } });
+      this.safePost({ type: "status", payload: { kind: "idle" } });
+    }
+  }
+
+  /**
+   * Rollback workspace files and conversation to the state before a specific checkpoint.
+   * Mirrors GitHub Copilot & Claude Code checkpoint restoration.
+   */
+  private async handleRollbackCheckpoint(checkpointId: string, rewindChat = true): Promise<void> {
+    if (!this.checkpointMgr) return;
+    this.output.appendLine(
+      `[checkpoint] Rolling back to checkpoint "${checkpointId}" (rewindChat=${rewindChat})`
+    );
+
+    const targetCp = this.checkpointMgr.getCheckpoint(checkpointId);
+    const cpNum = targetCp?.checkpointNumber;
+    const cpNumLabel = cpNum ? `Checkpoint #${cpNum}` : `checkpoint`;
+
+    const result = await this.checkpointMgr.rollbackToCheckpoint(checkpointId);
+    if (!result.success && result.errors.length > 0 && result.revertedFiles.length === 0) {
+      this.safePost({
+        type: "error",
+        payload: { message: `Rollback failed: ${result.errors.join("; ")}` },
+      });
+      return;
+    }
+
+    // Refresh symbol index for reverted/deleted files
+    if (this.ctxMgr) {
+      for (const f of result.revertedFiles) void this.ctxMgr.indexSingleFile(f);
+      for (const f of result.deletedFiles) this.ctxMgr.removeFile(f);
+    }
+
+    let restoredPrompt: string | undefined;
+
+    if (rewindChat) {
+      const session = this.session;
+
+      // Locate the user prompt for this checkpoint:
+      let userMsgIdx = session.messages.findIndex(
+        (m) =>
+          (m.role === "user" && m.checkpointId === checkpointId) ||
+          (m.role === "user" && m.id === result.targetTurnMessageId)
+      );
+
+      if (userMsgIdx === -1) {
+        // Fallback: look for an assistant message with checkpointId and get preceding user message
+        const asstIdx = session.messages.findIndex((m) => m.checkpointId === checkpointId);
+        if (asstIdx >= 0) {
+          for (let i = asstIdx - 1; i >= 0; i--) {
+            if (session.messages[i].role === "user") {
+              userMsgIdx = i;
+              break;
+            }
+          }
+        }
+      }
+
+      if (userMsgIdx >= 0) {
+        restoredPrompt = session.messages[userMsgIdx].content;
+        // Truncate messages to BEFORE this user message:
+        session.messages = session.messages.slice(0, userMsgIdx);
+      } else {
+        restoredPrompt = result.label || "";
+      }
+
+      session.updatedAt = Date.now();
+      await this.persistActiveSession(session);
+      this.safePost({ type: "sessionLoaded", payload: session });
+    }
+
+    const summaries = this.checkpointMgr.getSessionCheckpointSummaries(this.session.id);
+
+    this.safePost({
+      type: "checkpointRollbackDone",
+      payload: {
+        checkpointId: result.checkpointId,
+        revertedFiles: result.revertedFiles,
+        deletedFiles: result.deletedFiles,
+        rewindChat,
+        restoredPrompt,
+        messages: this.session.messages,
+        checkpoints: summaries,
+      },
+    });
+
+    const fileSummary =
+      result.revertedFiles.length > 0
+        ? `Reverted ${result.revertedFiles.length} file(s)`
+        : `Restored workspace`;
+    const rewindSuffix = rewindChat ? " and rewound chat" : "";
+    vscode.window.showInformationMessage(`Photon: ${fileSummary}${rewindSuffix} to ${cpNumLabel}.`);
+  }
+
+  private async handleRevertToNumber(arg: string): Promise<void> {
+    if (!this.checkpointMgr) return;
+    const clean = arg.replace(/#/g, "").trim();
+    const num = parseInt(clean, 10);
+    if (isNaN(num)) {
+      this.safePost({
+        type: "error",
+        payload: { message: `Invalid checkpoint number: "${arg}". Use /revert or e.g. /revert 1.` },
+      });
+      return;
+    }
+    const cp = this.checkpointMgr.getCheckpointByNumber(this.session.id, num);
+    if (!cp) {
+      this.safePost({
+        type: "error",
+        payload: { message: `Checkpoint #${num} not found in this chat session.` },
+      });
+      return;
+    }
+    await this.handleRollbackCheckpoint(cp.id, true);
+  }
+
+  private async handleRewindLatest(): Promise<void> {
+    if (!this.checkpointMgr) return;
+    const latest = this.checkpointMgr.getLatestCheckpoint(this.session.id);
+    if (!latest) {
+      this.safePost({
+        type: "error",
+        payload: { message: "No checkpoints recorded in this conversation yet." },
+      });
+      return;
+    }
+    await this.handleRollbackCheckpoint(latest.id, true);
+  }
+
+  private pushSessionCheckpoints(): void {
+    if (this.checkpointMgr) {
+      const summaries = this.checkpointMgr.getSessionCheckpointSummaries(this.session.id);
+      this.safePost({ type: "checkpointsList", payload: { checkpoints: summaries } });
     }
   }
 
@@ -1878,6 +2170,9 @@ export class PhotonController {
       capability: this.plan?.intelligence ?? "medium",
       getDiagnostics: (absPath) => this.collectDiagnostics(absPath),
       todos: [],
+      checkpointTracker: {
+        recordBeforeChange: (relPath: string) => this.checkpointMgr?.recordBeforeChange(relPath) ?? Promise.resolve(),
+      },
     };
   }
 
@@ -2145,6 +2440,7 @@ export class PhotonController {
       type: "models",
       payload: { models: this.modelsForUi(), selected: this.selectedModel, ollamaReachable: this.reachable },
     });
+    this.pushSessionCheckpoints();
   }
 
   private async persistActiveSession(session: SessionState = this.session): Promise<void> {

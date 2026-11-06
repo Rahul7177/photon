@@ -11,6 +11,7 @@ import { StatusIndicator } from "./components/StatusIndicator";
 import { ProjectContextModal } from "./components/ProjectContextModal";
 import { HardwareMetricsModal } from "./components/HardwareMetricsModal";
 import { ContextWarningModal } from "./components/ContextWarningModal";
+import { RevertModal } from "./components/RevertModal";
 import type { ContextOverflowCheck } from "./contextPresets";
 import type { Attachment } from "../../src/shared/types";
 import { readFileToAttachment } from "./attachments";
@@ -236,6 +237,13 @@ export function App() {
             setCtxWarn(null);
           }}
           onKeepSelected={() => setCtxWarn(null)}
+        />
+      )}
+      {state.revertModalOpen && (
+        <RevertModal
+          state={state}
+          actions={actions}
+          onClose={actions.closeRevertModal}
         />
       )}
       {dragDepth > 0 && (

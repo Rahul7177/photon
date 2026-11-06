@@ -1,5 +1,5 @@
 import type { AdaptivePlan, GenerationStats, OllamaRuntimeModel, TokenUsage } from "../../../src/shared/types";
-import { ChartIcon, ContextGaugeIcon } from "./Icons";
+import { ChartIcon, ContextGaugeIcon, BoltIcon } from "./Icons";
 
 /** Format a token count for display, e.g. 1200 → "1.2k". */
 export function fmtTokens(n: number): string {
@@ -59,12 +59,14 @@ export function ContextMeter({
   stats,
   ollamaRuntime,
   onOpenHardwareModal,
+  onCompact,
 }: {
   usage: TokenUsage | null;
   plan: AdaptivePlan | null;
   stats?: GenerationStats | null;
   ollamaRuntime?: OllamaRuntimeModel[];
   onOpenHardwareModal?: () => void;
+  onCompact?: () => void;
 }) {
   const { used, window, pct, warn, tooltip } = computeContextMetrics(usage, plan);
   const live = stats && stats.tps > 0;
@@ -87,18 +89,31 @@ export function ContextMeter({
             {stats.tps} tok/s
           </span>
         )}
-        {onOpenHardwareModal && (
-          <button
-            type="button"
-            className={`hw-chart-btn ${hasLoadedModel ? "loaded" : ""}`}
-            onClick={onOpenHardwareModal}
-            title="Open live hardware & token telemetry"
-          >
-            <ChartIcon />
-            <span>Telemetry</span>
-            {hasLoadedModel && <span className="hw-chart-dot" />}
-          </button>
-        )}
+        <div className="meter-actions-group">
+          {onCompact && (
+            <button
+              type="button"
+              className={`ctx-compact-btn ${warn ? "highlight" : ""}`}
+              onClick={onCompact}
+              title="Compact context window now (preserves anchor, key decisions, and modified files)"
+            >
+              <BoltIcon />
+              <span>Compact</span>
+            </button>
+          )}
+          {onOpenHardwareModal && (
+            <button
+              type="button"
+              className={`hw-chart-btn ${hasLoadedModel ? "loaded" : ""}`}
+              onClick={onOpenHardwareModal}
+              title="Open live hardware & token telemetry"
+            >
+              <ChartIcon />
+              <span>Telemetry</span>
+              {hasLoadedModel && <span className="hw-chart-dot" />}
+            </button>
+          )}
+        </div>
       </div>
       <div className="meter-bar" title={tooltip}>
         <div className={`meter-fill ${warn ? "warn" : ""}`} style={{ width: `${pct}%` }} />
