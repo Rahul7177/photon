@@ -1,4 +1,5 @@
 import type { ChatMessage, SessionState } from "../shared/types";
+import { buildNativeCompactionSummary } from "../core/agent/compactor";
 
 /** Inline base64 images kept in PERSISTED sessions. Images dominate storage —
  *  a few screenshots would otherwise bloat every globalState rewrite forever.
@@ -100,5 +101,49 @@ export function rewindMessagesToCheckpoint(
     restoredPrompt: fallbackLabel,
     userMessageIndex: -1,
   };
+}
+
+/**
+ * Cap messages kept per session.
+ * Before discarding the oldest messages exceeding the cap, we compact them into
+ * a structured context digest so task directives and verified repository facts are not lost.
+ */
+export function enforceSessionMessageCap(
+  session: SessionState,
+  maxMessages = MAX_SESSION_MESSAGES
+): boolean {
+  if (session.messages.length <= maxMessages) return false;
+
+  const excessCount = session.messages.length - maxMessages;
+  const firstUser = session.messages.find((m) => m.role === "user");
+  const anchorPrompt = firstUser?.content;
+
+  const toArchive = session.messages.slice(0, excessCount);
+  const remaining = session.messages.slice(excessCount);
+
+  // Build compaction summary of the discarded turns so key facts/edits are preserved
+  const summaryContent = buildNativeCompactionSummary(
+    toArchive,
+    "Archived history from earlier turns in this session",
+    anchorPrompt
+  );
+
+  const archiveDigestMessage: ChatMessage = {
+    id: `archive_${Date.now()}`,
+    role: "assistant",
+    content: `⚡ **[Context Compaction Summary]** (Archived session history)\n\n${summaryContent}`,
+    createdAt: Date.now(),
+    isCompacted: true,
+    notice: `Context archived: ${toArchive.length} earlier messages folded into digest`,
+    compactStats: {
+      messagesCount: toArchive.length,
+      tokensSaved: 0,
+      pctSaved: 0,
+      strategy: "session-persistence-archive",
+    },
+  };
+
+  session.messages = [archiveDigestMessage, ...remaining];
+  return true;
 }
 

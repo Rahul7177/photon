@@ -60,6 +60,7 @@ import {
 import { ApprovalService, parseMcpConfigJson } from "./approvalService";
 import {
   MAX_SESSION_MESSAGES,
+  enforceSessionMessageCap,
   finalizeTurnMessages,
   pruneInlineImages,
   rewindMessagesToCheckpoint,
@@ -412,8 +413,13 @@ export class PhotonController {
       this.safePost({ type: "error", payload: { message: result.error } });
     }
     this.projectConfig = result.config;
-    // The file may enable auto-approve for the project (it can enable, not disable).
-    if (this.projectConfig?.autoApprove) this.approvals.autoApprove = true;
+    // Security boundary: Repository configuration (.photon/config) MUST NOT silently
+    // disable user approval protections. Auto-approval is strictly a user-level setting.
+    if (this.projectConfig?.autoApprove) {
+      this.output.appendLine(
+        "[security] Repository configuration (.photon/config) requested autoApprove=true. Ignored: tool auto-approval is a user-controlled security decision."
+      );
+    }
 
     // Phase 1.4: Sync file-based per-model configs → ModelConfigStore (file wins).
     // The file is the source of truth for team-shared overrides; the extension's
@@ -769,12 +775,14 @@ export class PhotonController {
 
   /* --------------------------------- MCP (M11) -------------------------------- */
 
-  /** Register configured MCP servers, connecting only those already approved. */
+  /** Register configured MCP servers, connecting only those matching previously approved trust fingerprints. */
   private async setupMcp(): Promise<void> {
     const servers = this.readMcpConfig();
     await this.mcp.setConfigs(servers);
     for (const s of servers) {
-      if (this.projectStore.isMcpApproved(s.id)) await this.mcp.connect(s.id);
+      if (this.projectStore.isMcpConfigApproved(s)) {
+        await this.mcp.connect(s.id);
+      }
     }
     this.pushMcpServers();
     this.pushTools();
@@ -785,14 +793,19 @@ export class PhotonController {
   }
 
   private async approveMcpServer(id: string): Promise<void> {
-    await this.projectStore.approveMcp(id);
+    const server = this.readMcpConfig().find((s) => s.id === id);
+    if (server) {
+      await this.projectStore.approveMcpConfig(server);
+    } else {
+      await this.projectStore.approveMcp(id);
+    }
     await this.mcp.connect(id);
     this.pushMcpServers();
     this.pushTools();
   }
 
   private async revokeMcpServer(id: string): Promise<void> {
-    await this.projectStore.revokeMcp(id);
+    await this.projectStore.revokeMcpConfig(id);
     await this.mcp.disconnect(id);
     this.pushMcpServers();
     this.pushTools();
@@ -1033,6 +1046,7 @@ export class PhotonController {
         // the OLD session — e.g. "Hi" in a fresh chat continuing a previous
         // conversation invisibly.
         this.cancelActiveTurn();
+        const { autoApproveChanged } = this.approvals.clearSessionApprovals();
         const previous = this.session;
         this.mode = "chat";
         this.lastDecision = null;
@@ -1045,6 +1059,9 @@ export class PhotonController {
         this.pushPlan();
         this.pushSessionList();
         this.pushSessionCheckpoints();
+        if (autoApproveChanged) {
+          this.pushConfig();
+        }
         return;
       }
       case "switchSession":
@@ -2227,6 +2244,7 @@ export class PhotonController {
   private async switchSession(id: string): Promise<void> {
     if (id === this.session.id) return;
     this.cancelActiveTurn();
+    const { autoApproveChanged } = this.approvals.clearSessionApprovals();
     const target = this.sessionStore.get(id);
     if (!target) return;
     const previous = this.session;
@@ -2235,6 +2253,9 @@ export class PhotonController {
     this.loadSession(target);
     await this.persistActiveSession(previous);
     this.pushSessionList();
+    if (autoApproveChanged) {
+      this.pushConfig();
+    }
   }
 
   private async deleteSession(id: string): Promise<void> {
@@ -2243,12 +2264,16 @@ export class PhotonController {
     // session as a zombie.
     if (id === this.session.id) {
       this.cancelActiveTurn();
+      const { autoApproveChanged } = this.approvals.clearSessionApprovals();
       const next = this.sessionStore.loadAll().find((s) => s.id !== id);
       if (next) {
         this.loadSession(next);
       } else {
         this.mode = "chat";
         this.loadSession(this.freshSession());
+      }
+      if (autoApproveChanged) {
+        this.pushConfig();
       }
     }
     await this.sessionStore.remove(id);
@@ -2274,10 +2299,8 @@ export class PhotonController {
 
   private async persistActiveSession(session: SessionState = this.session): Promise<void> {
     if (session.messages.length === 0) return;
-    // Bound in-memory + on-disk growth for very long-running sessions.
-    if (session.messages.length > MAX_SESSION_MESSAGES) {
-      session.messages.splice(0, session.messages.length - MAX_SESSION_MESSAGES);
-    }
+    // Bound in-memory + on-disk growth for very long-running sessions by archiving older messages into a compact digest.
+    enforceSessionMessageCap(session, MAX_SESSION_MESSAGES);
     session.updatedAt = Date.now();
     await this.sessionStore.upsert(pruneInlineImages(session));
   }

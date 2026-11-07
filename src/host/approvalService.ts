@@ -7,10 +7,37 @@ import type { McpServerConfig } from "../core/tools/mcp/bridge";
 export class ApprovalService {
   private pendingApprovals = new Map<string, (approved: boolean) => void>();
   private sessionApprovedToolNames = new Set<string>();
-  public autoApprove: boolean;
+  private userConfiguredAutoApprove = false;
+  private sessionAutoApprove = false;
 
   constructor(initialAutoApprove = false) {
-    this.autoApprove = initialAutoApprove;
+    this.userConfiguredAutoApprove = initialAutoApprove;
+  }
+
+  /**
+   * Returns true if user global preference has enabled auto-approval
+   * OR the user chose "Always allow in session" for this active session.
+   */
+  get autoApprove(): boolean {
+    return this.userConfiguredAutoApprove || this.sessionAutoApprove;
+  }
+
+  /** Set user-level auto-approve setting. Setting to false also clears session auto-approval. */
+  set autoApprove(val: boolean) {
+    this.userConfiguredAutoApprove = val;
+    if (!val) {
+      this.sessionAutoApprove = false;
+    }
+  }
+
+  /** True only if user enabled global auto-approve in settings. */
+  get isUserConfiguredAutoApprove(): boolean {
+    return this.userConfiguredAutoApprove;
+  }
+
+  /** True if auto-approval was granted specifically for this session. */
+  get isSessionAutoApprove(): boolean {
+    return this.sessionAutoApprove;
   }
 
   /** Number of tool calls currently awaiting user approval. */
@@ -53,9 +80,11 @@ export class ApprovalService {
       if (toolName) {
         this.sessionApprovedToolNames.add(toolName);
       }
-      if (!this.autoApprove) {
-        this.autoApprove = true;
-        autoApproveChanged = true;
+      if (!this.sessionAutoApprove) {
+        this.sessionAutoApprove = true;
+        if (!this.userConfiguredAutoApprove) {
+          autoApproveChanged = true;
+        }
       }
     }
     resolve(approved);
@@ -73,9 +102,13 @@ export class ApprovalService {
     return count;
   }
 
-  /** Clear session-scoped tool approvals (e.g., on new session if desired). */
-  clearSessionApprovals(): void {
+  /** Clear session-scoped tool approvals and reset session-level auto-approval. */
+  clearSessionApprovals(): { autoApproveChanged: boolean } {
     this.sessionApprovedToolNames.clear();
+    const hadSessionAuto = this.sessionAutoApprove;
+    this.sessionAutoApprove = false;
+    const changed = hadSessionAuto && !this.userConfiguredAutoApprove;
+    return { autoApproveChanged: changed };
   }
 }
 

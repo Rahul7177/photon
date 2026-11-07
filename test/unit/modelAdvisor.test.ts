@@ -87,6 +87,36 @@ describe("memory fit formula", () => {
     assert.equal(assessFit(model("qwen2.5-coder:7b"), hardwareFromProfile(machine({ ram: 8 }))).mode, "cpu");
     assert.equal(assessFit(model("qwen2.5-coder:14b"), hardwareFromProfile(machine({ ram: 8 }))).mode, "exceeds");
   });
+  it("incorporates measured bench tps and labels estimated vs benchmarked", () => {
+    const unbench = assessFit(model("qwen2.5-coder:7b"), hardwareFromProfile(machine({ ram: 16, vram: 8 })));
+    assert.equal(unbench.isEstimate, true);
+    assert.ok(unbench.label.includes("~"));
+
+    const benchVerified = assessFit(
+      model("qwen2.5-coder:7b"),
+      hardwareFromProfile(machine({ ram: 16, vram: 8 })),
+      8192,
+      78.5
+    );
+    assert.equal(benchVerified.isEstimate, false);
+    assert.equal(benchVerified.tokPerSec, 79);
+    assert.ok(benchVerified.label.includes("79 tok/s bench"));
+  });
+  it("protects against severe memory exhaustion when free RAM is critically constrained", () => {
+    const criticalHw = hardwareFromProfile({
+      totalRamBytes: 8 * GB,
+      freeRamBytes: 0.8 * GB, // only 800MB free RAM
+      cpuCores: 8,
+      cpuModel: "x",
+      platform: "win32",
+      arch: "x64",
+      tier: "low",
+    });
+    // 7B requires 5.18 GB, which exceeds the critically low 0.8 GB free RAM
+    const fit = assessFit(model("qwen2.5-coder:7b"), criticalHw);
+    assert.equal(fit.mode, "exceeds");
+    assert.ok(fit.label.includes("low free RAM"));
+  });
 });
 
 describe("recommendations", () => {

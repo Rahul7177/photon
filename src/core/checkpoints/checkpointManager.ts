@@ -10,6 +10,7 @@ export interface FileSnapshot {
   mtimeMs?: number;
   oversized?: boolean;
   sizeBytes?: number;
+  error?: string;
 }
 
 export type FileRollbackStatus = "restored" | "deleted" | "skipped" | "conflict" | "failed";
@@ -164,8 +165,14 @@ export class CheckpointManager {
         mtimeMs: stat.mtimeMs,
         sizeBytes: stat.size,
       });
-    } catch {
-      // Best-effort capture; do not block tool execution if stat/read fails
+    } catch (err: any) {
+      // Record failed snapshot explicitly so tool mutations are not treated as silently restorable
+      this.activeTurn.files.set(norm, {
+        relativePath: norm,
+        existed: true,
+        oversized: true,
+        error: `Failed to snapshot pre-mutation state: ${err.message || String(err)}`,
+      });
     }
   }
 
@@ -273,10 +280,14 @@ export class CheckpointManager {
     }
 
     const target = this.checkpoints[targetIdx];
-    // Gather all checkpoints from targetIdx up to the latest (chronological order)
-    const affectedCheckpoints = this.checkpoints.slice(targetIdx);
+    // Restrict rollback strictly to the target checkpoint's session.
+    // Checkpoint records from OTHER sessions in the shared workspace must NOT be touched or pruned.
+    const sessionCheckpoints = this.checkpoints.filter((cp) => cp.sessionId === target.sessionId);
+    const targetSessionIdx = sessionCheckpoints.findIndex((cp) => cp.id === checkpointId);
+    const affectedCheckpoints = sessionCheckpoints.slice(targetSessionIdx);
+    const affectedIds = new Set(affectedCheckpoints.map((cp) => cp.id));
 
-    // For every file touched across these checkpoints, find the earliest snapshot
+    // For every file touched across these checkpoints in THIS session, find the earliest snapshot
     // (i.e. its state right before the target checkpoint turn began).
     const fileStates = new Map<string, FileSnapshot>();
 
@@ -311,12 +322,13 @@ export class CheckpointManager {
         continue;
       }
 
-      // 1. Files larger than 2MB where content could not be retained
+      // 1. Files larger than 2MB where content could not be retained or read failed
       if (snap.oversized || (snap.existed && snap.content === undefined)) {
         const sizeDesc = snap.sizeBytes
           ? ` (${Math.round((snap.sizeBytes / (1024 * 1024)) * 10) / 10} MB)`
           : "";
-        const msg = `File exceeds 2 MB limit${sizeDesc}; original content was not retained for rollback.`;
+        const detail = snap.error ? `: ${snap.error}` : ` exceeds 2 MB limit${sizeDesc}; original content was not retained for rollback.`;
+        const msg = `File${detail}`;
         errors.push(`Cannot restore "${rel}": ${msg}`);
         fileResults.push({ relativePath: rel, status: "failed", reason: msg });
         continue;
@@ -325,7 +337,33 @@ export class CheckpointManager {
       // 2. Check current status on disk
       const currentStat = await fs.stat(r.abs).catch(() => null);
 
-      // 3. Detect external modifications (newer user work after checkpoint)
+      // 3. Verify content equality before reporting external modification conflict:
+      // If a previous partial rollback attempt already restored this file, its content on disk
+      // already matches snap.content, but its mtime is newer. Detect content equality first!
+      let alreadyRestored = false;
+      if (currentStat && snap.existed && snap.content !== undefined) {
+        try {
+          const currentContent = await fs.readFile(r.abs, "utf8");
+          if (currentContent === snap.content) {
+            alreadyRestored = true;
+          }
+        } catch {
+          // ignore read error
+        }
+      } else if (!currentStat && !snap.existed) {
+        alreadyRestored = true;
+      }
+
+      if (alreadyRestored) {
+        fileResults.push({
+          relativePath: rel,
+          status: "skipped",
+          reason: "Already in target checkpoint state (restored in earlier attempt or unchanged)",
+        });
+        continue;
+      }
+
+      // 4. Detect external modifications (newer user work after checkpoint)
       if (currentStat && !options?.force) {
         const knownPostMtime = latestPostMtimes.get(rel) || target.timestamp;
         // If current file has an mtime > 1000ms after the checkpoint/mutation time, user edited it externally
@@ -339,7 +377,7 @@ export class CheckpointManager {
         }
       }
 
-      // 4. Restore or delete
+      // 5. Restore or delete
       try {
         if (snap.existed && snap.content !== undefined) {
           // Restore file content
@@ -373,9 +411,9 @@ export class CheckpointManager {
       fileResults.some((r) => r.status === "failed" || r.status === "conflict");
 
     // Only prune checkpoint history if ALL file restorations succeeded!
-    // If any failed or conflicted, preserve checkpoints so the user can fix and retry!
+    // Prune ONLY the checkpoints belonging to this session; preserve other sessions' history!
     if (!hasFailure) {
-      this.checkpoints = this.checkpoints.slice(0, targetIdx);
+      this.checkpoints = this.checkpoints.filter((cp) => !affectedIds.has(cp.id));
       await this.persist();
     }
 
@@ -465,8 +503,8 @@ export class CheckpointManager {
     try {
       await fs.mkdir(path.dirname(this.storagePath), { recursive: true });
       await fs.writeFile(this.storagePath, JSON.stringify(this.checkpoints, null, 2), "utf8");
-    } catch {
-      // Best-effort persistence
+    } catch (err: any) {
+      console.error(`[checkpoints] Failed to persist checkpoints to ${this.storagePath}:`, err);
     }
   }
 }

@@ -207,7 +207,7 @@ describe("Context Compaction Engine (P1 Item 4)", () => {
       assert.ok(summary.includes("Do not break existing session storage"));
       assert.ok(summary.includes("### ✅ Verified Repository Facts (Ground Truth)"));
       assert.ok(summary.includes("`src/services/auth.ts`"));
-      assert.ok(summary.includes("`npm test test/auth.test.ts` → ✓ Verified"));
+      assert.ok(summary.includes("`npm test test/auth.test.ts` → ✓ Completed"));
       assert.ok(summary.includes("### 🧠 Model Decisions & Assumptions (Unverified Claims / Rationale)"));
       assert.ok(summary.includes("HS256 signing"));
       assert.ok(summary.includes("### ⚠️ Unresolved Issues & Pending Items"));
@@ -249,6 +249,87 @@ describe("Context Compaction Engine (P1 Item 4)", () => {
       assert.ok(summary.includes("### 📜 Prior Compacted History"));
       assert.ok(summary.includes("`src/db.ts`: Updated query pool"));
       assert.ok(summary.includes("`src/cache.ts`: Created / overwritten file"));
+    });
+
+    it("maps command statuses explicitly and never reports unfinished commands as successful", () => {
+      const msgs: ChatMessage[] = [
+        makeUserMsg("1", "Deploy and test the service"),
+        makeAssistantMsg("2", "Running deployment steps...", [
+          {
+            id: "tc1",
+            name: "execute_command",
+            args: { command: "git pull origin main" },
+            status: "done",
+          },
+          {
+            id: "tc2",
+            name: "execute_command",
+            args: { command: "npm test" },
+            status: "error",
+            error: "2 tests failed",
+          },
+          {
+            id: "tc3",
+            name: "execute_command",
+            args: { command: "docker build -t app ." },
+            status: "running",
+          },
+          {
+            id: "tc4",
+            name: "execute_command",
+            args: { command: "kubectl apply -f k8s/" },
+            status: "pending" as any,
+          },
+          {
+            id: "tc5",
+            name: "execute_command",
+            args: { command: "terraform apply" },
+            status: "proposed",
+          },
+          {
+            id: "tc6",
+            name: "execute_command",
+            args: { command: "rm -rf /tmp/data" },
+            status: "denied",
+          },
+          {
+            id: "tc7",
+            name: "execute_command",
+            args: { command: "curl http://localhost:8080" },
+            status: "unknown_status" as any,
+          },
+        ]),
+      ];
+
+      const data = extractStructuredCompactionData(msgs);
+      assert.equal(data.commandsRun.length, 7);
+
+      const statusMap = Object.fromEntries(
+        data.commandsRun.map((c) => [c.command, c.status])
+      );
+      assert.equal(statusMap["git pull origin main"], "completed");
+      assert.equal(statusMap["npm test"], "failed");
+      assert.equal(statusMap["docker build -t app ."], "in_progress");
+      assert.equal(statusMap["kubectl apply -f k8s/"], "awaiting_approval");
+      assert.equal(statusMap["terraform apply"], "not_executed");
+      assert.equal(statusMap["rm -rf /tmp/data"], "denied");
+      assert.equal(statusMap["curl http://localhost:8080"], "unknown");
+
+      const summary = buildNativeCompactionSummary(msgs);
+      assert.ok(summary.includes("`git pull origin main` → ✓ Completed"));
+      assert.ok(summary.includes("`npm test` → ✗ Failed (2 tests failed)"));
+      assert.ok(summary.includes("`docker build -t app .` → ▶ In progress"));
+      assert.ok(summary.includes("`kubectl apply -f k8s/` → ⏳ Awaiting approval"));
+      assert.ok(summary.includes("`terraform apply` → ⏸ Not executed"));
+      assert.ok(summary.includes("`rm -rf /tmp/data` → ⛔ Denied"));
+      assert.ok(summary.includes("`curl http://localhost:8080` → ❓ Outcome unknown"));
+
+      // Unfinished/error tools should be recorded in unresolved items
+      assert.ok(summary.includes("### ⚠️ Unresolved Issues & Pending Items"));
+      assert.ok(summary.includes("was left in progress"));
+      assert.ok(summary.includes("was left awaiting approval"));
+      assert.ok(summary.includes("was left not executed"));
+      assert.ok(summary.includes("was denied by user"));
     });
   });
 

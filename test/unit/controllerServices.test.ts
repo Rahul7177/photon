@@ -9,6 +9,7 @@ import {
 } from "../../src/host/providerCatalogService";
 import { ApprovalService, parseMcpConfigJson } from "../../src/host/approvalService";
 import {
+  enforceSessionMessageCap,
   finalizeTurnMessages,
   pruneInlineImages,
   rewindMessagesToCheckpoint,
@@ -183,10 +184,25 @@ describe("ApprovalService & parseMcpConfigJson (Item 12)", () => {
     assert.equal(resolution.autoApproveChanged, true);
     assert.equal(await p, true);
     assert.equal(approvals.autoApprove, true);
+    assert.equal(approvals.isSessionAutoApprove, true);
+    assert.equal(approvals.isUserConfiguredAutoApprove, false);
 
-    // Reset autoApprove and test cancelAllPending
+    // Session clearing resets session-level autoApprove cleanly
+    const clearResult = approvals.clearSessionApprovals();
+    assert.equal(clearResult.autoApproveChanged, true);
+    assert.equal(approvals.autoApprove, false);
+    assert.equal(approvals.isSessionAutoApprove, false);
+
+    // If user configured global auto-approval, it is preserved across session clearing
+    approvals.autoApprove = true;
+    assert.equal(approvals.isUserConfiguredAutoApprove, true);
+    const clearResult2 = approvals.clearSessionApprovals();
+    assert.equal(clearResult2.autoApproveChanged, false);
+    assert.equal(approvals.autoApprove, true);
+    assert.equal(approvals.isUserConfiguredAutoApprove, true);
+
+    // Reset user preference for following test
     approvals.autoApprove = false;
-    approvals.clearSessionApprovals();
     const p2 = approvals.requestApproval({ ...writeCall, id: "c3" }, () => {});
     assert.equal(approvals.pendingCount, 1);
     assert.equal(approvals.cancelAllPending(), 1);
@@ -291,6 +307,62 @@ describe("SessionCoordinator (Item 12)", () => {
     assert.equal(res.rewoundMessages.length, 2);
     assert.equal(res.rewoundMessages[1].id, "a1");
   });
+
+  it("compacts older turns into an archive digest before truncating when exceeding max messages", () => {
+    const messages = [];
+    // User task anchor
+    messages.push({
+      id: "u_anchor",
+      role: "user" as const,
+      content: "Initial task: build the auth and billing systems",
+      createdAt: 1000,
+    });
+    // Intermediate turns with file edits and commands
+    for (let i = 1; i <= 10; i++) {
+      messages.push({
+        id: `a_${i}`,
+        role: "assistant" as const,
+        content: `Step ${i} completed.`,
+        toolCalls: [
+          {
+            id: `call_${i}`,
+            name: "write_to_file",
+            args: { path: `src/mod${i}.ts`, content: "export {}" },
+            status: "done" as const,
+          },
+        ],
+        createdAt: 1000 + i * 10,
+      });
+      messages.push({
+        id: `u_${i}`,
+        role: "user" as const,
+        content: `Continue to step ${i + 1}`,
+        createdAt: 1000 + i * 10 + 5,
+      });
+    }
+
+    const session: SessionState = {
+      id: "s_overflow",
+      title: "Long Session",
+      mode: "agent",
+      model: "qwen2.5-coder:7b",
+      createdAt: 1000,
+      updatedAt: 2000,
+      messages,
+    };
+
+    // Cap at 10 messages (excess 11 messages archived into digest)
+    const compacted = enforceSessionMessageCap(session, 10);
+    assert.equal(compacted, true);
+    // 1 archive message + 10 retained messages = 11 messages
+    assert.equal(session.messages.length, 11);
+    const archiveMsg = session.messages[0];
+    assert.equal(archiveMsg.role, "assistant");
+    assert.equal(archiveMsg.isCompacted, true);
+    assert.ok(archiveMsg.content.includes("[Context Compaction Summary]"));
+    assert.ok(archiveMsg.content.includes("Initial task: build the auth and billing systems"));
+    assert.ok(archiveMsg.notice?.includes("Context archived"));
+  });
 });
 
 describe("Agent Activity Visibility & TurnProcess Summary (Item 13)", () => {
@@ -348,17 +420,17 @@ describe("Agent Activity Visibility & TurnProcess Summary (Item 13)", () => {
     );
   });
 
-  it("distinguishes approval waiting, verification, errors, and cancellation in TurnProcess", () => {
+  it("distinguishes tool execution, verification, errors, and cancellation in TurnProcess", () => {
     const writeCall: ToolCall = {
       id: "t1",
       name: "write_file",
       args: { path: "index.ts" },
-      status: "pending",
+      status: "running",
     };
 
-    const approvalSummary = computeSummary([writeCall], 0, true, false, writeCall, false);
-    assert.equal(approvalSummary.state, "approval");
-    assert.equal(approvalSummary.badge, "Needs Approval");
+    const runSummary = computeSummary([writeCall], 0, true, false, false);
+    assert.equal(runSummary.state, "running");
+    assert.equal(runSummary.badge, "Running");
 
     const diagCall: ToolCall = {
       id: "t2",
@@ -366,7 +438,7 @@ describe("Agent Activity Visibility & TurnProcess Summary (Item 13)", () => {
       args: {},
       status: "running",
     };
-    const verifySummary = computeSummary([diagCall], 0, true, false, null, false);
+    const verifySummary = computeSummary([diagCall], 0, true, false, false);
     assert.equal(verifySummary.state, "running");
     assert.equal(verifySummary.badge, "Verifying");
 

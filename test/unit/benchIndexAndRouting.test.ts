@@ -324,6 +324,44 @@ END_ARG
       const afterDelete = await index.retrieve("computeSubtotalWithTax vatRate", 3);
       assert.ok(!afterDelete.some((h) => h.path === "src/billing/invoiceCalculator.ts"));
     });
+
+    it("records embedding model identity and file mtimes, invalidating on model mismatch", () => {
+      const store = new VectorStore();
+      store.setEmbeddingModel("nomic-embed-text");
+      store.setFile(
+        "src/util.ts",
+        [
+          {
+            path: "src/util.ts",
+            startLine: 1,
+            endLine: 5,
+            text: "export const x = 1;",
+            vector: [0.1, 0.2, 0.3],
+          },
+        ],
+        1700000000000
+      );
+
+      assert.equal(store.getEmbeddingModel(), "nomic-embed-text");
+      assert.equal(store.getFileMtime("src/util.ts"), 1700000000000);
+      assert.equal(store.hasFile("src/util.ts"), true);
+
+      const json = store.toJSON();
+      assert.equal(json.version, 2);
+      assert.equal(json.embeddingModel, "nomic-embed-text");
+      assert.equal(json.fileMtimes?.["src/util.ts"], 1700000000000);
+
+      // Loading with matching embedding model succeeds
+      const restoredSame = VectorStore.fromJSON(json, "nomic-embed-text");
+      assert.equal(restoredSame.stats.chunks, 1);
+      assert.equal(restoredSame.getFileMtime("src/util.ts"), 1700000000000);
+      assert.equal(restoredSame.getEmbeddingModel(), "nomic-embed-text");
+
+      // Loading with different embedding model invalidates the store to prevent semantic poisoning
+      const restoredMismatch = VectorStore.fromJSON(json, "bge-m3");
+      assert.equal(restoredMismatch.stats.chunks, 0);
+      assert.equal(restoredMismatch.hasFile("src/util.ts"), false);
+    });
   });
 
   describe("P1 Item 10: Explainable & Measurable Adaptive Model Routing", () => {

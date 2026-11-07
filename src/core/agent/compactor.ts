@@ -171,6 +171,36 @@ export function extractCompactionCandidates(
   };
 }
 
+export type CompactionCommandStatus =
+  | "completed"
+  | "failed"
+  | "not_executed"
+  | "awaiting_approval"
+  | "in_progress"
+  | "denied"
+  | "unknown";
+
+export function mapToolStatusToCompactionStatus(
+  status: string | undefined
+): CompactionCommandStatus {
+  switch (status) {
+    case "done":
+      return "completed";
+    case "error":
+      return "failed";
+    case "proposed":
+      return "not_executed";
+    case "pending":
+      return "awaiting_approval";
+    case "running":
+      return "in_progress";
+    case "denied":
+      return "denied";
+    default:
+      return "unknown";
+  }
+}
+
 /**
  * Extracts structured metadata from messages being compacted so we can both
  * build the native summary and verify that provider summaries retain all critical facts.
@@ -180,7 +210,12 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
   const filesModified = new Map<string, string[]>();
   const filesInspected = new Set<string>();
   const toolFindings: string[] = [];
-  const commandsRun: Array<{ command: string; status: "success" | "error"; error?: string }> = [];
+  const commandsRun: Array<{
+    command: string;
+    status: CompactionCommandStatus;
+    rawStatus?: string;
+    error?: string;
+  }> = [];
   const modelDecisions: string[] = [];
   const unresolvedItems: string[] = [];
   const existingSummarySections: string[] = [];
@@ -266,9 +301,11 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
       ) {
         const cmd = String(args.command || args.cmd || "");
         if (cmd) {
+          const mappedStatus = mapToolStatusToCompactionStatus(call.status);
           commandsRun.push({
             command: cmd.length > 80 ? cmd.slice(0, 77) + "…" : cmd,
-            status: call.status === "error" ? "error" : "success",
+            status: mappedStatus,
+            rawStatus: call.status,
             error: call.error ? String(call.error).slice(0, 80) : undefined,
           });
         }
@@ -277,6 +314,23 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
       if (call.status === "error" && call.error) {
         const errNote = `Tool ${name} failed: ${String(call.error).slice(0, 120)}`;
         if (!unresolvedItems.includes(errNote)) unresolvedItems.push(errNote);
+      } else if (
+        call.status === "running" ||
+        (call.status as string) === "pending" ||
+        call.status === "proposed"
+      ) {
+        const rawStatus = call.status as string;
+        const statusText =
+          rawStatus === "running"
+            ? "in progress"
+            : rawStatus === "pending"
+              ? "awaiting approval"
+              : "not executed";
+        const pendingNote = `Tool ${name}${filePath ? ` (${filePath})` : ""} was left ${statusText}`;
+        if (!unresolvedItems.includes(pendingNote)) unresolvedItems.push(pendingNote);
+      } else if (call.status === "denied") {
+        const deniedNote = `Tool ${name}${filePath ? ` (${filePath})` : ""} was denied by user`;
+        if (!unresolvedItems.includes(deniedNote)) unresolvedItems.push(deniedNote);
       } else if (call.result && typeof call.result === "string" && toolFindings.length < 8) {
         const firstLine = call.result.trim().split(/\r?\n/)[0]?.slice(0, 120);
         if (firstLine) {
@@ -407,11 +461,33 @@ export function buildNativeCompactionSummary(
     }
   }
   if (data.commandsRun.length > 0) {
-    repoFactLines.push("**Commands Executed:**");
+    repoFactLines.push("**Commands Executed / Attempted:**");
     for (const c of data.commandsRun.slice(-8)) {
-      repoFactLines.push(
-        `- \`${c.command}\` → ${c.status === "success" ? "✓ Verified" : `✗ Failed (${c.error ?? "error"})`}`
-      );
+      let statusLabel: string;
+      switch (c.status) {
+        case "completed":
+          statusLabel = "✓ Completed";
+          break;
+        case "failed":
+          statusLabel = `✗ Failed (${c.error ?? "error"})`;
+          break;
+        case "not_executed":
+          statusLabel = "⏸ Not executed";
+          break;
+        case "awaiting_approval":
+          statusLabel = "⏳ Awaiting approval";
+          break;
+        case "in_progress":
+          statusLabel = "▶ In progress";
+          break;
+        case "denied":
+          statusLabel = "⛔ Denied";
+          break;
+        default:
+          statusLabel = "❓ Outcome unknown";
+          break;
+      }
+      repoFactLines.push(`- \`${c.command}\` → ${statusLabel}`);
     }
   }
   if (data.toolFindings.length > 0) {
@@ -508,7 +584,24 @@ export async function summarizeWithProviderModel(
       let text = m.content.slice(0, 1200);
       if (m.toolCalls?.length) {
         text += `\n[Tool calls: ${m.toolCalls
-          .map((t) => `${t.name}(${JSON.stringify(t.args)})${t.status === "error" ? ` -> ERROR: ${t.error}` : ""}`)
+          .map((t) => {
+            const mappedStatus = mapToolStatusToCompactionStatus(t.status);
+            const statusDetail =
+              mappedStatus === "completed"
+                ? "completed"
+                : mappedStatus === "failed"
+                  ? `failed: ${t.error ?? "error"}`
+                  : mappedStatus === "awaiting_approval"
+                    ? "awaiting approval"
+                    : mappedStatus === "in_progress"
+                      ? "in progress"
+                      : mappedStatus === "not_executed"
+                        ? "not executed"
+                        : mappedStatus === "denied"
+                          ? "denied"
+                          : "unknown";
+            return `${t.name}(${JSON.stringify(t.args)}) [status: ${statusDetail}]`;
+          })
           .join(", ")}]`;
       }
       transcript += `${role}: ${text}\n`;
@@ -562,6 +655,15 @@ export async function summarizeWithProviderModel(
         .map((f) => `- \`${f}\`: ${(data.filesModified.get(f) ?? []).join("; ")}`)
         .join("\n");
       finalSummary += `\n\n### 🛠️ Verified Modified Files (Retained)\n${fileLines}`;
+    }
+
+    if (data.unresolvedItems.length > 0) {
+      const missingUnresolved = data.unresolvedItems.filter(
+        (item) => !finalSummary.includes(item)
+      );
+      if (missingUnresolved.length > 0) {
+        finalSummary += `\n\n### ⚠️ Unresolved Issues & Pending Items (Retained)\n${missingUnresolved.map((u) => `- ${u}`).join("\n")}`;
+      }
     }
 
     return finalSummary;

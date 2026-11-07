@@ -331,14 +331,36 @@ export function MessageActions({ content, isUser }: { content: string; isUser: b
 
 export function AttachmentThumb({ attachment }: { attachment: Attachment }) {
   const name = attachment.name?.trim() || (attachment.kind === "image" ? "image" : "attachment");
-  if (attachment.kind === "image" && attachment.dataBase64) {
+  if (attachment.kind === "image") {
+    if (attachment.dataBase64) {
+      return (
+        <img
+          className="msg-image"
+          src={`data:${attachment.mime};base64,${attachment.dataBase64}`}
+          alt={name}
+          title={name}
+        />
+      );
+    }
     return (
-      <img
-        className="msg-image"
-        src={`data:${attachment.mime};base64,${attachment.dataBase64}`}
-        alt={name}
-        title={name}
-      />
+      <div
+        className="msg-doc msg-image-expired"
+        title="Image expired from session history to preserve storage"
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: "6px",
+          padding: "3px 8px",
+          borderRadius: "6px",
+          background: "rgba(255, 255, 255, 0.05)",
+          border: "1px dashed rgba(255, 255, 255, 0.2)",
+          fontSize: "11px",
+          color: "var(--vscode-descriptionForeground, #888)",
+        }}
+      >
+        <span style={{ fontSize: "12px", opacity: 0.8 }}>🖼️</span>
+        <span>{name} (image expired from session history)</span>
+      </div>
     );
   }
   return (

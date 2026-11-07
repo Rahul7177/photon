@@ -107,6 +107,7 @@ export interface FitAssessment {
   gpuGb: number;
   ramGb: number;
   tokPerSec?: number;
+  isEstimate?: boolean;
   /** Human-readable badge text (no emoji). */
   label: string;
 }

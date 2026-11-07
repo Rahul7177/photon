@@ -1,450 +1,245 @@
-# Photon --- Engineering Improvement Checklist
-
-**Scope:** Consolidated from the repository review and the UI
-walkthrough.\
-**Current stage:** Personal/local testing.\
-**Direction:** Local-first, with cloud support.\
-**Purpose:** Improve reliability, safety, predictability and developer
-experience before wider testing.
-
-> This is an action list, not a monetization roadmap. The repository
-> review was static inspection; tests and builds were not executed.
-> Re-check each finding against the current branch before changing code.
-
-## Priority levels
-
--   **P0 --- Critical:** privacy exposure, unsafe execution or risk of
-    losing user work.
--   **P1 --- Core reliability:** long sessions, agent execution,
-    context, recovery and evaluation.
--   **P2 --- Product polish:** maintainability, UI clarity and
-    accessibility.
-
-------------------------------------------------------------------------
-
-# P0 --- Safety, privacy and workspace integrity
-
-## 1. Keep generated Photon workspace state out of Git and VSIX
-
-**What to do** - Add `.photon/` to `.gitignore`. - Add `.photon/**` to
-`.vscodeignore`. - Remove already tracked workspace-generated context,
-index, checkpoint, handoff and other local state from the repository. -
-Inspect Git history for previously committed workspace paths, file
-inventories, summaries or other private project metadata. Decide whether
-history rewriting is required. - If documentation needs sample data, use
-synthetic examples or schemas.
-
-**End goal:** Source control and packaged extensions contain intentional
-source/assets, not the developer's local workspace state.
-
-**Done when** - `git ls-files` contains no generated `.photon` files. -
-A fresh workspace's `.photon/` data is ignored. - The packaged VSIX
-contains no `.photon/**` data. - Historical exposure has been reviewed
-and addressed where necessary.
-
-## 2. Make checkpoint rollback safe under partial failure
-
-**What to do** - Review `checkpointManager.ts`, especially
-`rollbackToCheckpoint()`. - Do not prune checkpoint records if any file
-restoration fails. - Return per-file results: restored, skipped,
-conflict or failed, with a reason. - Preserve failed checkpoint data so
-the user can retry. - Detect files changed externally after checkpoint
-creation; do not silently overwrite newer user work. - Revisit files
-larger than 2 MB. Do not represent a checkpoint as restorable if
-original content was not retained. - Consider Git-backed snapshots or
-content-addressed storage for large files if needed. - Add tests for
-partial restore, deleted files, external modifications, permission
-errors, large files and multi-file rollback.
-
-**End goal:** Rollback either restores the requested state or clearly
-reports partial failure while preserving recovery information.
-
-**Done when** - A failure restoring one file does not delete the
-checkpoint. - A retry can complete restoration. - External modifications
-are detected and handled explicitly. - Large-file limitations are
-explicit in behaviour and UI. - Multi-file rollback has success and
-failure tests.
-
-## 3. Harden MCP trust boundaries and tool permissions
-
-**What to do** - Review remote MCP URL validation. Hostname checks alone
-may not prevent DNS rebinding or routing to private/local networks. -
-Validate resolved destinations at connection time; block loopback,
-private, link-local and prohibited ranges unless a local endpoint is
-explicitly trusted. - Treat `npx` as a package runner, not proof that a
-package is trusted. Show the exact command/package and require an
-explicit trust decision. - Add per-server and per-tool permissions
-rather than relying only on broad read-only/write distinctions. -
-Approval prompts should identify the server, tool, arguments and
-expected side effect. - Add an audit trail for MCP calls and approval
-decisions. - Test malformed responses, redirects, DNS changes, timeouts,
-crashes and cleanup.
-
-**End goal:** MCP integrations are explicit, permission-scoped and
-auditable; servers cannot quietly gain more access than intended.
-
-**Done when** - Untrusted write/execute tools require approval. -
-Prohibited network destinations are blocked, including after DNS
-changes. - Users can see exactly what they are approving. -
-Processes/connections are cleaned up after errors and cancellation. -
-Security tests cover hostile inputs and network edge cases.
-
-------------------------------------------------------------------------
-
-# P1 --- Agent and session reliability
-
-## 4. Stabilize context compaction
-
-**What to do** - Verify the 75% auto-compaction trigger uses the active
-model's actual context limit. - Preserve the original task, constraints,
-decisions, important paths, changes made, unresolved questions and
-relevant tool results. - Preserve tool-call/tool-result pairing and
-valid message ordering. - Avoid losing user instructions or important
-repository facts when compressing the middle of a conversation. -
-Distinguish repository facts from model assumptions in summaries. - Add
-fallback handling when provider summarization fails, times out or
-returns unusable output. - Show a concise compaction event: why it
-happened and what was retained. - Add long-session tests that trigger
-compaction during multi-step work.
-
-**End goal:** Long coding sessions continue correctly after compaction
-without losing the task, decisions or tool state.
-
-**Done when** - The original task remains understood after compaction. -
-Tool-call/result sequences remain valid. - Summarization failure does
-not corrupt the conversation. - Continuation tests pass after one or
-more compactions. - The user can tell when compaction occurred.
-
-## 5. Consolidate the agent execution path
-
-**What to do** - Map the active path through `PhotonController`,
-`AgentEngine`, `runUnifiedTurn` and `photon-core`. - Identify the
-canonical runtime and which paths are legacy or experimental. - Compare
-legacy and harness behaviour on representative tasks. - Move required
-behaviour into the chosen runtime before removing the old path. - Keep
-parity tests for tools, approvals, cancellation, streaming, recovery,
-compaction and persistence. - Avoid maintaining two independent
-implementations of the same agent lifecycle.
-
-**End goal:** One understandable, testable source of truth for agent
-execution.
-
-**Done when** - The normal extension path uses a clearly documented
-canonical runtime. - Required behaviour has parity tests. - No required
-behaviour is lost during migration. - Experimental flags and duplicate
-paths are removed or clearly isolated.
-
-## 6. Improve failure recovery and cancellation
-
-**What to do** - Define consistent handling for provider timeouts, rate
-limits, network failures, malformed model output, local model crashes,
-tool failures and interrupted streams. - Use bounded retries/backoff
-only when retrying is safe. - Distinguish retryable from permanent
-failures. - Preserve conversation and tool state when a request fails. -
-Propagate cancellation through model requests, tools and child
-processes. - Ensure failed tool calls cannot be mistaken for successful
-actions. - Provide safe retry/resume actions where possible.
-
-**End goal:** Temporary failures do not force users to restart sessions,
-lose context or mistake failed operations for successful ones.
-
-**Done when** - Timeout and local-runtime-crash tests recover or fail
-with actionable messages. - Cancellation stops work and cleans up
-resources. - Failed actions are visibly distinct from successful
-actions. - Retrying cannot duplicate destructive operations.
-
-## 7. Validate long-running sessions
-
-**What to do** - Test 30--60 minute sessions with repeated tool use,
-large outputs, model switching and compaction. - Check memory growth,
-event/listener cleanup, stale session state and UI responsiveness. -
-Verify session restoration after supported extension-host or provider
-restarts. - Ensure progress and cancellation state remain accurate. -
-Add repeated-session regression tests, not only single-turn tests.
-
-**End goal:** Photon remains responsive and state-consistent during
-realistic developer sessions.
-
-**Done when** - No unbounded memory/listener growth appears in
-repeated-session tests. - Session state is recoverable after supported
-restarts. - The UI never remains stuck in a running state after
-failure/cancellation. - Long-session scenarios are repeatable.
-
-## 8. Make benchmarks measure actual coding success
-
-**What to do** - Keep throughput and latency measurements, but do not
-treat them as coding-quality evidence. - Add real repository tasks
-requiring code reading, editing and verification. - Measure task
-completion, correct file selection, patch correctness, test success,
-recovery and context retention. - Replace simplistic text-match checks
-that can pass without completing the task. - Run multiple trials for
-nondeterministic tasks and record model, prompt, settings, hardware and
-repository state. - Compare adaptive routing against a fixed-model
-baseline.
-
-**End goal:** Improvements are measured by successful coding outcomes,
-not just tokens/sec or plausible responses.
-
-**Done when** - Each benchmark task has an objective success
-condition. - Results are reproducible and include configuration
-details. - Regressions in task success are visible even if speed
-improves. - Routing claims are supported by measured outcomes.
-
-------------------------------------------------------------------------
-
-# P1 --- Context, indexing and model selection
-
-## 9. Measure and improve project indexing/retrieval
-
-**What to do** - Benchmark indexing time, incremental update time, query
-latency, memory use and relevance on small, medium and large
-repositories. - Review the vector store's linear similarity scan and
-approximate 8,000-chunk cap; establish whether either is a practical
-bottleneck. - Exclude or filter generated, ignored, binary, oversized
-and irrelevant files. - Ensure file changes, renames and deletions
-invalidate stale chunks. - Build retrieval evaluations using questions
-with known answers in the repository.
-
-**End goal:** Context retrieval is fast, relevant and current without
-excessive memory use or stale results.
-
-**Done when** - Benchmarks exist for representative repositories. -
-Modified/deleted files do not return stale chunks. - Retrieval relevance
-is measured against known-answer cases. - Chunk limits and exclusions
-are explicit.
-
-## 10. Make adaptive model routing measurable and explainable
-
-**What to do** - Evaluate complexity, capability, context and hardware
-signals used by adaptive routing. - Build capability profiles from
-repeatable task benchmarks, not only model names or advertised
-capabilities. - Include context fit, tool reliability, latency, local
-hardware constraints and estimated cloud cost. - Test whether current
-per-level tool allowances improve completion. - Explain model selection
-and routing reasons in the transparency panel. - Provide controlled
-fallback when a model fails or cannot handle a task. - Make cloud
-escalation visible and respect the configured local/cloud policy.
-
-**End goal:** Photon chooses a suitable model for the task and
-environment, and users can understand and control the decision.
-
-**Done when** - Routing decisions record the signals that influenced
-them. - Benchmarks compare adaptive routing with a fixed-model
-baseline. - Model failure triggers controlled fallback or a clear
-explanation. - Cloud use is never hidden.
-
-## 11. Evaluate the Photon Block Protocol across models
-
-**What to do** - Benchmark the custom `[TOOL ...]` protocol against
-native function/tool calling. - Test models with different
-instruction-following and tool-use capabilities. - Measure valid call
-rate, malformed output, tool selection, argument accuracy and
-recovery. - Test ambiguous arguments, repeated calls, escaped content,
-partial streaming and malformed delimiters. - Use native tool calling
-where it performs better and the custom protocol where it demonstrably
-improves compatibility.
-
-**End goal:** The protocol is a measured compatibility advantage, not an
-unnecessary source of parsing failures.
-
-**Done when** - A model-by-model evaluation exists. - Parser tests cover
-malformed/adversarial outputs. - Arbitrary text or incomplete delimiters
-cannot trigger unintended tools. - Protocol choice is based on measured
-reliability.
-
-------------------------------------------------------------------------
-
-# P2 --- Maintainability and UI/UX refinement
-
-## 12. Reduce `PhotonController.ts` responsibilities
-
-**What to do** - Map responsibilities concentrated in the controller. -
-Gradually extract session orchestration, provider configuration,
-approval lifecycle, workspace lifecycle and UI message coordination into
-focused services. - Keep the controller as a thin host-facing
-coordinator. - Add interfaces and unit tests around extracted
-services. - Extract one responsibility at a time; avoid a large rewrite.
-
-**End goal:** Core behaviour can be tested and changed without
-navigating or destabilizing one oversized controller.
-
-**Done when** - Extracted services have clear responsibilities and
-tests. - The controller delegates rather than owning all business
-logic. - No unintended user-facing behaviour changes occur.
-
-## 13. Make agent activity visible and understandable
-
-**What to do** - Show meaningful stages from actual runtime events:
-understanding request, retrieving context, selecting model, invoking
-tools and verifying changes. - Distinguish thinking, tool execution,
-approval waiting, success, failure and cancellation. - Keep tool details
-expandable to avoid a wall of raw output. - Do not simulate progress or
-show stages the runtime has not reached. - Make it clear when Photon is
-waiting for approval or a provider.
-
-**End goal:** Developers can understand what Photon is doing without
-guessing whether it is stuck.
-
-**Done when** - Every activity state maps to a real runtime event. -
-Errors, approvals and cancellation are visually distinct. - The UI
-returns to an accurate idle/finished state after every outcome.
-
-## 14. Refine composer and control hierarchy
-
-**What to do** - Keep Chat, Plan and Agent modes, but make their
-behavioural differences easy to discover. - Group model, local/cloud,
-thinking and attachment controls into a coherent composer hierarchy. -
-Make the active inference mode obvious. - Explain whether a request may
-send code/context to a cloud provider. - Keep advanced controls
-accessible without giving every control equal prominence. - Test narrow
-VS Code panel widths.
-
-**End goal:** The composer is quick to use while important execution and
-privacy choices remain understandable.
-
-**Done when** - First-time users can distinguish Chat, Plan and Agent. -
-Active model and inference mode are visible. - Cloud/context-sharing
-implications are clear. - Controls remain usable in narrow panels.
-
-## 15. Refine Project Context and hardware presentation
-
-**What to do** - Separate summary metrics from detailed context/index
-information. - Improve hierarchy between memory, indexed files, modules,
-notes and handoff details. - Make file references actionable where
-possible. - Explain hardware compatibility practically: fits in VRAM,
-requires offloading, may run slowly or is not recommended. - Distinguish
-measured values from estimates.
-
-**End goal:** Users can understand what Photon knows about the project
-and whether a local model is practical on their machine.
-
-**Done when** - Context sections have clear labels and hierarchy. - File
-references open relevant workspace files where supported. - Hardware
-guidance is grounded in measurements and labels estimates.
-
-## 16. Accessibility and interaction polish
-
-**What to do** - Check keyboard navigation, focus visibility, tooltips
-and accessible labels for icon-only controls. - Ensure dropdowns and
-modals support Escape and sensible focus behaviour. - Check contrast for
-muted text, badges and status indicators. - Respect reduced-motion
-preferences. - Test different panel widths and VS Code zoom levels.
-
-**End goal:** Photon remains usable and consistent across developer
-setups and interaction styles.
-
-**Done when** - Core workflows work by keyboard. - Icon-only controls
-have accessible names and useful tooltips. - Modal/dropdown focus
-behaviour is predictable. - Important status is not communicated by
-colour alone.
-
-------------------------------------------------------------------------
-
-# Recommended implementation order
-
-Work in small, independently testable changes. Do not combine everything
-into one refactor.
-
-  ---------------------------------------------------------------------------------
-                  Order Workstream              Priority         Exit condition
-  --------------------- ----------------------- ---------------- ------------------
-                      1 Workspace data hygiene  P0               No generated
-                                                                 `.photon` state
-                                                                 tracked or
-                                                                 packaged
-
-                      2 Checkpoint/rollback     P0               Partial failures
-                        integrity                                preserve recovery
-                                                                 data
-
-                      3 MCP security and        P0               Trust boundaries
-                        permissions                              and approvals are
-                                                                 tested
-
-                      4 Context compaction      P1               Long tasks survive
-                                                                 compaction
-
-                      5 Agent runtime           P1               One canonical
-                        consolidation                            execution path
-
-                      6 Failure                 P1               Failures leave
-                        recovery/cancellation                    consistent session
-                                                                 state
-
-                      7 Long-session regression P1               30--60 minute
-                        tests                                    scenarios remain
-                                                                 stable
-
-                      8 Real coding-task        P1               Quality measured
-                        evaluation                               by actual task
-                                                                 outcomes
-
-                      9 Indexing/retrieval      P1               Context is
-                        evaluation                               current, relevant
-                                                                 and performant
-
-                     10 Routing/protocol        P1               Decisions are
-                        evaluation                               evidence-based
-
-                     11 Controller              P2               Responsibilities
-                        decomposition                            separated
-                                                                 incrementally
-
-                     12 Agent activity/composer P2               Runtime state and
-                        UX                                       controls are clear
-
-                     13 Context/hardware UI and P2               Information is
-                        accessibility                            actionable and
-                                                                 accessible
-  ---------------------------------------------------------------------------------
-
-------------------------------------------------------------------------
-
-# Regression test checklist
-
-Run these regularly, manually and/or automatically:
-
--   [ ] 30--60 minute coding session with repeated file reads, edits and
-    terminal calls.
--   [ ] Context compaction during a multi-step task, followed by
-    successful continuation.
--   [ ] Provider timeout during a task, followed by retry or controlled
-    failure.
--   [ ] Local model crash/restart while a session is active.
--   [ ] Cancellation while a tool is running.
--   [ ] Multi-file edit followed by rollback to a checkpoint.
--   [ ] Partial rollback failure followed by a successful retry.
--   [ ] File modified externally after checkpoint creation.
--   [ ] Large file changed and then reverted.
--   [ ] MCP read-only call, write call requiring approval, and denied
-    approval.
--   [ ] MCP server crash, malformed response and prohibited network
-    destination.
--   [ ] Model switch during a session, including context handoff.
--   [ ] Index update after file modification, rename and deletion.
--   [ ] Narrow VS Code panel layout and keyboard-only core workflow.
-
-# Definition of ready for a wider private beta
-
-Do not consider Photon ready merely because the interface looks polished
-or a short demo succeeds. Before inviting more developers, aim for:
-
--   No known rollback path silently discards the only recovery data.
--   No workspace-generated context/private project state is included in
-    source control or VSIX packages.
--   MCP permissions, network restrictions and approvals have meaningful
-    security tests.
--   Long sessions can compact and continue without losing the task or
-    corrupting tool history.
--   Provider failures and cancellation leave the session consistent.
--   The normal user path uses one clearly defined agent execution
-    architecture.
--   A repeatable coding-task suite measures actual completion and
-    regressions.
--   Users can tell what the agent is doing, which model is active and
-    whether inference is local or cloud-based.
-
-**Guiding principle:** Prioritize correctness, recoverability and user
-trust before adding more capabilities. A smaller set of dependable agent
-workflows is more valuable than a larger set of features that are
-difficult to predict.
+3. The important issues I found
+   These are the findings I'd prioritize. Some are residual problems; others are edge cases introduced by the new implementations.
+   P0 — Fix before wider external testing
+1. MCP processes inherit the extension host's environment
+   File: mcpStdioClient.ts
+
+Your process launch currently uses:
+env: { ...process.env, ...this.env }
+
+That means the MCP process inherits the extension host's entire environment.
+
+Depending on the user's setup, that environment could contain:
+
+- Provider API keys.
+- GitHub credentials.
+- Cloud credentials.
+- Other application secrets.
+  An MCP server is external executable code. A malicious or compromised MCP package could inspect the environment it inherits.
+
+What to change:
+
+Launch MCP processes with a minimal environment instead of the complete process.env. Pass only necessary OS variables and explicitly approved MCP-specific variables.
+
+This is one of the most important security changes I'd make. 2. MCP server approval is tied to its ID, not its actual identity
+Files: projectStore.ts, PhotonController.ts
+
+Currently, approval is stored using the MCP server ID.
+
+On startup, Photon checks whether that ID was previously approved and reconnects it.
+
+Consider this scenario:
+
+1. A developer approves an MCP server named database.
+2. Its configuration points to a trusted executable.
+3. Someone changes the configuration under the same ID.
+4. Photon sees the existing approval and reconnects it.
+   The endpoint, executable, arguments or permissions may have changed, but the approval remains valid.
+
+What to change:
+
+Create a trust fingerprint from the server's identity:
+
+- Transport.
+- Endpoint or executable.
+- Arguments.
+- Relevant configuration.
+- Permission policy.
+  Require reapproval whenever the fingerprint changes.
+
+Approval should mean approval of a specific server configuration, not permanent trust in a string ID. 3. DNS validation still has a race condition
+Files: dnsValidator.ts, mcpClient.ts
+
+The implementation resolves a hostname and checks its IP addresses. But the subsequent fetch() resolves the hostname independently.
+
+This creates a time-of-check/time-of-use gap: DNS could change between validation and the actual connection.
+
+There is another issue in McpClient.close(): the session DELETE request uses the default redirect behaviour, without the redirect restrictions implemented in post(). That request also carries the MCP session ID and configured headers.
+
+What to change:
+
+Pin the validated address to the actual connection, or use a transport that enforces the validated destination. Apply redirect restrictions and destination validation to session teardown as well.
+
+The current DNS tests validate the helper function, not the full HTTP connection behaviour. 4. Checkpoint rollback has two important correctness bugs
+File: checkpointManager.ts
+
+You fixed the earlier issue where checkpoint history was deleted after partial restoration. That was necessary.
+
+But I found two remaining problems.
+
+Problem A: Rollback can cross session boundaries.
+
+rollbackToCheckpoint() finds the target index in the workspace-wide checkpoint array and processes:
+const affectedCheckpoints = this.checkpoints.slice(targetIdx);
+
+The checkpoint manager is shared at workspace level, while checkpoints contain different sessionId values.
+
+Suppose:
+
+- Session A creates checkpoint 1.
+- Session B modifies another file and creates checkpoint 2.
+- You roll back checkpoint 1 from session A.
+  The rollback can include session B's changes as well. Successful pruning can also remove checkpoints belonging to other sessions.
+
+The rollback chain should be restricted to the target checkpoint's session, and pruning must preserve other sessions' histories.
+
+Problem B: Retrying after partial rollback may fail incorrectly.
+
+The manager uses file modification times to detect external edits.
+
+Imagine:
+
+1. Rollback restores file A successfully.
+2. Restoring file B fails.
+3. The checkpoint is preserved.
+4. You fix the problem and retry several seconds later.
+   File A now has a newer modification time because Photon itself restored it. The next rollback can interpret that timestamp as an external modification and report a conflict.
+
+The current test retries immediately, so it can miss this condition.
+
+What to change:
+
+Track restoration progress per file, or detect that a file already matches the original snapshot before applying external-modification conflict checks. Use content hashes or equivalent file-state verification rather than treating every newer timestamp as a user edit.
+
+Also, recordBeforeChange() silently ignores snapshot failures, and persist() swallows storage errors. For a feature advertised as safe rollback, inability to save the original state should be visible and should not silently allow an unprotected edit.
+
+P1 — Core reliability and intelligence 5. Context compaction can incorrectly report unfinished commands as successful
+File: compactor.ts
+
+I found this status mapping in the structured compaction extraction:
+status: call.status === "error" ? "error" : "success"
+
+This treats every status except error as success.
+
+That includes statuses such as:
+
+- proposed
+- pending
+- running
+  The generated summary can then say a command was verified when it wasn't completed.
+
+What to change:
+
+Use explicit status mapping:
+Original status Compaction representation
+done Completed
+error Failed
+proposed Not executed
+pending Awaiting approval
+running In progress
+Unknown Outcome unknown
+
+Never turn an unknown or unfinished operation into a verified success.
+
+I also noticed that provider-assisted compaction truncates each message and condenses long transcripts to their head and tail. It appends missing modified-file paths, but this does not guarantee that every important decision, inspection result or unresolved issue is retained.
+
+That deserves more evaluation with long, realistic coding sessions. 6. Persisted project indexes can become stale
+Files: indexService.ts, vectorStore.ts
+
+This is a subtle retrieval problem.
+
+When Photon loads an existing index, it publishes the index as ready and does not automatically reindex the workspace.
+
+That means files modified while Photon was closed can remain stale in the index.
+
+There is a second problem: persisted vectors record their dimension, but not the embedding-model identity.
+
+Two different embedding models can have the same vector dimension while producing vectors from different semantic spaces.
+
+Photon could load old vectors and query them using a new embedding model, producing misleading similarity results.
+
+What to change:
+
+Store the embedding model name and version alongside the index. Invalidate or rebuild the index when that identity changes.
+
+Also validate file freshness at startup using file metadata or hashes, and incrementally update files changed since the previous indexing session. 7. The current implementation is not yet seamless local-to-cloud overflow
+Files: PhotonController.ts, autoMode.ts
+
+Your model-scoring system has improved substantially. It considers:
+
+- Task complexity.
+- Context fit.
+- Tool reliability.
+- Coding and reasoning capabilities.
+- Benchmark throughput.
+- Hardware fit.
+- Cost and local preference.
+  However, the controller passes modelsForUi() into planRequest(). That method separates local and cloud models according to the currently selected interface mode.
+
+As a result, the router normally evaluates the active stack, not a combined set of local and cloud candidates.
+
+So the current behaviour is primarily:
+
+User selects Local or Cloud → Photon selects an appropriate model within that mode.
+
+It is not yet the same as:
+
+Photon starts locally → detects insufficient capability → selects a cloud model → escalates transparently.
+
+The README currently describes cloud models as seamless overflow, which is stronger than what this routing path implements.
+
+This isn't necessarily a defect if separate modes are your intended current behaviour. But it is important not to confuse model selection inside a mode with genuine hybrid routing. 8. Hardware recommendations are still estimates
+File: modelAdvisor.ts
+
+The new hardware advisor is a good addition, but it has limitations:
+
+- It captures free RAM but calculates available RAM primarily from total RAM minus a safety buffer.
+- GPU and RAM bandwidth values are hard-coded assumptions.
+- Estimated tokens/sec are calculated from those assumptions, not measured inference results for the actual machine and model.
+  Therefore, recommendations may be directionally useful without being accurate performance predictions.
+
+What to change:
+
+Use current free RAM in fit calculations, incorporate actual Photon Bench measurements where available, and label unbenchmarked performance as an estimate. 9. Your coding benchmark is better, but not yet a complete coding evaluation
+File: bench.ts
+
+The additions for patch validation, tool selection, recovery, verification and context retention are useful.
+
+However, several checks still rely on fixed prompts and output-pattern matching. The patch evaluator can accept text that resembles a valid edit without actually applying the edit and verifying the resulting repository.
+
+The new tests also use mocked LLM providers.
+
+What to change:
+
+Progress towards actual repository-level tasks:
+
+1. Give a model a small real repository and a defined coding task.
+2. Let it inspect, modify and test the repository.
+3. Apply its actual changes.
+4. Run the relevant test suite.
+5. Compare the resulting repository state against objective success conditions.
+   Measure successful tasks, not only successful-looking tool calls.
+
+6. Other improvements worth doing
+   Area Finding Recommended action
+   Session persistence Sessions are capped at 400 messages by removing the oldest entries. Compact or archive before truncating, so important task context isn't discarded.
+   Image attachments Only the newest four inline images are retained in persisted sessions. Show a clear indication when older image data is no longer available after reload.
+   Approval lifecycle Always allow in session sets autoApprove = true, allowing all side-effecting tools. clearSessionApprovals() has no controller call site. Ensure the permission actually expires at the intended session boundary.
+   Project configuration A checked-in .photon/config can set autoApprove: true and enable it in the controller. Do not let repository configuration independently disable user approval protections.
+   Controller PhotonController.ts is still over 2,300 lines. Continue incremental extraction of session, provider and workspace orchestration.
+   Documentation README says compaction triggers at 85%, while the implementation uses 75%. Synchronize documentation with actual runtime behaviour.
+   Repository metadata README badges and package.json repository metadata still reference other GitHub namespaces. Update before distributing the extension.
+
+One additional detail about approvals: the project configuration currently describes autoApprove as a team-shareable default. I would make that a user-controlled security decision instead. Opening a repository should not silently allow all its agent tool operations. 5. Testing: a very important distinction
+CI successful
+The latest commit, 34e3987, has a successful GitHub Actions run.
+
+However, I checked the actual job steps. They were:
+
+1. npm ci
+2. npm run typecheck
+3. npm run build
+   The CI workflow does not run npm test.
+
+You've added useful test coverage in:
+
+- checkpoints.test.ts
+- mcpSecurity.test.ts
+- runtimeAndRecovery.test.ts
+- benchIndexAndRouting.test.ts
+- controllerServices.test.ts
+  That is good progress. But these tests currently aren't being executed by the CI workflow.
+
+I would add npm test to CI immediately, ideally as a separate job so failures are easy to identify.
+
+Also add tests for the specific edge cases above: cross-session rollback, delayed retry after partial rollback, MCP environment isolation, MCP configuration changes after approval, embedding model changes and startup index freshness.

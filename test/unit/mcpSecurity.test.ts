@@ -348,5 +348,92 @@ describe("MCP Security, Trust Boundaries & Tool Permissions", () => {
       assert.strictEqual(manager.list().length, 0);
     });
   });
+
+  describe("MCP Child Process Environment Isolation & Trust Fingerprints", () => {
+    it("buildSafeMcpEnv strips sensitive credentials while preserving OS essentials and custom vars", async () => {
+      const { buildSafeMcpEnv } = await import("../../src/core/tools/mcp/mcpStdioClient");
+
+      const parentEnv: NodeJS.ProcessEnv = {
+        PATH: "C:\\Windows;C:\\Program Files\\nodejs",
+        SYSTEMROOT: "C:\\Windows",
+        USERPROFILE: "C:\\Users\\dev",
+        HOME: "/home/dev",
+        TEMP: "C:\\Temp",
+        OPENAI_API_KEY: "sk-secret-1234567890",
+        ANTHROPIC_API_KEY: "sk-ant-secret",
+        GITHUB_TOKEN: "ghp_1234567890",
+        AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        MY_APP_SECRET_PASS: "supersecret",
+        SSH_AUTH_SOCK: "/tmp/ssh.sock",
+        GENERIC_VAR: "allowed_value",
+      };
+
+      const customEnv = {
+        MCP_SERVER_CUSTOM_PORT: "8080",
+        SPECIFIC_APPROVED_KEY: "custom_mcp_val",
+      };
+
+      const safe = buildSafeMcpEnv(parentEnv, customEnv);
+
+      // Essential system variables must be retained
+      assert.strictEqual(safe.PATH, parentEnv.PATH);
+      assert.strictEqual(safe.SYSTEMROOT, parentEnv.SYSTEMROOT);
+      assert.strictEqual(safe.USERPROFILE, parentEnv.USERPROFILE);
+      assert.strictEqual(safe.HOME, parentEnv.HOME);
+      assert.strictEqual(safe.TEMP, parentEnv.TEMP);
+      assert.strictEqual(safe.GENERIC_VAR, parentEnv.GENERIC_VAR);
+
+      // Sensitive credentials must be stripped
+      assert.strictEqual(safe.OPENAI_API_KEY, undefined);
+      assert.strictEqual(safe.ANTHROPIC_API_KEY, undefined);
+      assert.strictEqual(safe.GITHUB_TOKEN, undefined);
+      assert.strictEqual(safe.AWS_SECRET_ACCESS_KEY, undefined);
+      assert.strictEqual(safe.MY_APP_SECRET_PASS, undefined);
+      assert.strictEqual(safe.SSH_AUTH_SOCK, undefined);
+
+      // Custom server-specific variables must be present
+      assert.strictEqual(safe.MCP_SERVER_CUSTOM_PORT, "8080");
+      assert.strictEqual(safe.SPECIFIC_APPROVED_KEY, "custom_mcp_val");
+    });
+
+    it("computeMcpConfigFingerprint detects configuration modifications under the same server ID", async () => {
+      const { computeMcpConfigFingerprint } = await import("../../src/host/projectStore");
+
+      const originalConfig: McpServerConfig = {
+        id: "database",
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-sqlite"],
+        allowLocalNetwork: false,
+        permissions: { defaultPolicy: "ask" },
+      };
+
+      const fp1 = computeMcpConfigFingerprint(originalConfig);
+      assert.ok(typeof fp1 === "string" && fp1.length >= 16);
+
+      // Idempotent for identical config
+      const fpIdentical = computeMcpConfigFingerprint({ ...originalConfig });
+      assert.strictEqual(fp1, fpIdentical);
+
+      // Altering command creates distinct fingerprint
+      const alteredCommand: McpServerConfig = { ...originalConfig, command: "node" };
+      assert.notStrictEqual(fp1, computeMcpConfigFingerprint(alteredCommand));
+
+      // Altering args creates distinct fingerprint
+      const alteredArgs: McpServerConfig = { ...originalConfig, args: ["-y", "malicious-package"] };
+      assert.notStrictEqual(fp1, computeMcpConfigFingerprint(alteredArgs));
+
+      // Altering permissions creates distinct fingerprint
+      const alteredPerms: McpServerConfig = {
+        ...originalConfig,
+        permissions: { defaultPolicy: "allow" },
+      };
+      assert.notStrictEqual(fp1, computeMcpConfigFingerprint(alteredPerms));
+
+      // Altering allowLocalNetwork creates distinct fingerprint
+      const alteredNet: McpServerConfig = { ...originalConfig, allowLocalNetwork: true };
+      assert.notStrictEqual(fp1, computeMcpConfigFingerprint(alteredNet));
+    });
+  });
 });
 

@@ -111,18 +111,25 @@ const fmtGb = (n: number) => (Math.round(n * 10) / 10).toString();
 export function assessFit(
   model: Pick<CatalogModel, "sizeGb" | "kvGbPer1k">,
   hw: HardwareInput,
-  ctxTokens = DEFAULT_CONTEXT_TOKENS
+  ctxTokens = DEFAULT_CONTEXT_TOKENS,
+  measuredBenchTps?: number
 ): FitAssessment {
   const required = memoryRequiredGb(model, ctxTokens);
-  const usableRam = Math.max(0, hw.totalRamGb - hw.ramBufferGb);
+  // Consider current free RAM vs total RAM safety buffer to prevent disk thrashing under pressure
+  const nominalUsableRam = Math.max(0, hw.totalRamGb - hw.ramBufferGb);
+  const isCriticalRam = hw.freeRamGb > 0 && hw.freeRamGb < 1.5 && hw.freeRamGb < nominalUsableRam * 0.35;
+  const usableRam = isCriticalRam ? Math.max(hw.freeRamGb, 1.0) : nominalUsableRam;
   const usableVram = Math.max(0, hw.vramGb - VRAM_RESERVE_GB);
   const hasGpu = usableVram > 0;
   const gpuBw = hw.unifiedMemory ? APPLE_BW : GPU_BW;
   const base = { memRequiredGb: round1(required) };
 
+  const hasBench = typeof measuredBenchTps === "number" && measuredBenchTps > 0;
+
   // 100% GPU resident.
   if (hasGpu && required <= usableVram) {
-    const tok = Math.min(120, round(gpuBw / model.sizeGb));
+    const tok = hasBench ? Math.round(measuredBenchTps) : Math.min(120, round(gpuBw / model.sizeGb));
+    const speedLabel = hasBench ? `${tok} tok/s bench` : `~${tok} tok/s`;
     return {
       ...base,
       mode: "gpu",
@@ -130,7 +137,8 @@ export function assessFit(
       gpuGb: round1(required),
       ramGb: 0,
       tokPerSec: tok,
-      label: `Fits 100% in your ${shortGpuName(hw.gpuName)} ${hw.unifiedMemory ? "unified memory" : "VRAM"} (~${tok} tok/s)`,
+      isEstimate: !hasBench,
+      label: `Fits 100% in your ${shortGpuName(hw.gpuName)} ${hw.unifiedMemory ? "unified memory" : "VRAM"} (${speedLabel})`,
     };
   }
 
@@ -140,7 +148,8 @@ export function assessFit(
     const ramPart = required - gpuPart;
     const frac = Math.min(1, gpuPart / required);
     const secPerToken = (frac * model.sizeGb) / gpuBw + ((1 - frac) * model.sizeGb) / RAM_BW;
-    const tok = round(1 / secPerToken);
+    const tok = hasBench ? Math.round(measuredBenchTps) : round(1 / secPerToken);
+    const speedLabel = hasBench ? `${tok} tok/s bench` : `~${tok} tok/s`;
     return {
       ...base,
       mode: "hybrid",
@@ -148,14 +157,16 @@ export function assessFit(
       gpuGb: round1(gpuPart),
       ramGb: round1(ramPart),
       tokPerSec: tok,
-      label: `Hybrid GPU+RAM: ${fmtGb(gpuPart)}GB in VRAM, ${fmtGb(ramPart)}GB in RAM (~${tok} tok/s)`,
+      isEstimate: !hasBench,
+      label: `Hybrid GPU+RAM: ${fmtGb(gpuPart)}GB in VRAM, ${fmtGb(ramPart)}GB in RAM (${speedLabel})`,
     };
   }
 
   // CPU only.
   if (!hasGpu && required <= usableRam) {
     const scale = Math.min(1, hw.cpuCores / 8);
-    const tok = round((RAM_BW / model.sizeGb) * Math.max(0.4, scale));
+    const tok = hasBench ? Math.round(measuredBenchTps) : round((RAM_BW / model.sizeGb) * Math.max(0.4, scale));
+    const speedLabel = hasBench ? `${tok} tok/s bench` : `~${tok} tok/s`;
     return {
       ...base,
       mode: "cpu",
@@ -163,7 +174,8 @@ export function assessFit(
       gpuGb: 0,
       ramGb: round1(required),
       tokPerSec: tok,
-      label: `CPU-only: runs in system RAM (~${tok} tok/s)`,
+      isEstimate: !hasBench,
+      label: `CPU-only: runs in system RAM (${speedLabel})`,
     };
   }
 
@@ -173,7 +185,10 @@ export function assessFit(
     badge: "red",
     gpuGb: 0,
     ramGb: 0,
-    label: "Exceeds safe memory: heavy disk swap risk",
+    isEstimate: true,
+    label: isCriticalRam
+      ? "Exceeds safe memory: low free RAM on system"
+      : "Exceeds safe memory: heavy disk swap risk",
   };
 }
 

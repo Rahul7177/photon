@@ -80,13 +80,21 @@ export class IndexService {
     await this.load(); // may replace this.store with a persisted one
     this.makeIndex();
     this.ensureWatcher();
-    // If we loaded nothing from disk, do a full background index.
-    if (this.store.stats.chunks === 0) void this.reindex();
-    else this.publishReady();
+    // If we loaded nothing from disk (or persisted store was invalidated due to embedding model mismatch),
+    // do a full background index.
+    if (this.store.stats.chunks === 0) {
+      void this.reindex();
+    } else {
+      this.publishReady();
+      // Incremental validation of file freshness at startup:
+      // Files modified or created while Photon was closed are detected via mtime and updated.
+      void this.validateFreshnessAndReindexStale();
+    }
   }
 
   /** (Re)bind the index to the current store + a local-Ollama embed function. */
   private makeIndex(): void {
+    this.store.setEmbeddingModel(this.embeddingModel);
     this.index = new WorkspaceIndex(this.store, (texts) =>
       this.client.embed(this.embeddingModel, texts, 120_000)
     );
@@ -123,6 +131,7 @@ export class IndexService {
         const bytes = await vscode.workspace.fs.readFile(uri);
         const content = Buffer.from(bytes).toString("utf8");
         await this.index.indexFile(rel, content, abort.signal);
+        this.store.setFileMtime(rel, stat.mtime);
       } catch (e) {
         this.log(`[index] skip ${rel}: ${(e as Error).message}`);
       }
@@ -237,6 +246,7 @@ export class IndexService {
         }
         const bytes = await vscode.workspace.fs.readFile(uri);
         await this.index.indexFile(rel, Buffer.from(bytes).toString("utf8"), signal);
+        this.store.setFileMtime(rel, stat.mtime);
       } catch (e) {
         // Only a genuinely missing file evicts its chunks. Transient errors
         // (Windows EBUSY/EPERM while an editor or compiler holds the file)
@@ -297,13 +307,88 @@ export class IndexService {
     this.saveTimer = setTimeout(() => void this.save(), SAVE_DEBOUNCE_MS);
   }
 
+  /**
+   * At startup, incrementally validates file freshness of the persisted index:
+   * 1. Detects files changed while Photon was offline (mtime > stored mtime) and updates them.
+   * 2. Detects new files created while offline and indexes them.
+   * 3. Detects files deleted while offline and evicts them from the index.
+   */
+  async validateFreshnessAndReindexStale(): Promise<void> {
+    if (!this.enabled || !this.index || this.disposed) return;
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!folder) return;
+
+    try {
+      const files = await vscode.workspace.findFiles(FILE_GLOB, EXCLUDE_GLOB, MAX_FILES);
+      if (this.disposed || !this.enabled) return;
+
+      const currentFileUris = new Map<string, vscode.Uri>();
+      const staleOrNewUris: Array<{ rel: string; uri: vscode.Uri; mtime: number }> = [];
+
+      for (const uri of files) {
+        const rel = vscode.workspace.asRelativePath(uri, false);
+        currentFileUris.set(rel, uri);
+        try {
+          const stat = await vscode.workspace.fs.stat(uri);
+          const storedMtime = this.store.getFileMtime(rel);
+          // If file is missing in store, or modified since stored mtime (with 500ms safety window)
+          if (!this.store.hasFile(rel) || storedMtime === undefined || stat.mtime > storedMtime + 500) {
+            if (stat.size <= MAX_FILE_BYTES) {
+              staleOrNewUris.push({ rel, uri, mtime: stat.mtime });
+            }
+          }
+        } catch {
+          // Ignore stat errors for unreadable files
+        }
+      }
+
+      // Evict files deleted while Photon was offline
+      const existingPaths = this.store.getFilePaths();
+      let evictedCount = 0;
+      for (const existingPath of existingPaths) {
+        if (!currentFileUris.has(existingPath)) {
+          this.store.removeFile(existingPath);
+          evictedCount++;
+        }
+      }
+
+      if (staleOrNewUris.length === 0 && evictedCount === 0) {
+        return; // Persisted index is fully fresh
+      }
+
+      this.log(
+        `[index] startup freshness check: updating ${staleOrNewUris.length} modified/new files, evicted ${evictedCount} removed files.`
+      );
+
+      const signal = new AbortController().signal;
+      for (const item of staleOrNewUris) {
+        if (this.disposed || !this.enabled) return;
+        try {
+          const bytes = await vscode.workspace.fs.readFile(item.uri);
+          const content = Buffer.from(bytes).toString("utf8");
+          await this.index.indexFile(item.rel, content, signal);
+          this.store.setFileMtime(item.rel, item.mtime);
+        } catch (e) {
+          this.log(`[index] failed reindexing stale ${item.rel}: ${(e as Error).message}`);
+        }
+        await delay(5);
+      }
+
+      this.publishReady();
+      this.scheduleSave();
+    } catch (e) {
+      this.log(`[index] freshness validation error: ${(e as Error).message}`);
+    }
+  }
+
   private async load(): Promise<void> {
     const uri = this.storageUri();
     if (!uri) return;
     try {
       const bytes = await vscode.workspace.fs.readFile(uri);
       const data = JSON.parse(Buffer.from(bytes).toString("utf8"));
-      this.store = VectorStore.fromJSON(data);
+      this.store = VectorStore.fromJSON(data, this.embeddingModel);
+      this.store.setEmbeddingModel(this.embeddingModel);
     } catch {
       // No saved index yet (or unreadable) — start empty.
     }

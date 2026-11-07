@@ -2,11 +2,11 @@
 
 **Agentic coding with small local LLMs — tuned so low-end models actually cope, with frontier cloud models as seamless overflow.**
 
-[![Version](https://img.shields.io/badge/version-0.1.0-orange.svg)](https://github.com/photon-agent/photon)
+[![Version](https://img.shields.io/badge/version-0.1.0-orange.svg)](https://github.com/Rahul7177/photon)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![VS Code](https://img.shields.io/badge/VS%20Code-^1.90.0-blue.svg)](https://code.visualstudio.com/)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/photon-agent/photon/pulls)
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/Rahul7177/photon/actions)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Rahul7177/photon/pulls)
 
 ---
 
@@ -65,7 +65,7 @@ Never worry about bad AI edits breaking your codebase. Photon automatically crea
 
 ### 🗜️ Intelligent Context Compaction
 Avoid context overflow errors during extended coding sessions:
-- **Automatic Threshold Trigger:** Continuously tracks context pressure and automatically triggers structural compaction when token usage exceeds **85%** of the context window.
+- **Automatic Threshold Trigger:** Continuously tracks context pressure and automatically triggers structural compaction when token usage exceeds **75%** of the context window.
 - **Preserved Core Insights:** Preserves the initial task objective, active files list, pending todos, key technical decisions, and the latest turns while summarizing older turns into a dense summary.
 - **Visual Compaction Pill:** Real-time chat indicators display exact tokens saved and percentage reduction.
 - **Manual Control:** Trigger compaction anytime via `/compact [focus]` or through the Context Meter.

@@ -16,6 +16,83 @@ interface Pending {
 }
 
 /**
+ * Constructs an isolated, sanitized environment for MCP child processes.
+ * Prevents untrusted or third-party MCP servers from inspecting sensitive credentials
+ * (API keys, GitHub tokens, cloud credentials) present in the extension host's process.env.
+ */
+export function buildSafeMcpEnv(
+  parentEnv: NodeJS.ProcessEnv = process.env,
+  customEnv?: Record<string, string>
+): NodeJS.ProcessEnv {
+  const allowedKeys = new Set([
+    // Windows system variables
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "PATH",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "COMSPEC",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "OS",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    // Unix/macOS environment variables
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "HOSTNAME",
+    // Runtime essentials
+    "NODE_PATH",
+    "NODE_OPTIONS",
+    "NVM_BIN",
+    "VIRTUAL_ENV",
+    "PYTHONPATH",
+    "PYTHONHOME",
+  ]);
+
+  const sensitivePattern = /(key|secret|token|auth|pass|cred|private|bearer|jwt|gh_|github_|aws_|azure_|openai|anthropic|gemini|nvidia|groq|mistral|deepseek|together|cohere|voyage|ssh_)/i;
+
+  const safeEnv: NodeJS.ProcessEnv = {};
+
+  for (const [key, val] of Object.entries(parentEnv)) {
+    if (!val) continue;
+    const upper = key.toUpperCase();
+    if (allowedKeys.has(upper)) {
+      safeEnv[key] = val;
+    } else if (!sensitivePattern.test(upper)) {
+      safeEnv[key] = val;
+    }
+  }
+
+  // Explicit user-specified environment variables for this server take precedence
+  if (customEnv) {
+    for (const [k, v] of Object.entries(customEnv)) {
+      if (typeof v === "string") {
+        safeEnv[k] = v;
+      }
+    }
+  }
+
+  return safeEnv;
+}
+
+/**
  * MCP client over stdio: launches the server as a child process and exchanges
  * newline-delimited JSON-RPC. Careful with the process lifecycle — every pending
  * request is rejected if the child dies, timers are always cleared, and close()
@@ -43,9 +120,10 @@ export class McpStdioClient implements IMcpClient {
         cmd = `${cmd}.cmd`;
       }
     }
+    const safeEnv = buildSafeMcpEnv(process.env, this.env);
     const child = spawn(cmd, this.args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, ...this.env },
+      env: safeEnv,
       cwd: this.cwd,
       windowsHide: true,
     });

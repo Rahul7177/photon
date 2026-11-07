@@ -6,8 +6,10 @@ import type { IndexedChunk, RetrievedChunk } from "./types";
 const MAX_CHUNKS = 8000;
 
 interface Persisted {
-  version: 1;
+  version: 1 | 2;
   dim: number;
+  embeddingModel?: string;
+  fileMtimes?: Record<string, number>;
   chunks: IndexedChunk[];
 }
 
@@ -19,22 +21,53 @@ interface Persisted {
  */
 export class VectorStore {
   private byPath = new Map<string, IndexedChunk[]>();
+  private fileMtimes = new Map<string, number>();
   private flat: IndexedChunk[] = [];
   private dirty = true;
   private dim = 0;
+  private embeddingModel?: string;
+
+  getEmbeddingModel(): string | undefined {
+    return this.embeddingModel;
+  }
+
+  setEmbeddingModel(model?: string): void {
+    this.embeddingModel = model;
+  }
 
   /** Replace all chunks for a file (incremental re-index). Vectors normalized here. */
-  setFile(path: string, chunks: IndexedChunk[]): void {
+  setFile(path: string, chunks: IndexedChunk[], mtime?: number): void {
     const normPath = normalizePathKey(path);
     const normalized = chunks.map((c) => ({ ...c, path: normPath, vector: normalize(c.vector) }));
     if (normalized[0]?.vector.length) this.dim = normalized[0].vector.length;
     this.byPath.set(normPath, normalized);
+    if (typeof mtime === "number") {
+      this.fileMtimes.set(normPath, mtime);
+    }
     this.dirty = true;
     this.enforceCap();
   }
 
+  setFileMtime(path: string, mtime: number): void {
+    this.fileMtimes.set(normalizePathKey(path), mtime);
+  }
+
+  getFileMtime(path: string): number | undefined {
+    return this.fileMtimes.get(normalizePathKey(path));
+  }
+
+  getFileMtimes(): Map<string, number> {
+    return new Map(this.fileMtimes);
+  }
+
+  getFilePaths(): string[] {
+    return Array.from(this.byPath.keys());
+  }
+
   removeFile(path: string): void {
-    if (this.byPath.delete(normalizePathKey(path))) this.dirty = true;
+    const norm = normalizePathKey(path);
+    this.fileMtimes.delete(norm);
+    if (this.byPath.delete(norm)) this.dirty = true;
   }
 
   hasFile(path: string): boolean {
@@ -43,6 +76,7 @@ export class VectorStore {
 
   clear(): void {
     this.byPath.clear();
+    this.fileMtimes.clear();
     this.flat = [];
     this.dirty = true;
   }
@@ -70,13 +104,39 @@ export class VectorStore {
 
   toJSON(): Persisted {
     this.rebuild();
-    return { version: 1, dim: this.dim, chunks: this.flat };
+    const mtimesObj: Record<string, number> = {};
+    for (const [p, m] of this.fileMtimes.entries()) {
+      mtimesObj[p] = m;
+    }
+    return {
+      version: 2,
+      dim: this.dim,
+      embeddingModel: this.embeddingModel,
+      fileMtimes: mtimesObj,
+      chunks: this.flat,
+    };
   }
 
-  static fromJSON(data: unknown): VectorStore {
+  static fromJSON(data: unknown, expectedEmbeddingModel?: string): VectorStore {
     const store = new VectorStore();
     const p = data as Partial<Persisted> | undefined;
-    if (!p || p.version !== 1 || !Array.isArray(p.chunks)) return store;
+    if (!p || (p.version !== 1 && p.version !== 2) || !Array.isArray(p.chunks)) return store;
+
+    // Check embedding model compatibility:
+    // If the index was generated with a different embedding model, the vectors reside in a completely
+    // different semantic latent space. Querying vectors from model A with an embedding from model B
+    // generates meaningless dot products. Invalidate when model mismatch is detected.
+    if (
+      expectedEmbeddingModel &&
+      p.embeddingModel &&
+      p.embeddingModel.trim() !== expectedEmbeddingModel.trim()
+    ) {
+      return store;
+    }
+
+    if (p.embeddingModel) {
+      store.embeddingModel = p.embeddingModel;
+    }
 
     // The recorded embedding dimension is a contract: vectors of any other
     // size came from a DIFFERENT embedding model and would silently produce
@@ -99,6 +159,15 @@ export class VectorStore {
       loaded++;
     }
     store.dim = declaredDim || store.dim;
+
+    if (p.fileMtimes && typeof p.fileMtimes === "object") {
+      for (const [k, v] of Object.entries(p.fileMtimes)) {
+        if (typeof v === "number" && Number.isFinite(v)) {
+          store.fileMtimes.set(normalizePathKey(k), v);
+        }
+      }
+    }
+
     store.dirty = true;
     return store;
   }

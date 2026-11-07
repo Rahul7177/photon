@@ -394,4 +394,72 @@ describe("Checkpoint & Rollback Manager", () => {
     // Checkpoint preserved
     assert.strictEqual(mgr.listCheckpoints().length, 1);
   });
+
+  it("isolates rollbacks across session boundaries without touching other sessions", async () => {
+    const fileA = path.join(tmpDir, "fileA.txt");
+    const fileB = path.join(tmpDir, "fileB.txt");
+    await fs.writeFile(fileA, "v1_A", "utf8");
+    await fs.writeFile(fileB, "v1_B", "utf8");
+
+    // Session A creates checkpoint cpA
+    mgr.beginTurn("session-A", "turn-A1", "Edit A");
+    await mgr.recordBeforeChange("fileA.txt");
+    await fs.writeFile(fileA, "v2_A", "utf8");
+    const cpA = await mgr.commitTurn("turn-A1");
+    assert.ok(cpA);
+
+    // Session B creates checkpoint cpB
+    mgr.beginTurn("session-B", "turn-B1", "Edit B");
+    await mgr.recordBeforeChange("fileB.txt");
+    await fs.writeFile(fileB, "v2_B", "utf8");
+    const cpB = await mgr.commitTurn("turn-B1");
+    assert.ok(cpB);
+
+    assert.strictEqual(mgr.listCheckpoints().length, 2);
+
+    // Rollback session A checkpoint
+    const resA = await mgr.rollbackToCheckpoint(cpA.id);
+    assert.strictEqual(resA.success, true);
+    assert.strictEqual(await fs.readFile(fileA, "utf8"), "v1_A");
+
+    // Session B's file and checkpoint MUST remain untouched and intact
+    assert.strictEqual(await fs.readFile(fileB, "utf8"), "v2_B");
+    const remaining = mgr.listCheckpoints();
+    assert.strictEqual(remaining.length, 1);
+    assert.strictEqual(remaining[0].id, cpB.id);
+    assert.strictEqual(remaining[0].sessionId, "session-B");
+  });
+
+  it("succeeds on delayed rollback retry without reporting false conflicts on already restored files", async () => {
+    const file1 = path.join(tmpDir, "retry1.txt");
+    const file2 = path.join(tmpDir, "retry2.txt");
+    await fs.writeFile(file1, "original_1", "utf8");
+    await fs.writeFile(file2, "original_2", "utf8");
+
+    mgr.beginTurn("session-retry", "turn-r1", "Mutate both files");
+    await mgr.recordBeforeChange("retry1.txt");
+    await mgr.recordBeforeChange("retry2.txt");
+    await fs.writeFile(file1, "mutated_1", "utf8");
+    await fs.writeFile(file2, "mutated_2", "utf8");
+    const cp = await mgr.commitTurn("turn-r1");
+    assert.ok(cp);
+
+    // Simulate partial restore: file1 is restored to original_1
+    await fs.writeFile(file1, "original_1", "utf8");
+    // Simulate elapsed time by touching file1 mtime forward by 5 seconds
+    const futureTime = new Date(Date.now() + 5000);
+    await fs.utimes(file1, futureTime, futureTime);
+
+    // Verify file1 stat is > 1000ms after postMutationMtimes
+    const stat1 = await fs.stat(file1);
+    const postMtime = cp.postMutationMtimes?.["retry1.txt"] ?? 0;
+    assert.ok(stat1.mtimeMs > postMtime + 1000);
+
+    // Rollback should detect that retry1.txt already matches snapshot content and NOT flag a conflict
+    const res = await mgr.rollbackToCheckpoint(cp.id);
+    assert.strictEqual(res.success, true);
+    assert.strictEqual(await fs.readFile(file1, "utf8"), "original_1");
+    assert.strictEqual(await fs.readFile(file2, "utf8"), "original_2");
+    assert.strictEqual(mgr.listCheckpoints().length, 0);
+  });
 });

@@ -75,15 +75,19 @@ export class McpClient {
     return text || "(no content)";
   }
 
-  /** End the server session (HTTP DELETE per the spec). Best-effort. */
+  /** End the server session (HTTP DELETE per the spec). Best-effort with destination & redirect protection. */
   async close(): Promise<void> {
     if (!this.sessionId) return;
     try {
-      await fetch(this.url, {
-        method: "DELETE",
-        signal: AbortSignal.timeout(3000),
-        headers: { "Mcp-Session-Id": this.sessionId, ...this.headers },
-      });
+      const check = await validateRemoteEndpoint(this.url, this.allowLocalNetwork, this.customLookup);
+      if (check.ok) {
+        await fetch(this.url, {
+          method: "DELETE",
+          signal: AbortSignal.timeout(3000),
+          redirect: "manual",
+          headers: { "Mcp-Session-Id": this.sessionId, ...this.headers },
+        });
+      }
     } catch {
       /* server may not support session teardown — ignore */
     } finally {
