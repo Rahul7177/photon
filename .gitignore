@@ -6,4 +6,5 @@ out/
 *.log
 deepseek-harness/
 .vscode/
+.photon/
 *.tmp

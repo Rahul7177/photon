@@ -74,6 +74,7 @@ export interface AppState {
   checkpoints: CheckpointSummary[];
   draftPrompt: string | null;
   revertModalOpen: boolean;
+  showOnboarding: boolean;
 }
 
 const initialConfig: PhotonConfig = {
@@ -135,6 +136,7 @@ export const initial: AppState = {
   checkpoints: [],
   draftPrompt: null,
   revertModalOpen: false,
+  showOnboarding: false,
 };
 
 type LocalAction =
@@ -146,7 +148,8 @@ type LocalAction =
   | { type: "_testModel"; providerId: string; model: ModelInfo }
   | { type: "_setDraftPrompt"; prompt: string | null }
   | { type: "_openRevertModal" }
-  | { type: "_closeRevertModal" };
+  | { type: "_closeRevertModal" }
+  | { type: "_setOnboarding"; show: boolean };
 export type Action = HostMessage | LocalAction;
 
 export function reducer(state: AppState, msg: Action): AppState {
@@ -154,10 +157,10 @@ export function reducer(state: AppState, msg: Action): AppState {
     case "_clearApproval": return { ...state, pendingApproval: null };
     case "_clearError": return { ...state, error: null };
     case "_setMode": return { ...state, mode: msg.mode };
-    case "_setModel": return { ...state, selectedModel: msg.model, autoSelectModel: false };
+    case "_setModel": return { ...state, selectedModel: msg.model, config: { ...state.config, autoSelectModel: false } };
     case "_fetchProviderModels": return { ...state, providerModelsFetching: [...state.providerModelsFetching, msg.id], providerModelsError: { ...state.providerModelsError, [msg.id]: "" } };
     case "_testModel": return { ...state, modelTestRunning: [...state.modelTestRunning, modelTestKey(msg.providerId, msg.model.name)] };
-    case "init": return { ...state, ready: true, ollamaReachable: msg.payload.ollamaReachable, models: msg.payload.models, selectedModel: msg.payload.selectedModel, mode: msg.payload.mode, machine: msg.payload.machine, plan: msg.payload.plan, messages: msg.payload.session.messages, sessions: msg.payload.sessions, activeSessionId: msg.payload.session.id, config: msg.payload.config, tools: msg.payload.tools, benchResults: msg.payload.benchResults, indexStatus: msg.payload.indexStatus, mcpServers: msg.payload.mcpServers, modelConfigs: (msg.payload as any).modelConfigs ?? {}, ollamaRuntime: msg.payload.ollamaRuntime ?? [], hardwareMetrics: msg.payload.hardwareMetrics ?? null, cloudUsage: msg.payload.cloudUsage ?? null, projectContext: msg.payload.projectContext ?? state.projectContext, usage: msg.payload.session.usage ?? state.usage };
+    case "init": return { ...state, ready: true, ollamaReachable: msg.payload.ollamaReachable, models: msg.payload.models, selectedModel: msg.payload.selectedModel, mode: msg.payload.mode, machine: msg.payload.machine, plan: msg.payload.plan, messages: msg.payload.session.messages, sessions: msg.payload.sessions, activeSessionId: msg.payload.session.id, config: msg.payload.config, tools: msg.payload.tools, benchResults: msg.payload.benchResults, indexStatus: msg.payload.indexStatus, mcpServers: msg.payload.mcpServers, modelConfigs: (msg.payload as any).modelConfigs ?? {}, ollamaRuntime: msg.payload.ollamaRuntime ?? [], hardwareMetrics: msg.payload.hardwareMetrics ?? null, cloudUsage: msg.payload.cloudUsage ?? null, projectContext: msg.payload.projectContext ?? state.projectContext, usage: msg.payload.session.usage ?? state.usage, showOnboarding: Boolean(msg.payload.showOnboarding) };
     case "models": return { ...state, models: msg.payload.models, selectedModel: msg.payload.selected, ollamaReachable: msg.payload.ollamaReachable };
     case "sessionLoaded": {
       const isSameSession = msg.payload.id === state.activeSessionId;
@@ -205,7 +208,21 @@ export function reducer(state: AppState, msg: Action): AppState {
     case "toolApprovalRequest": return { ...state, pendingApproval: msg.payload.call };
     case "tokenUsage": return { ...state, usage: msg.payload };
     case "generationStats": return { ...state, generationStats: msg.payload };
-    case "status": return { ...state, status: msg.payload.kind, statusDetail: msg.payload.detail ?? null, error: msg.payload.kind === "error" ? msg.payload.detail ?? state.error : state.error };
+    case "status": {
+      const nextKind = msg.payload.kind;
+      const isIdleOrError = nextKind === "idle" || nextKind === "error";
+      const nextMessages = isIdleOrError && state.messages.some((m) => m.streaming)
+        ? state.messages.map((m) => (m.streaming ? { ...m, streaming: false } : m))
+        : state.messages;
+      return {
+        ...state,
+        status: nextKind,
+        statusDetail: msg.payload.detail ?? null,
+        error: nextKind === "error" ? msg.payload.detail ?? state.error : state.error,
+        pendingApproval: isIdleOrError ? null : state.pendingApproval,
+        messages: nextMessages,
+      };
+    }
     case "decision": return { ...state, decision: msg.payload };
     case "benchResults": return { ...state, benchResults: msg.payload };
     case "benchStatus": { const running = new Set(state.benchRunning); if (msg.payload.phase === "running") running.add(msg.payload.model); else running.delete(msg.payload.model); return { ...state, benchRunning: [...running] }; }
@@ -249,15 +266,20 @@ export function reducer(state: AppState, msg: Action): AppState {
     case "_openRevertModal": return { ...state, revertModalOpen: true };
     case "_closeRevertModal": return { ...state, revertModalOpen: false };
     case "_setDraftPrompt": return { ...state, draftPrompt: msg.prompt };
+    case "onboardingStatus": return { ...state, showOnboarding: msg.payload.show };
+    case "_setOnboarding": return { ...state, showOnboarding: msg.show };
     case "error": {
       const errText = msg.payload.message;
-      const hasNoticeAlready = state.messages.some(
+      const cleanedMessages = state.messages.map((m) =>
+        m.streaming ? { ...m, streaming: false } : m
+      );
+      const hasNoticeAlready = cleanedMessages.some(
         (m) => m.notice && m.notice.includes(errText)
       );
       const nextMessages = hasNoticeAlready
-        ? state.messages
+        ? cleanedMessages
         : [
-            ...state.messages,
+            ...cleanedMessages,
             {
               id: `err-${Date.now()}`,
               role: "assistant" as const,
@@ -267,7 +289,16 @@ export function reducer(state: AppState, msg: Action): AppState {
               streaming: false,
             },
           ];
-      return { ...state, error: errText, status: "idle", messages: nextMessages };
+      return {
+        ...state,
+        error: errText,
+        status: "idle",
+        statusDetail: null,
+        pendingApproval: null,
+        generationStats: null,
+        isCompacting: false,
+        messages: nextMessages,
+      };
     }
     default: return state;
   }
@@ -319,14 +350,14 @@ function mergeMessages(current: ChatMessage[], incoming: ChatMessage[]): ChatMes
       }
       continue;
     }
-    const live = existing.streaming === true;
+    const live = existing.streaming === true && message.streaming !== false;
     byId.set(message.id, {
       ...existing,
       ...message,
       content: live ? existing.content : message.content,
       thinking: live ? (existing.thinking ?? message.thinking) : (message.thinking ?? existing.thinking),
       toolCalls: live ? existing.toolCalls : (message.toolCalls ?? existing.toolCalls),
-      streaming: live ? true : message.streaming,
+      streaming: live ? true : (message.streaming ?? false),
     });
   }
   return order.map((id) => byId.get(id)).filter((message): message is ChatMessage => !!message);
@@ -345,7 +376,7 @@ export function useAppState() {
     switchSession: (id: string) => post({ type: "switchSession", payload: { id } }),
     deleteSession: (id: string) => post({ type: "deleteSession", payload: { id } }),
     refreshModels: () => post({ type: "refreshModels" }),
-    approve: (callId: string, approved: boolean, remember?: boolean) => post({ type: "toolApproval", payload: { callId, approved, remember } }),
+    approve: (callId: string, approved: boolean, remember?: boolean, toolName?: string) => post({ type: "toolApproval", payload: { callId, approved, remember, toolName } }),
     setContextWindow: (numCtx: number) => post({ type: "setContextWindow", payload: { numCtx } }),
     setAutoApprove: (enabled: boolean) => post({ type: "setAutoApprove", payload: { enabled } }),
     setAdaptiveEnabled: (enabled: boolean) => post({ type: "setAdaptiveEnabled", payload: { enabled } }),
@@ -396,6 +427,9 @@ export function useAppState() {
     clearDraftPrompt: () => dispatch({ type: "_setDraftPrompt", prompt: null }),
     revertToNumber: (checkpointNumber: number) => post({ type: "revertToNumber", payload: { checkpointNumber } }),
     getCheckpoints: () => post({ type: "getCheckpoints" }),
+    openFile: (path: string, line?: number) => post({ type: "openFile", payload: { path, line } }),
+    completeOnboarding: () => { dispatch({ type: "_setOnboarding", show: false }); post({ type: "completeOnboarding" }); },
+    openOnboarding: () => { dispatch({ type: "_setOnboarding", show: true }); post({ type: "openOnboarding" }); },
   }), []);
   return { state, dispatch, actions };
 }

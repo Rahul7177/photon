@@ -3,8 +3,6 @@ import type { ChatMessage, Role } from "../../shared/types";
 import type { LLMMessage, LLMProvider } from "../llm/types";
 import {
   estimateTokens,
-  estimateTokensForModel,
-  estimateMessageTokens,
   estimateMessagesTokens,
 } from "../adaptive/tokens";
 
@@ -13,6 +11,20 @@ export interface CompactionCandidateSet {
   toCompact: ChatMessage[];
   recent: ChatMessage[];
   canCompact: boolean;
+}
+
+export interface CompactionRetainedItems {
+  anchorPreserved: boolean;
+  taskPreserved: boolean;
+  userDirectivesCount: number;
+  constraintsCount: number;
+  modifiedFiles: string[];
+  modifiedFilesCount: number;
+  inspectedFiles: string[];
+  inspectedFilesCount: number;
+  commandsCount: number;
+  unresolvedCount: number;
+  recentMessagesKept: number;
 }
 
 export interface CompactionResult {
@@ -26,6 +38,8 @@ export interface CompactionResult {
   pctSaved: number;
   strategy: "provider-model" | "native-heuristic";
   summary?: string;
+  compactionNotice?: string;
+  retained?: CompactionRetainedItems;
   newMessages: ChatMessage[];
 }
 
@@ -38,7 +52,10 @@ export interface CompactionOptions {
   focus?: string;
   threshold?: number;
   recentTurnsToKeep?: number;
+  keepRecentUserTurns?: number;
 }
+
+export type StructuredCompactionData = ReturnType<typeof extractStructuredCompactionData>;
 
 /** Default context fill ratio to trigger auto-compaction (75% like Copilot / Claude Code) */
 export const DEFAULT_AUTO_COMPACT_THRESHOLD = 0.75;
@@ -47,9 +64,24 @@ export const DEFAULT_AUTO_COMPACT_THRESHOLD = 0.75;
 export const MIN_MESSAGES_FOR_COMPACTION = 4;
 
 /**
+ * Checks whether a message is a synthetic tool-result wrapper rather than a genuine user prompt.
+ */
+export function isToolResultMessage(m: ChatMessage): boolean {
+  if (m.role === "tool") return true;
+  const trimmed = (m.content || "").trim();
+  return (
+    trimmed.startsWith("[tool:") ||
+    trimmed.startsWith("[TOOL_RESULT") ||
+    trimmed.startsWith("<photon:result") ||
+    trimmed.startsWith("<tool_result") ||
+    Boolean((m as any).toolCallId)
+  );
+}
+
+/**
  * Determine if the conversation context is full enough to trigger automatic compaction.
  * Mirrors Claude Code and GitHub Copilot threshold heuristics:
- * triggers when current conversation tokens >= threshold (default 75%) of context window.
+ * triggers when current conversation tokens >= threshold (default 75%) of active model's context window.
  */
 export function shouldAutoCompact(
   messages: ChatMessage[],
@@ -67,9 +99,9 @@ export function shouldAutoCompact(
 
 /**
  * Partitions conversation messages into:
- * 1. Anchor: First user prompt establishing the overall task/intent.
+ * 1. Anchor: First genuine user prompt establishing the overall task/intent.
  * 2. ToCompact: Middle messages to be folded into a structured summary.
- * 3. Recent: Latest turns (default last 1-2 user turns and immediate assistant responses) kept verbatim.
+ * 3. Recent: Latest turns kept verbatim, strictly preserving tool-call/tool-result pairing.
  */
 export function extractCompactionCandidates(
   messages: ChatMessage[],
@@ -79,21 +111,21 @@ export function extractCompactionCandidates(
     return { anchor: null, toCompact: [], recent: messages || [], canCompact: false };
   }
 
-  // 1. Locate anchor (first user message)
-  const firstUserIdx = messages.findIndex((m) => m.role === "user");
+  // 1. Locate anchor (first genuine user message)
+  const firstUserIdx = messages.findIndex((m) => m.role === "user" && !isToolResultMessage(m));
   const anchor = firstUserIdx >= 0 ? messages[firstUserIdx] : null;
+  const minCompactIdx = firstUserIdx >= 0 ? firstUserIdx + 1 : 0;
 
-  // Decide how many recent user turns to preserve:
-  // If messages count is <= 8, keep 1 recent user turn (the active turn);
-  // for longer conversations, keep up to recentTurnsToKeep (default 2).
+  // Decide how many recent genuine user turns to preserve:
   const effectiveRecentTurns = recentTurnsToKeep ?? (messages.length <= 8 ? 1 : 2);
 
-  // 2. Count backwards to locate start of recent turns
+  // 2. Count backwards across genuine user turns (never splitting a tool-result from its assistant tool-call)
   let userTurnsSeen = 0;
   let recentStartIdx = messages.length;
 
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user") {
+  for (let i = messages.length - 1; i >= minCompactIdx; i--) {
+    const m = messages[i];
+    if (m.role === "user" && !isToolResultMessage(m) && !m.isCompacted) {
       userTurnsSeen++;
       if (userTurnsSeen === effectiveRecentTurns) {
         recentStartIdx = i;
@@ -102,13 +134,31 @@ export function extractCompactionCandidates(
     }
   }
 
-  // Fallback if not enough user turns found: keep at least the last 2 messages intact
-  if (recentStartIdx >= messages.length || recentStartIdx <= (firstUserIdx >= 0 ? firstUserIdx + 1 : 1)) {
-    recentStartIdx = Math.max(firstUserIdx >= 0 ? firstUserIdx + 1 : 1, messages.length - 2);
+  // Fallback if not enough genuine user turns found after anchor
+  if (recentStartIdx >= messages.length || recentStartIdx <= minCompactIdx) {
+    recentStartIdx = Math.max(minCompactIdx, messages.length - 2);
   }
 
-  const sliceStart = firstUserIdx >= 0 ? firstUserIdx + 1 : 0;
-  const toCompact = messages.slice(sliceStart, recentStartIdx);
+  // 3. Enforce strict tool-call / tool-result pairing:
+  // Never start `recent` on a tool-result message or leave an assistant tool-call in `toCompact`
+  // whose result is in `recent`. Walk `recentStartIdx` backwards until clean boundary.
+  while (recentStartIdx > minCompactIdx) {
+    const firstRecent = messages[recentStartIdx];
+    const prevMsg = messages[recentStartIdx - 1];
+    const firstIsToolResult = firstRecent && isToolResultMessage(firstRecent);
+    const prevHasToolCalls =
+      prevMsg && prevMsg.role === "assistant" && (prevMsg.toolCalls?.length ?? 0) > 0;
+
+    if (firstIsToolResult || (prevHasToolCalls && firstRecent?.role !== "user")) {
+      recentStartIdx--;
+    } else if (prevHasToolCalls && firstRecent && isToolResultMessage(firstRecent)) {
+      recentStartIdx--;
+    } else {
+      break;
+    }
+  }
+
+  const toCompact = messages.slice(minCompactIdx, recentStartIdx);
   const recent = messages.slice(recentStartIdx);
 
   const canCompact = toCompact.length >= 1;
@@ -122,69 +172,98 @@ export function extractCompactionCandidates(
 }
 
 /**
- * Deterministic Native Compaction Engine:
- * Analyzes conversation turns without network or LLM latency.
- * Accurately extracts:
- * - Original user goal & intermediate instructions
- * - Files modified & written (with exact paths & edit nature)
- * - Files inspected & read
- * - Terminal commands executed & exit status
- * - Key technical decisions made by assistant
- * - Error states and unresolved checklist items
- * - Rollover from any earlier compaction blocks so no context is lost over long sessions.
+ * Extracts structured metadata from messages being compacted so we can both
+ * build the native summary and verify that provider summaries retain all critical facts.
  */
-export function buildNativeCompactionSummary(
-  messages: ChatMessage[],
-  focus?: string,
-  anchorPrompt?: string
-): string {
+export function extractStructuredCompactionData(messages: ChatMessage[]) {
   const userDirectives: string[] = [];
   const filesModified = new Map<string, string[]>();
   const filesInspected = new Set<string>();
+  const toolFindings: string[] = [];
   const commandsRun: Array<{ command: string; status: "success" | "error"; error?: string }> = [];
-  const decisions: string[] = [];
-  const activeErrors: string[] = [];
+  const modelDecisions: string[] = [];
+  const unresolvedItems: string[] = [];
   const existingSummarySections: string[] = [];
 
   for (const msg of messages) {
-    // Check if this message is a prior compaction summary to preserve historical continuity
-    if (msg.content.includes("[Context Compaction Summary]") || msg.notice?.includes("Context compacted")) {
-      existingSummarySections.push(msg.content.replace(/^⚡\s*\*\*\[Context Compaction Summary\]\*\*\s*/i, "").trim());
+    if (
+      msg.content.includes("[Context Compaction Summary]") ||
+      msg.notice?.includes("Context compacted")
+    ) {
+      existingSummarySections.push(
+        msg.content.replace(/^⚡\s*\*\*\[Context Compaction Summary\]\*\*\s*/i, "").trim()
+      );
       continue;
     }
 
     if (msg.role === "user") {
       const clean = msg.content.trim();
-      // Don't include tool-result user turns as user directives
-      if (!clean.startsWith("[tool:") && !clean.startsWith("```json") && clean.length > 0) {
-        if (!userDirectives.includes(clean)) {
-          userDirectives.push(clean.length > 200 ? clean.slice(0, 197) + "…" : clean);
+      if (isToolResultMessage(msg)) {
+        // Extract concise tool result facts
+        const snippet = clean.replace(/\s+/g, " ").slice(0, 140);
+        if (snippet && toolFindings.length < 8) {
+          toolFindings.push(snippet);
+        }
+      } else if (!clean.startsWith("```json") && clean.length > 0) {
+        const truncated = clean.length > 240 ? clean.slice(0, 237) + "…" : clean;
+        if (!userDirectives.includes(truncated)) {
+          userDirectives.push(truncated);
         }
       }
     }
 
-    // Inspect tool calls made by assistant or recorded on message
+    if (msg.role === "tool" && msg.content) {
+      const snippet = msg.content.trim().replace(/\s+/g, " ").slice(0, 140);
+      if (snippet && toolFindings.length < 8) {
+        toolFindings.push(snippet);
+      }
+    }
+
     for (const call of msg.toolCalls ?? []) {
       const name = call.name;
       const args = call.args || {};
       const filePath = String(args.path || args.file_path || args.filePath || args.file || "");
 
-      if (name === "replace_in_file" || name === "edit_file" || name === "write_to_file" || name === "write_file" || name === "append_file") {
+      if (
+        name === "replace_in_file" ||
+        name === "edit_file" ||
+        name === "write_to_file" ||
+        name === "write_file" ||
+        name === "append_file" ||
+        name === "move_path" ||
+        name === "delete_file"
+      ) {
         if (filePath) {
           const notes = filesModified.get(filePath) ?? [];
-          const editDesc = args.find
-            ? `Replaced target block (${String(args.find).slice(0, 40).trim()}…)`
-            : name === "write_to_file" || name === "write_file"
-              ? "Created / overwritten file"
-              : "Updated file contents";
+          const editDesc =
+            name === "delete_file"
+              ? "Deleted file"
+              : name === "move_path"
+                ? `Moved to ${String(args.to || args.destination || "")}`
+                : args.find || args.old_str
+                  ? `Edited block (${String(args.find || args.old_str).slice(0, 40).trim()}…)`
+                  : name === "write_to_file" || name === "write_file"
+                    ? "Created / overwritten file"
+                    : "Updated file contents";
           if (!notes.includes(editDesc)) notes.push(editDesc);
           filesModified.set(filePath, notes);
         }
-      } else if (name === "read_file" || name === "search_files" || name === "find_files" || name === "list_dir") {
+      } else if (
+        name === "read_file" ||
+        name === "search_files" ||
+        name === "search_code" ||
+        name === "find_files" ||
+        name === "list_dir"
+      ) {
         if (filePath) filesInspected.add(filePath);
         if (args.pattern) filesInspected.add(`pattern: "${args.pattern}"`);
         if (args.query) filesInspected.add(`query: "${args.query}"`);
-      } else if (name === "execute_command" || name === "bash" || name === "terminal") {
+      } else if (
+        name === "execute_command" ||
+        name === "run_command" ||
+        name === "bash" ||
+        name === "terminal"
+      ) {
         const cmd = String(args.command || args.cmd || "");
         if (cmd) {
           commandsRun.push({
@@ -194,95 +273,178 @@ export function buildNativeCompactionSummary(
           });
         }
       }
+
+      if (call.status === "error" && call.error) {
+        const errNote = `Tool ${name} failed: ${String(call.error).slice(0, 120)}`;
+        if (!unresolvedItems.includes(errNote)) unresolvedItems.push(errNote);
+      } else if (call.result && typeof call.result === "string" && toolFindings.length < 8) {
+        const firstLine = call.result.trim().split(/\r?\n/)[0]?.slice(0, 120);
+        if (firstLine) {
+          toolFindings.push(`${name}${filePath ? `(${filePath})` : ""}: ${firstLine}`);
+        }
+      }
     }
 
     if (msg.role === "assistant" && msg.content) {
-      // Extract high-signal decision lines (bullet points, "I will", "Configured", "Fixed", "Implemented")
       const lines = msg.content.split(/\r?\n/);
       for (const line of lines) {
         const trimmed = line.trim();
         if (
-          /^(?:[-*]|\d+\.)\s+(?:Fixed|Implemented|Configured|Added|Updated|Verified|Resolved|Adopted|Selected|Refactored|Created)/i.test(trimmed) ||
-          /^(?:Decision|Architecture|Key finding|Root cause):/i.test(trimmed)
+          /^(?:[-*]|\d+\.)\s+(?:Fixed|Implemented|Configured|Added|Updated|Verified|Resolved|Adopted|Selected|Refactored|Created|Decided|Assumed)/i.test(
+            trimmed
+          ) ||
+          /^(?:Decision|Architecture|Key finding|Root cause|Assumption|Constraint):/i.test(trimmed) ||
+          /\b(?:decided to|assumed|chosen because|for backward compatibility)\b/i.test(trimmed)
         ) {
           const clean = trimmed.replace(/^(?:[-*]|\d+\.)\s+/, "");
-          if (clean.length > 10 && !decisions.includes(clean)) {
-            decisions.push(clean.length > 140 ? clean.slice(0, 137) + "…" : clean);
+          if (clean.length > 10 && !modelDecisions.includes(clean)) {
+            modelDecisions.push(clean.length > 150 ? clean.slice(0, 147) + "…" : clean);
+          }
+        }
+        // Unresolved todos or open questions
+        if (
+          /^[-*]\s+\[\s\]\s+/.test(trimmed) ||
+          /^(?:TODO|Remaining|Unresolved|Open question|Next step):/i.test(trimmed)
+        ) {
+          const clean = trimmed.replace(/^[-*]\s+\[\s\]\s+/, "");
+          if (clean.length > 5 && !unresolvedItems.includes(clean)) {
+            unresolvedItems.push(clean.length > 140 ? clean.slice(0, 137) + "…" : clean);
           }
         }
       }
     }
 
     if (msg.notice && (msg.notice.startsWith("⚠️") || /error|failed/i.test(msg.notice))) {
-      activeErrors.push(msg.notice.slice(0, 120));
+      const errStr = msg.notice.slice(0, 120);
+      if (!unresolvedItems.includes(errStr)) {
+        unresolvedItems.push(errStr);
+      }
     }
   }
 
-  // Construct structured Markdown brief
+  const retainedItems: CompactionRetainedItems = {
+    anchorPreserved: true,
+    taskPreserved: true,
+    userDirectivesCount: userDirectives.length,
+    constraintsCount: userDirectives.length,
+    modifiedFiles: [...filesModified.keys()],
+    modifiedFilesCount: filesModified.size,
+    inspectedFiles: [...filesInspected],
+    inspectedFilesCount: filesInspected.size,
+    commandsCount: commandsRun.length,
+    unresolvedCount: unresolvedItems.length,
+    recentMessagesKept: 0,
+  };
+
+  return {
+    userDirectives,
+    filesModified,
+    filesInspected,
+    toolFindings,
+    commandsRun,
+    modelDecisions,
+    unresolvedItems,
+    existingSummarySections,
+    retainedItems,
+  };
+}
+
+/**
+ * Deterministic Native Compaction Engine:
+ * Analyzes conversation turns without network or LLM latency.
+ * Explicitly separates:
+ * - Original task objective & user constraints
+ * - Verified Repository Facts (actual file edits, reads, command outputs, tool results)
+ * - Model Decisions & Working Assumptions (assistant statements/hypotheses)
+ * - Unresolved Questions & Active Errors
+ */
+export function buildNativeCompactionSummary(
+  messages: ChatMessage[],
+  focus?: string,
+  anchorPrompt?: string
+): string {
+  const data = extractStructuredCompactionData(messages);
   const sections: string[] = [];
 
-  // Goal & Focus
+  // 1. Original Task Objective & Scope
   if (anchorPrompt) {
-    sections.push(`### 🎯 Task Objective & Scope\n${anchorPrompt.trim()}`);
+    sections.push(`### 🎯 Original Task & Objective\n${anchorPrompt.trim()}`);
   }
   if (focus) {
     sections.push(`### 📌 Compaction Focus\n${focus.trim()}`);
   }
 
-  // Incorporate rolled-over history if present
-  if (existingSummarySections.length > 0) {
-    sections.push(`### 📜 Previous Conversation History\n${existingSummarySections.join("\n\n")}`);
+  // 2. Rolled-over History from earlier compactions
+  if (data.existingSummarySections.length > 0) {
+    sections.push(
+      `### 📜 Prior Compacted History\n${data.existingSummarySections.join("\n\n")}`
+    );
   }
 
-  // User Directives
-  if (userDirectives.length > 0) {
-    const list = userDirectives.slice(-8).map((d) => `- ${d}`).join("\n");
-    sections.push(`### 📝 User Directives & Constraints\n${list}`);
-  }
-
-  // Files Modified
-  if (filesModified.size > 0) {
-    const entries = [...filesModified.entries()]
+  // 3. User Directives & Constraints
+  if (data.userDirectives.length > 0) {
+    const list = data.userDirectives
       .slice(-12)
-      .map(([f, notes]) => `- \`${f}\`: ${notes.join("; ")}`)
+      .map((d) => `- ${d}`)
       .join("\n");
-    sections.push(`### 🛠️ Files Modified & Created\n${entries}`);
+    sections.push(`### 📝 User Instructions & Constraints\n${list}`);
   }
 
-  // Files Inspected
-  if (filesInspected.size > 0) {
-    const entries = [...filesInspected]
-      .slice(-10)
-      .map((f) => (f.startsWith("pattern:") || f.startsWith("query:") ? `- ${f}` : `- \`${f}\``))
-      .join("\n");
-    sections.push(`### 🔍 Key Files & Searches Inspected\n${entries}`);
+  // 4. Verified Repository Facts (Files Modified, Inspected, Commands, Tool Results)
+  const repoFactLines: string[] = [];
+  if (data.filesModified.size > 0) {
+    repoFactLines.push("**Files Modified / Created:**");
+    for (const [f, notes] of [...data.filesModified.entries()].slice(-15)) {
+      repoFactLines.push(`- \`${f}\`: ${notes.join("; ")}`);
+    }
+  }
+  if (data.filesInspected.size > 0) {
+    repoFactLines.push("**Files & Paths Inspected:**");
+    for (const f of [...data.filesInspected].slice(-12)) {
+      repoFactLines.push(
+        f.startsWith("pattern:") || f.startsWith("query:") ? `- ${f}` : `- \`${f}\``
+      );
+    }
+  }
+  if (data.commandsRun.length > 0) {
+    repoFactLines.push("**Commands Executed:**");
+    for (const c of data.commandsRun.slice(-8)) {
+      repoFactLines.push(
+        `- \`${c.command}\` → ${c.status === "success" ? "✓ Verified" : `✗ Failed (${c.error ?? "error"})`}`
+      );
+    }
+  }
+  if (data.toolFindings.length > 0) {
+    repoFactLines.push("**Key Tool Results:**");
+    for (const tf of data.toolFindings.slice(-6)) {
+      repoFactLines.push(`- ${tf}`);
+    }
+  }
+  if (repoFactLines.length > 0) {
+    sections.push(`### ✅ Verified Repository Facts (Ground Truth)\n${repoFactLines.join("\n")}`);
   }
 
-  // Commands Executed
-  if (commandsRun.length > 0) {
-    const entries = commandsRun
+  // 5. Model Decisions & Working Assumptions (distinguished from verified repo facts)
+  if (data.modelDecisions.length > 0) {
+    const list = data.modelDecisions
+      .slice(-8)
+      .map((d) => `- ${d}`)
+      .join("\n");
+    sections.push(`### 🧠 Model Decisions & Assumptions (Unverified Claims / Rationale)\n${list}`);
+  }
+
+  // 6. Unresolved Questions, Pending Work & Active Errors
+  if (data.unresolvedItems.length > 0) {
+    const list = data.unresolvedItems
       .slice(-6)
-      .map((c) => `- \`${c.command}\` → ${c.status === "success" ? "✓ Success" : `✗ Failed (${c.error ?? "error"})`}`)
+      .map((e) => `- ${e}`)
       .join("\n");
-    sections.push(`### 💻 Commands & Validations\n${entries}`);
+    sections.push(`### ⚠️ Unresolved Issues & Pending Items\n${list}`);
   }
 
-  // Key Technical Decisions
-  if (decisions.length > 0) {
-    const list = decisions.slice(-8).map((d) => `- ${d}`).join("\n");
-    sections.push(`### 💡 Key Technical Decisions & Progress\n${list}`);
-  }
-
-  // Active Errors / Warnings
-  if (activeErrors.length > 0) {
-    const list = activeErrors.slice(-3).map((e) => `- ⚠️ ${e}`).join("\n");
-    sections.push(`### ⚠️ Attention & Errors Noted\n${list}`);
-  }
-
-  // Fallback if very little structured data was extracted
   if (sections.length === 0) {
     sections.push(
-      `### 📋 Conversation Digest\n- Compacted ${messages.length} intermediate turns.\n- All file changes and previous test executions remain intact in the workspace.`
+      `### 📋 Conversation Digest\n- Compacted ${messages.length} intermediate turns.\n- All file changes and previous tool executions remain intact in the workspace.`
     );
   }
 
@@ -290,10 +452,31 @@ export function buildNativeCompactionSummary(
 }
 
 /**
+ * Validates whether a provider-generated summary is usable or if it should be rejected
+ * in favor of the deterministic native summary.
+ */
+export function isUsableProviderSummary(text: string | null | undefined): boolean {
+  if (!text) return false;
+  const trimmed = text.trim();
+  if (trimmed.length < 40) return false;
+  // Reject common LLM refusal or error outputs
+  if (
+    /^(?:error\b|failed\b|sorry\b|i apologize|i cannot|i'm sorry|unable to|rate limit|bad request)/i.test(
+      trimmed
+    ) ||
+    /\b(?:cannot fulfill|cannot summarize|unable to summarize|safety guidelines)\b/i.test(
+      trimmed.slice(0, 160)
+    )
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
  * Model-Assisted Compaction:
- * Attempts to summarize conversation turns using the provider's fastest/lightest model
- * (e.g. Gemini Flash Lite, Claude Haiku, GPT-4o-mini, or active model).
- * Includes timeout and error handling, seamlessly returning null if unavailable.
+ * Attempts to summarize conversation turns using the provider's fastest/lightest model.
+ * Includes timeout, output validation, and deterministic fact-preservation fallback.
  */
 export async function summarizeWithProviderModel(
   provider: LLMProvider,
@@ -304,41 +487,46 @@ export async function summarizeWithProviderModel(
   timeoutMs = 9000
 ): Promise<string | null> {
   try {
-    // Select the best lightweight summarizer model name for the provider
     const summarizerModel = chooseSummarizerModel(provider.id, model);
 
     const systemPrompt =
-      "You are Photon's context compaction engine (inspired by Claude Code & GitHub Copilot). " +
-      "Summarize the conversation history concisely, retaining all critical facts, user objectives, " +
-      "files inspected/modified, commands run, architectural choices, and pending work. " +
-      "Be dense, factual, and strictly technical. Use markdown bullet points.";
+      "You are Photon's context compaction engine. " +
+      "Summarize the conversation history concisely while preserving: " +
+      "(1) Original task & user constraints, " +
+      "(2) Verified repository facts (exact file paths read/modified, commands run, tool results), " +
+      "(3) Model decisions & assumptions (explicitly distinguished from verified repository facts), and " +
+      "(4) Unresolved questions or errors. " +
+      "Be dense, factual, and strictly technical. Use markdown sections and bullet points.";
 
-    // Convert messages to text transcript for the summarizer
     let transcript = "";
     if (anchorPrompt) transcript += `INITIAL TASK:\n${anchorPrompt}\n\n`;
     if (focus) transcript += `COMPACTION FOCUS INSTRUCTION:\n${focus}\n\n`;
     transcript += "CONVERSATION HISTORY TO COMPACT:\n";
 
     for (const m of messages) {
-      if (m.content.includes("[Context Compaction Summary]")) continue;
       const role = m.role.toUpperCase();
-      let text = m.content.slice(0, 1000);
+      let text = m.content.slice(0, 1200);
       if (m.toolCalls?.length) {
-        text += `\n[Tool calls: ${m.toolCalls.map((t) => `${t.name}(${JSON.stringify(t.args)})`).join(", ")}]`;
+        text += `\n[Tool calls: ${m.toolCalls
+          .map((t) => `${t.name}(${JSON.stringify(t.args)})${t.status === "error" ? ` -> ERROR: ${t.error}` : ""}`)
+          .join(", ")}]`;
       }
       transcript += `${role}: ${text}\n`;
     }
 
-    // Limit input transcript to ~6000 chars to ensure lightning-fast completion
-    if (transcript.length > 6000) {
-      transcript = transcript.slice(0, 3000) + "\n... [intermediate turns omitted for summary] ...\n" + transcript.slice(-3000);
+    // Preserve head and tail if transcript is very long
+    if (transcript.length > 8000) {
+      transcript =
+        transcript.slice(0, 4000) +
+        "\n... [middle turns condensed] ...\n" +
+        transcript.slice(-4000);
     }
 
     const llmMessages: LLMMessage[] = [
       { role: "system", content: systemPrompt },
       {
         role: "user",
-        content: `Please synthesize this conversation into an ultra-dense, structured context compaction digest:\n\n${transcript}`,
+        content: `Synthesize this conversation into a structured context compaction digest:\n\n${transcript}`,
       },
     ];
 
@@ -348,7 +536,7 @@ export async function summarizeWithProviderModel(
     let result = "";
     try {
       for await (const chunk of provider.chatStream(
-        { model: summarizerModel, messages: llmMessages, options: { num_predict: 800 } },
+        { model: summarizerModel, messages: llmMessages, options: { num_predict: 900 } },
         controller.signal
       )) {
         if (chunk.message?.content) result += chunk.message.content;
@@ -357,13 +545,28 @@ export async function summarizeWithProviderModel(
       clearTimeout(timeout);
     }
 
-    const trimmed = result.trim();
-    if (trimmed.length > 40) {
-      return trimmed;
+    if (!isUsableProviderSummary(result)) {
+      return null;
     }
-    return null;
+
+    let finalSummary = result.trim();
+
+    // Ensure critical repository facts (modified file paths & anchor goal) are never lost
+    // even if the provider model forgot to mention a file path.
+    const data = extractStructuredCompactionData(messages);
+    const missingModFiles = [...data.filesModified.keys()].filter(
+      (f) => !finalSummary.includes(f)
+    );
+    if (missingModFiles.length > 0) {
+      const fileLines = missingModFiles
+        .map((f) => `- \`${f}\`: ${(data.filesModified.get(f) ?? []).join("; ")}`)
+        .join("\n");
+      finalSummary += `\n\n### 🛠️ Verified Modified Files (Retained)\n${fileLines}`;
+    }
+
+    return finalSummary;
   } catch {
-    // Graceful fallback to native compactor
+    // Graceful fallback to native compactor on timeout, network error, or crash
     return null;
   }
 }
@@ -396,7 +599,7 @@ function chooseSummarizerModel(providerId: string, activeModel: string): string 
 /**
  * Main compaction orchestrator:
  * Executes automatic or manual context compaction on session messages.
- * Automatically chooses between provider-assisted summarization and native deterministic compaction.
+ * Preserves anchor task, tool-call/result pairing, role alternation, and repository facts.
  */
 export async function compactSessionMessages(options: CompactionOptions): Promise<CompactionResult> {
   const {
@@ -408,8 +611,10 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
     focus,
     threshold = DEFAULT_AUTO_COMPACT_THRESHOLD,
     recentTurnsToKeep,
+    keepRecentUserTurns,
   } = options;
 
+  const effectiveRecentTurns = recentTurnsToKeep ?? keepRecentUserTurns;
   const tokensBefore = estimateMessagesTokens(messages, model);
 
   // Check if compaction is required / allowed
@@ -428,7 +633,7 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
     };
   }
 
-  const candidates = extractCompactionCandidates(messages, recentTurnsToKeep);
+  const candidates = extractCompactionCandidates(messages, effectiveRecentTurns);
   if (!candidates.canCompact) {
     return {
       compacted: false,
@@ -446,6 +651,7 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
 
   const { anchor, toCompact, recent } = candidates;
   const anchorText = anchor ? anchor.content : undefined;
+  const structuredData = extractStructuredCompactionData(toCompact);
 
   let summary: string | null = null;
   let strategy: "provider-model" | "native-heuristic" = "native-heuristic";
@@ -462,15 +668,55 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
     strategy = "native-heuristic";
   }
 
-  // Determine role for compaction message:
-  // Anthropic requires strictly alternating user/assistant turns.
-  // If `recent[0]` is user, compaction message should be assistant; otherwise user.
-  const nextRole: Role = recent.length > 0 && recent[0].role === "user" ? "assistant" : "user";
+  const keepAnchor = Boolean(anchor && !anchor.content.includes("[Context Compaction Summary]"));
 
-  const tokensSavedEstimate = Math.max(0, estimateMessagesTokens(toCompact, model) - estimateTokens(summary));
-  const pctSaved = contextWindow > 0 ? Math.min(100, Math.round((tokensSavedEstimate / contextWindow) * 100)) : 0;
+  // Determine role for compaction message to preserve valid user/assistant ordering:
+  // If anchor (role="user") is kept, the message immediately following anchor should be "assistant".
+  // Otherwise, if recent[0] is "user", compaction message is "assistant"; else "user".
+  const nextRole: Role = keepAnchor
+    ? "assistant"
+    : recent.length > 0 && recent[0].role === "user"
+      ? "assistant"
+      : "user";
 
-  const compactionNotice = `⚡ Context compacted: ${toCompact.length} messages compressed · Freed ~${formatCompactTokens(tokensSavedEstimate)} tokens (${pctSaved}% of window)`;
+  const tokensSavedEstimate = Math.max(
+    0,
+    estimateMessagesTokens(toCompact, model) - estimateTokens(summary)
+  );
+  const pctSaved =
+    contextWindow > 0 ? Math.min(100, Math.round((tokensSavedEstimate / contextWindow) * 100)) : 0;
+
+  const retained: CompactionRetainedItems = {
+    anchorPreserved: keepAnchor,
+    taskPreserved: keepAnchor,
+    userDirectivesCount: structuredData.userDirectives.length,
+    constraintsCount: structuredData.userDirectives.length,
+    modifiedFiles: [...structuredData.filesModified.keys()],
+    modifiedFilesCount: structuredData.filesModified.size,
+    inspectedFiles: [...structuredData.filesInspected],
+    inspectedFilesCount: structuredData.filesInspected.size,
+    commandsCount: structuredData.commandsRun.length,
+    unresolvedCount: structuredData.unresolvedItems.length,
+    recentMessagesKept: recent.length,
+  };
+
+  const triggerDesc = force
+    ? "manual /compact"
+    : `auto ≥${Math.round(threshold * 100)}% of ${formatCompactTokens(contextWindow)} window`;
+
+  const retainedDescParts: string[] = ["task"];
+  if (retained.modifiedFiles.length > 0) {
+    retainedDescParts.push(`${retained.modifiedFiles.length} modified file(s)`);
+  }
+  if (retained.userDirectivesCount > 0) {
+    retainedDescParts.push(`${retained.userDirectivesCount} directive(s)`);
+  }
+  retainedDescParts.push(`${recent.length} recent msg(s)`);
+
+  const compactionNotice =
+    `⚡ Context compacted (${triggerDesc}): ${toCompact.length} msgs compressed · ` +
+    `Freed ~${formatCompactTokens(tokensSavedEstimate)} tokens (${pctSaved}%) · ` +
+    `Retained ${retainedDescParts.join(", ")}`;
 
   const compactionMessage: ChatMessage = {
     id: randomUUID(),
@@ -490,7 +736,7 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
   // Assemble new message history:
   // [Anchor (if preserved), Compaction Message, ...Recent Turns]
   const newMessages: ChatMessage[] = [];
-  if (anchor && (!anchor.content.includes("[Context Compaction Summary]"))) {
+  if (keepAnchor && anchor) {
     newMessages.push(anchor);
   }
   newMessages.push(compactionMessage);
@@ -498,7 +744,8 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
 
   const tokensAfter = estimateMessagesTokens(newMessages, model);
   const realTokensSaved = Math.max(0, tokensBefore - tokensAfter);
-  const realPctSaved = contextWindow > 0 ? Math.min(100, Math.round((realTokensSaved / contextWindow) * 100)) : 0;
+  const realPctSaved =
+    contextWindow > 0 ? Math.min(100, Math.round((realTokensSaved / contextWindow) * 100)) : 0;
 
   return {
     compacted: true,
@@ -511,6 +758,8 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
     pctSaved: realPctSaved,
     strategy,
     summary,
+    compactionNotice,
+    retained,
     newMessages,
   };
 }

@@ -52,27 +52,46 @@ export const runCommandTool:Tool={
       toolCall.risk = "critical";
       toolCall.statusDetail = `High-risk action: ${secAnalysis.reason}`;
     }
-    const approved=await ctx.requestApproval(toolCall);if(!approved)return toolError("permission_denied", secAnalysis.isDangerous ? `User declined high-risk action: ${secAnalysis.reason}` : "User declined to run the command.");
+    const approved=await ctx.requestApproval(toolCall);
+    if(ctx.signal.aborted)return toolError("execution_error","Command cancelled.");
+    if(!approved)return toolError("permission_denied", secAnalysis.isDangerous ? `User declined high-risk action: ${secAnalysis.reason}` : "User declined to run the command.");
     ctx.log(`$ ${command}`);
-    return new Promise(resolve=>{let child:ReturnType<typeof exec>|undefined;const onAbort=()=>child?.kill();child=exec(command,{cwd,timeout:timeoutMs,maxBuffer:MAX_BUFFER,windowsHide:true},(error,stdout,stderr)=>{
-      ctx.signal.removeEventListener("abort",onAbort);
-      const rawOut=[stdout,stderr].filter(Boolean).join("\n").trim();
-      // §4: Truncate run_command output to ~80 lines
-      const out=clampLines(rawOut,80);
+    return new Promise(resolve=>{
       if(ctx.signal.aborted)return resolve(toolError("execution_error","Command cancelled."));
-      if(error&&(error as {killed?:boolean}).killed)return resolve(toolError("timeout",`Command timed out after ${Math.round(timeoutMs/1000)}s.\n${clampToolResult(out)}`,{retryable:true,recovery:{action:"retry"}}));
-      const code=error?((error as unknown as {code?:number}).code??1):0;
-      const header=`Exit code ${code}.`;
-      const outputText = `${header}\n${clampToolResult(out||error?.message||"(no output)")}`;
-      if(code!==0) {
-        // Return full stdout/stderr with retryable metadata so the model can inspect error traces and repair.
-        return resolve(toolError("execution_error", outputText, {
-          retryable: true,
-          recovery: { action: "repair", hints: ["Inspect the output/stderr above, fix errors, and re-run"] }
-        }));
-      }
-      resolve(ok(outputText,{metadata:{evidence:[`command exited 0: ${command}`]}}));
-    });ctx.signal.addEventListener("abort",onAbort,{once:true});});
+      let settled=false;
+      const finish=(res:ReturnType<typeof ok>)=>{if(settled)return;settled=true;resolve(res);};
+      let child:ReturnType<typeof exec>|undefined;
+      const onAbort=()=>{
+        if(child){
+          try{child.stdout?.destroy();child.stderr?.destroy();child.stdin?.destroy();}catch{/* ignore */}
+          try{child.kill();}catch{/* ignore */}
+          if(process.platform==="win32"&&child.pid){
+            try{exec(`taskkill /pid ${child.pid} /T /F`,{windowsHide:true});}catch{/* ignore */}
+          }
+        }
+        finish(toolError("execution_error","Command cancelled."));
+      };
+      child=exec(command,{cwd,timeout:timeoutMs,maxBuffer:MAX_BUFFER,windowsHide:true},(error,stdout,stderr)=>{
+        ctx.signal.removeEventListener("abort",onAbort);
+        if(settled||ctx.signal.aborted)return finish(toolError("execution_error","Command cancelled."));
+        const rawOut=[stdout,stderr].filter(Boolean).join("\n").trim();
+        // §4: Truncate run_command output to ~80 lines
+        const out=clampLines(rawOut,80);
+        if(error&&(error as {killed?:boolean}).killed)return finish(toolError("timeout",`Command timed out after ${Math.round(timeoutMs/1000)}s.\n${clampToolResult(out)}`,{retryable:true,recovery:{action:"retry"}}));
+        const code=error?((error as unknown as {code?:number}).code??1):0;
+        const header=`Exit code ${code}.`;
+        const outputText = `${header}\n${clampToolResult(out||error?.message||"(no output)")}`;
+        if(code!==0) {
+          // Return full stdout/stderr with retryable metadata so the model can inspect error traces and repair.
+          return finish(toolError("execution_error", outputText, {
+            retryable: true,
+            recovery: { action: "repair", hints: ["Inspect the output/stderr above, fix errors, and re-run"] }
+          }));
+        }
+        finish(ok(outputText,{metadata:{evidence:[`command exited 0: ${command}`]}}));
+      });
+      ctx.signal.addEventListener("abort",onAbort,{once:true});
+    });
   },
 };
 function mkCall(command:string,args:Record<string,unknown>,existingId?:string):ToolCall{return{id:existingId??randomUUID(),name:"run_command",args:{...args,command},status:"proposed",sideEffecting:true};}

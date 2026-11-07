@@ -28,8 +28,9 @@ export interface TokenUsage{used:number;window:number;breakdown:{label:string;to
 export type ComplexityLevel="simple"|"moderate"|"complex";
 export interface ComplexitySignals{filesReferenced:number;estimatedSteps:number;keywords:string[];promptTokens:number;scope?:TaskAnalysis["scope"];reasoning?:TaskAnalysis["reasoning"];risk?:TaskAnalysis["risk"];verification?:VerificationKind[];ambiguity?:TaskAnalysis["ambiguity"];}
 export interface ComplexityAssessment{level:ComplexityLevel;minContextTokens:number;signals:ComplexitySignals;task?:TaskAnalysis;}
-export interface ModelScore{model:string;score:number;fits:boolean;reasons:string[];}
-export interface AutoDecision{chosenModel:string;auto:boolean;pinned:boolean;complexity:ComplexityAssessment;scores:ModelScore[];reason:string;}
+export interface RoutingSignalBreakdown{taskComplexity:ComplexityLevel;contextFit:boolean;toolReliability:number;hardwareFit:"gpu"|"hybrid"|"cpu"|"cloud"|"tight";estimatedCostPer1MUsd:number;isCloud:boolean;}
+export interface ModelScore{model:string;score:number;fits:boolean;reasons:string[];signals?:RoutingSignalBreakdown;}
+export interface AutoDecision{chosenModel:string;auto:boolean;pinned:boolean;complexity:ComplexityAssessment;scores:ModelScore[];reason:string;signals?:RoutingSignalBreakdown;fallbackModels?:string[];cloudEscalated?:boolean;previousModel?:string;escalationNotice?:string;}
 export type BenchTaskId="throughput"|"toolcall"|"schema"|"tool_selection"|"recovery"|"edit"|"verification"|"context"|"reasoning";
 export interface BenchTaskOutcome{id:BenchTaskId;passed:boolean;detail:string;}
 export interface BenchResult{model:string;quantization?:string;hardwareClass:string;methodologyVersion:number;tokensPerSec:number;firstTokenMs:number;toolCallReliability:number;reasoningPass:boolean;tasks:BenchTaskOutcome[];ranAt:number;capabilityProfile?:ModelCapabilityProfile;}
@@ -129,8 +130,20 @@ export interface ModelRecommendation {
   tier: "light" | "sweet" | "high";
   fit: FitAssessment;
   installed: boolean;
+  /** Actual installed model tag on the system when matched (e.g. "qwen2.5-coder:latest"). */
+  installedName?: string;
   recommended: boolean;
   quality: number;
+}
+export interface InstalledModelEvaluation {
+  name: string;
+  label: string;
+  sizeGb: number;
+  capabilities: ModelCapability[];
+  fit: FitAssessment;
+  recommended: boolean;
+  quality: number;
+  reason: string;
 }
 export interface RecommendationSet {
   hardware: HardwareSummary;
@@ -139,4 +152,118 @@ export interface RecommendationSet {
   models: ModelRecommendation[];
   recommendedName?: string;
   headline: string;
+  evaluatedInstalled?: InstalledModelEvaluation[];
+  bestInstalledName?: string;
 }
+
+/** Determine whether a model is locally hosted (Ollama / llama.cpp) vs cloud. */
+export function isLocalModel(m: { name?: string; provider?: string } | null | undefined): boolean {
+  if (!m) return true;
+  if (m.provider) {
+    return m.provider === "ollama" || m.provider === "llamacpp";
+  }
+  if (m.name && m.name.includes(":")) {
+    const prefix = m.name.split(":")[0].toLowerCase();
+    if (
+      prefix === "anthropic" ||
+      prefix === "claude" ||
+      prefix === "openai" ||
+      prefix === "gemini" ||
+      prefix === "groq" ||
+      prefix === "nvidia" ||
+      prefix === "mistral" ||
+      prefix === "together" ||
+      prefix === "deepseek" ||
+      prefix === "openrouter" ||
+      prefix === "opencode" ||
+      prefix === "blackbox" ||
+      prefix === "fireworks" ||
+      prefix === "xai" ||
+      prefix === "cerebras" ||
+      prefix.startsWith("custom")
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const DEFAULT_LATEST_TAGS: Record<string, string> = {
+  "qwen2.5-coder": "7b",
+  "qwen3": "8b",
+  "deepseek-r1": "8b",
+  "deepseek-coder": "6.7b",
+  "deepseek-coder-v2": "16b",
+  "llama3.1": "8b",
+  "llama3.2": "3b",
+  "llama3": "8b",
+  "gemma4": "e4b",
+  "gemma3": "4b",
+  "gemma2": "9b",
+  "mistral": "7b",
+  "codellama": "7b",
+  "starcoder2": "7b",
+  "command-r": "35b",
+  "phi3": "3.8b",
+  "phi4": "14b",
+};
+
+function parseModelParts(rawName: string): { raw: string; stripped: string; family: string; tag: string; baseTag: string } {
+  const raw = rawName.trim();
+  const lower = raw.toLowerCase().replace(/^(ollama|llamacpp):/, "");
+  const colonIdx = lower.indexOf(":");
+  const familyFull = colonIdx >= 0 ? lower.slice(0, colonIdx) : lower;
+  const slashIdx = familyFull.lastIndexOf("/");
+  const family = slashIdx >= 0 ? familyFull.slice(slashIdx + 1) : familyFull;
+  const tag = colonIdx >= 0 ? lower.slice(colonIdx + 1) : "latest";
+  // Normalize quantization / instruct suffixes on tags, e.g. "7b-instruct-q4_k_m" -> "7b"
+  const baseTagMatch = tag.match(/^([a-z]?\d+(?:\.\d+)?b)(?:[-_].*)?$/i);
+  const baseTag = baseTagMatch ? baseTagMatch[1].toLowerCase() : tag;
+  return { raw, stripped: lower, family, tag, baseTag };
+}
+
+/**
+ * Matches a target model name (e.g. "qwen2.5-coder:7b") against a set of installed model names,
+ * handling provider prefixes ("ollama:"), quantization suffixes ("-instruct-q4_K_M"), and
+ * Ollama's default ":latest" tag mapping (e.g. "qwen2.5-coder:latest" <-> "qwen2.5-coder:7b").
+ * Returns the actual installed model name if matched, or undefined.
+ */
+export function matchInstalledModelName(
+  targetName: string,
+  installedNames: Iterable<string>,
+): string | undefined {
+  if (!targetName) return undefined;
+  const target = parseModelParts(targetName);
+  const entries = Array.from(installedNames);
+
+  // 1. Exact case-insensitive match or stripped match
+  for (const inst of entries) {
+    const p = parseModelParts(inst);
+    if (p.raw.toLowerCase() === target.raw.toLowerCase() || p.stripped === target.stripped) {
+      return inst;
+    }
+  }
+
+  // 2. Same family + normalized base parameter tag (e.g. "7b-instruct-q4_K_M" == "7b")
+  // or default ":latest" tag equivalence for that family
+  for (const inst of entries) {
+    const p = parseModelParts(inst);
+    if (p.family !== target.family) continue;
+    if (p.baseTag === target.baseTag) {
+      return inst;
+    }
+    const defaultTag = DEFAULT_LATEST_TAGS[target.family];
+    if (defaultTag) {
+      if (
+        (p.tag === "latest" && target.baseTag === defaultTag) ||
+        (target.tag === "latest" && p.baseTag === defaultTag)
+      ) {
+        return inst;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+

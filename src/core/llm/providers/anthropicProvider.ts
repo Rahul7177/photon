@@ -159,8 +159,9 @@ export class AnthropicProvider implements LLMProvider {
       push(m.role === "assistant" ? "assistant" : "user", m.content);
     }
 
+    const wireModel = req.model.startsWith("claude:") ? req.model.slice("claude:".length) : req.model;
     const body: Record<string, unknown> = {
-      model: req.model,
+      model: wireModel,
       max_tokens:
         req.options?.num_predict && req.options.num_predict > 0
           ? req.options.num_predict

@@ -13,6 +13,39 @@ function fmtUsd(usd?: number): string {
   return `$${usd.toFixed(3)}`;
 }
 
+function describeRuntimeCompatibility(gpuPercent: number): {
+  badge: string;
+  detail: string;
+  tone: "ok" | "warn" | "crit";
+} {
+  if (gpuPercent >= 95) {
+    return {
+      badge: `✓ Fits in VRAM (${gpuPercent}% GPU)`,
+      detail: "Running entirely in GPU memory for optimal token generation speed.",
+      tone: "ok",
+    };
+  }
+  if (gpuPercent >= 50) {
+    return {
+      badge: `◐ Requires Offloading (${gpuPercent}% GPU)`,
+      detail: "Split across GPU VRAM and system RAM; expect moderate generation speed.",
+      tone: "warn",
+    };
+  }
+  if (gpuPercent > 0) {
+    return {
+      badge: `⚠ Heavy Offload (${gpuPercent}% GPU)`,
+      detail: "Mostly offloaded to system RAM; may run slowly on long contexts.",
+      tone: "crit",
+    };
+  }
+  return {
+    badge: "○ CPU / System RAM Only",
+    detail: "Running on CPU and system RAM without GPU acceleration; may run slowly.",
+    tone: "warn",
+  };
+}
+
 export function HardwareMetricsModal({
   state,
   actions,
@@ -36,6 +69,14 @@ export function HardwareMetricsModal({
     return () => window.clearInterval(timer);
   }, [actions]);
 
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
   const hw = state.hardwareMetrics;
   const gpuName = hw?.gpuName ?? state.machine?.gpu?.name ?? "GPU";
   const gpuUtil = hw?.gpuUtilPercent;
@@ -54,6 +95,9 @@ export function HardwareMetricsModal({
     (ramTotal > 0 ? Math.min(100, Math.round((ramUsed / ramTotal) * 100)) : 0);
 
   const cu = state.cloudUsage;
+  const localModels = state.models.filter(
+    (m) => !m.provider || m.provider === "ollama" || m.provider === "llamacpp"
+  );
 
   return (
     <div className="hw-modal-backdrop" onClick={onClose}>
@@ -66,18 +110,20 @@ export function HardwareMetricsModal({
       >
         <div className="hw-modal-header">
           <div className="hw-modal-title-wrap">
-            <span className="hw-modal-icon">
+            <span className="hw-modal-icon" aria-hidden="true">
               <ChartIcon />
             </span>
             <span id="hw-modal-title" className="hw-modal-title">
-              Telemetry
+              Hardware &amp; Telemetry
             </span>
           </div>
 
           <div className="ctx-modal-head-actions">
-            <div className="iface-toggle">
+            <div className="iface-toggle" role="tablist" aria-label="Telemetry view">
               <button
                 type="button"
+                role="tab"
+                aria-selected={viewTab === "local"}
                 className={viewTab === "local" ? "active" : ""}
                 onClick={() => setViewTab("local")}
               >
@@ -85,13 +131,21 @@ export function HardwareMetricsModal({
               </button>
               <button
                 type="button"
+                role="tab"
+                aria-selected={viewTab === "cloud"}
                 className={viewTab === "cloud" ? "active" : ""}
                 onClick={() => setViewTab("cloud")}
               >
                 Cloud
               </button>
             </div>
-            <button className="icon-btn" onClick={onClose} title="Close">
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={onClose}
+              title="Close (Esc)"
+              aria-label="Close Hardware and Telemetry modal"
+            >
               <CloseIcon />
             </button>
           </div>
@@ -100,16 +154,17 @@ export function HardwareMetricsModal({
         <div className="hw-modal-body">
           {viewTab === "local" ? (
             <>
-              {/* Compact Hardware Bars */}
+              {/* Live Measured Hardware Summary */}
+              <div className="hw-section-title">Live System Telemetry (Measured)</div>
               <div className="hw-metric-card">
                 <div className="hw-metric-head">
                   <span className="hw-metric-label">{gpuName}</span>
                   <span className="hw-metric-val">
-                    {gpuUtil !== undefined ? `${gpuUtil}%` : "N/A"}
+                    {gpuUtil !== undefined ? `${gpuUtil}% util` : "No live sensor"}
                     {hw?.gpuTempC !== undefined ? ` · ${hw.gpuTempC}°C` : ""}
                   </span>
                 </div>
-                <div className="hw-metric-bar">
+                <div className="hw-metric-bar" aria-hidden="true">
                   <div
                     className="hw-metric-fill gpu-compute"
                     style={{ width: `${gpuUtil ?? 0}%` }}
@@ -119,16 +174,16 @@ export function HardwareMetricsModal({
 
               <div className="hw-metric-card">
                 <div className="hw-metric-head">
-                  <span className="hw-metric-label">VRAM</span>
+                  <span className="hw-metric-label">GPU VRAM</span>
                   <span className="hw-metric-val">
                     {vramUsed !== undefined && vramTotal !== undefined
                       ? `${fmtGb(vramUsed)} / ${fmtGb(vramTotal)} (${vramPercent}%)`
                       : vramTotal !== undefined
-                        ? `${fmtGb(vramTotal)}`
-                        : "N/A"}
+                        ? `${fmtGb(vramTotal)} total (est.)`
+                        : "Shared / Unified"}
                   </span>
                 </div>
-                <div className="hw-metric-bar">
+                <div className="hw-metric-bar" aria-hidden="true">
                   <div
                     className={`hw-metric-fill ${
                       (vramPercent ?? 0) > 90
@@ -153,7 +208,7 @@ export function HardwareMetricsModal({
                       : "N/A"}
                   </span>
                 </div>
-                <div className="hw-metric-bar">
+                <div className="hw-metric-bar" aria-hidden="true">
                   <div
                     className={`hw-metric-fill ${
                       ramPercent > 88 ? "crit" : ramPercent > 75 ? "warn" : "ok"
@@ -165,26 +220,38 @@ export function HardwareMetricsModal({
 
               {/* Active Models in Memory */}
               <div className="hw-models-section">
-                <div className="hw-section-title">Loaded in Memory</div>
+                <div className="hw-section-title">Loaded in Runtime Memory (Measured)</div>
                 {state.ollamaRuntime.length === 0 ? (
-                  <div className="hw-empty-note">No model currently loaded in memory.</div>
+                  <div className="hw-empty-note">
+                    No model is currently resident in Ollama memory. A model loads automatically on your next local prompt.
+                  </div>
                 ) : (
                   state.ollamaRuntime.map((rt) => {
                     const isConfirming = confirmUnloadModel === rt.name;
+                    const compat = describeRuntimeCompatibility(rt.gpuPercent);
                     return (
                       <div key={rt.name} className="hw-model-card">
                         <div className="hw-model-row">
                           <div>
                             <div className="hw-model-name">{rt.name}</div>
                             <div className="hw-model-meta">
-                              <span className={rt.gpuPercent >= 95 ? "hw-tag-ok" : "hw-tag-warn"}>
-                                {rt.gpuPercent}% GPU
+                              <span
+                                className={
+                                  compat.tone === "ok"
+                                    ? "hw-tag-ok"
+                                    : compat.tone === "crit"
+                                      ? "hw-tag-crit"
+                                      : "hw-tag-warn"
+                                }
+                              >
+                                {compat.badge}
                               </span>
-                              <span>· {fmtGb(rt.sizeBytes)}</span>
+                              <span>· {fmtGb(rt.sizeBytes)} footprint</span>
                               {rt.contextLength > 0 && (
                                 <span>· {Math.round(rt.contextLength / 1024)}k ctx</span>
                               )}
                             </div>
+                            <div className="hw-compat-note">{compat.detail}</div>
                           </div>
                           {isConfirming ? (
                             <div className="hw-confirm-inline">
@@ -211,6 +278,7 @@ export function HardwareMetricsModal({
                               type="button"
                               className="btn btn-sm"
                               onClick={() => setConfirmUnloadModel(rt.name)}
+                              aria-label={`Unload ${rt.name} from memory`}
                             >
                               Unload
                             </button>
@@ -221,12 +289,54 @@ export function HardwareMetricsModal({
                   })
                 )}
               </div>
+
+              {/* Hardware Compatibility & Benchmarks for Installed Local Models */}
+              {localModels.length > 0 && (
+                <div className="hw-models-section">
+                  <div className="hw-section-title">Installed Model Compatibility &amp; Speed</div>
+                  {localModels.slice(0, 6).map((m) => {
+                    const bench = state.benchResults.find((b) => b.model === m.name);
+                    const rec = state.recommendations?.models.find(
+                      (r) => r.name.toLowerCase() === m.name.toLowerCase()
+                    );
+                    const estBytes = m.sizeBytes ?? (m.paramsB ? m.paramsB * 0.65 * 1024 ** 3 : 0);
+                    const fitLabel = rec
+                      ? rec.fit.label
+                      : vramTotal && estBytes > 0 && estBytes <= vramTotal * 0.85
+                        ? "Fits in VRAM"
+                        : ramTotal > 0 && estBytes > 0 && estBytes <= ramTotal * 0.65
+                          ? "Requires CPU/RAM offload"
+                          : estBytes > 0
+                            ? "May run slowly (high memory footprint)"
+                            : "Compatible";
+                    return (
+                      <div key={m.name} className="hw-model-card">
+                        <div className="hw-model-row">
+                          <span className="hw-model-name">{m.name}</span>
+                          {bench ? (
+                            <span className="hw-tag-ok" title="Measured via Photon Bench on this machine">
+                              Measured: {Math.round(bench.tokensPerSec)} tok/s
+                            </span>
+                          ) : (
+                            <span className="hw-model-meta">Est. fit</span>
+                          )}
+                        </div>
+                        <div className="hw-model-meta">
+                          <span>{fitLabel}</span>
+                          {m.sizeBytes ? <span>· {fmtGb(m.sizeBytes)}</span> : null}
+                          {m.contextLength ? <span>· {Math.round(m.contextLength / 1024)}k max ctx</span> : null}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </>
           ) : (
             <>
               <div className="cloud-stat-grid">
                 <div className="cloud-stat-item">
-                  <span className="cloud-stat-k">Session Tokens</span>
+                  <span className="cloud-stat-k">Session Tokens (Measured)</span>
                   <span className="cloud-stat-v">
                     {(
                       (cu?.sessionInputTokens ?? 0) + (cu?.sessionOutputTokens ?? 0)
@@ -234,24 +344,24 @@ export function HardwareMetricsModal({
                   </span>
                 </div>
                 <div className="cloud-stat-item">
-                  <span className="cloud-stat-k">Session Cost</span>
+                  <span className="cloud-stat-k">Est. Session Cost</span>
                   <span className="cloud-stat-v">{fmtUsd(cu?.sessionEstimatedCostUsd)}</span>
                 </div>
                 <div className="cloud-stat-item">
-                  <span className="cloud-stat-k">Tokens Saved</span>
+                  <span className="cloud-stat-k">Est. Tokens Saved</span>
                   <span className="cloud-stat-v hw-tag-ok">
                     +{(cu?.totalSavedTokens ?? 0).toLocaleString()}
                   </span>
                 </div>
                 <div className="cloud-stat-item">
-                  <span className="cloud-stat-k">Total Cost</span>
+                  <span className="cloud-stat-k">Est. Total Cost</span>
                   <span className="cloud-stat-v">{fmtUsd(cu?.totalEstimatedCostUsd)}</span>
                 </div>
               </div>
 
               <div className="hw-models-section">
                 <div className="hw-metric-head">
-                  <span className="hw-section-title">Usage by Model</span>
+                  <span className="hw-section-title">Usage by Cloud Model</span>
                   {(cu?.byModel.length ?? 0) > 0 && (
                     confirmResetCloud ? (
                       <div className="hw-confirm-inline">
@@ -292,7 +402,9 @@ export function HardwareMetricsModal({
                     <div key={m.model} className="hw-model-card">
                       <div className="hw-model-row">
                         <span className="hw-model-name">{m.model}</span>
-                        <span className="hw-metric-val">{fmtUsd(m.estimatedCostUsd)}</span>
+                        <span className="hw-metric-val" title="Estimated from published per-million-token pricing">
+                          ~{fmtUsd(m.estimatedCostUsd)}
+                        </span>
                       </div>
                       <div className="hw-model-meta">
                         <span>{m.turns} turns</span>
@@ -300,7 +412,7 @@ export function HardwareMetricsModal({
                         <span>· {m.outputTokens.toLocaleString()} out</span>
                         {m.savedTokens > 0 && (
                           <span className="hw-tag-ok">
-                            · {m.savedTokens.toLocaleString()} saved
+                            · ~{m.savedTokens.toLocaleString()} saved
                           </span>
                         )}
                       </div>

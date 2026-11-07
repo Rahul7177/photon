@@ -4,6 +4,7 @@ import type { Actions } from "../state/store";
 import { Markdown } from "./Markdown";
 import { TurnProcess } from "./TurnProcess";
 import { AttachmentThumb, MessageActions, NoticeBubble, CheckpointPill, hasVisibleText } from "./Message";
+import { ClaudeThinkingIndicator } from "./StatusIndicator";
 
 /**
  * Renders an entire assistant turn (which may span multiple agentic steps,
@@ -37,7 +38,7 @@ export const AssistantTurn = memo(function AssistantTurn({
     if (hasVisibleText(m.notice)) notices.push(m.notice!);
   }
 
-  const showCursor = isStreaming && !hasContent && !hasThinking && !hasTools;
+  const showThinking = isStreaming && !hasContent && !hasTools;
 
   // Nothing to paint at all
   if (
@@ -46,7 +47,7 @@ export const AssistantTurn = memo(function AssistantTurn({
     !hasThinking &&
     !hasTools &&
     !notices.length &&
-    !showCursor
+    !showThinking
   ) {
     return null;
   }
@@ -86,9 +87,9 @@ export const AssistantTurn = memo(function AssistantTurn({
         );
       })}
 
-      {showCursor && (
+      {showThinking && (
         <div className="msg-body">
-          <span className="cursor-blink" />
+          <ClaudeThinkingIndicator label={hasThinking ? "Thinking..." : "Generating..."} />
         </div>
       )}
 

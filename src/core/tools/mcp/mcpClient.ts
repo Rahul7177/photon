@@ -2,6 +2,8 @@
 // Supports servers that reply with either application/json or text/event-stream.
 // Intentionally small and tolerant — it's a bridge, not a full SDK.
 
+import { validateRemoteEndpoint, type DnsLookupFn } from "./dnsValidator";
+
 export interface McpTool {
   name: string;
   description?: string;
@@ -26,10 +28,18 @@ export class McpClient {
 
   constructor(
     private readonly url: string,
-    private readonly headers: Record<string, string> = {}
+    private readonly headers: Record<string, string> = {},
+    private readonly allowLocalNetwork = false,
+    private readonly customLookup?: DnsLookupFn
   ) {}
 
   async connect(timeoutMs = 8000): Promise<void> {
+    // 1. Validate remote destination at connection time to block private/link-local/loopback destinations
+    const check = await validateRemoteEndpoint(this.url, this.allowLocalNetwork, this.customLookup);
+    if (!check.ok) {
+      throw new Error(`MCP connection blocked: ${check.reason}`);
+    }
+
     const result = (await this.rpc(
       "initialize",
       {
@@ -119,6 +129,10 @@ export class McpClient {
         const orig = new URL(url);
         if (next.protocol !== "https:" || next.hostname.toLowerCase() !== orig.hostname.toLowerCase()) {
           throw new Error("Blocked MCP redirect to a different host.");
+        }
+        const redirectCheck = await validateRemoteEndpoint(next.toString(), this.allowLocalNetwork, this.customLookup);
+        if (!redirectCheck.ok) {
+          throw new Error(`Blocked unsafe MCP redirect: ${redirectCheck.reason}`);
         }
         url = next.toString();
         continue;

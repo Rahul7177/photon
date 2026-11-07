@@ -1,322 +1,327 @@
 # Photon — Comprehensive Documentation
 
-> Version 0.1.0 · VS Code `^1.90.0` · License MIT
-> Agentic coding with small local LLMs — tuned so low-end models actually cope,
-> with cloud frontier models available as BYOK overflow.
+> Version 0.1.0 · VS Code `^1.90.0` · License MIT  
+> Agentic coding with small local LLMs — tuned so low-end models actually cope, with cloud frontier models available as BYOK overflow.
 
-This document is a complete inventory of what Photon implements, how it is
-architected, the design theme it uses, and how to build / configure / extend it.
-It reflects the codebase as shipped in `photon-0.1.0.vsix` (312 KB, 14 files).
+This document is a complete inventory of what Photon implements, how it is architected, the design theme it uses, and how to build, configure, test, and extend it.
 
 ---
 
 ## 1. Overview & Philosophy
 
-Photon flips the usual AI-extension priorities: instead of designing for
-frontier cloud models and bolting local support on afterwards, it is built
-**local-first for the 3B–16B parameter class** (Qwen2.5-Coder, Qwen3,
-DeepSeek-Coder-V2-Lite, Gemma 3, Devstral Small) and adapts prompts, tool
-protocols, and context budgets down to the machine + model at hand.
+Photon flips the conventional AI coding assistant priority: instead of designing exclusively for massive cloud frontier models and bolting on local support as an afterthought, Photon is built **local-first for the 3B–16B parameter class** (Qwen 2.5 Coder, DeepSeek-Coder-V2-Lite, Gemma 3, Devstral Small, Llama 3.2). It dynamically adapts system prompts, tool protocols, context budgets, and repair loops down to the specific machine and model at hand.
 
-- **Local-first.** Ollama (`http://localhost:11434`) and llama.cpp
-  (`http://localhost:8080/v1`) are first-class. Code stays on-machine.
-- **Adaptive down.** Terse prompts, fewer tools, capped budgets for small
-  windows; rich scaffolding only for capable models.
-- **Forgiving protocols.** The `[TOOL name] arg: value [/TOOL]` block protocol
-  plus a multi-format parser lets weak models call tools reliably; repair loops
-  correct mistakes instead of dying silently.
-- **Cloud when needed.** Gemini, Claude, OpenAI, NVIDIA NIM, OpenRouter,
-  OpenCode Zen, Blackbox AI, and any OpenAI-compatible endpoint — keys in VS Code
-  `SecretStorage`, never plaintext.
-
-See `README.md`, `docs/product_info.md`, `docs/Usecase.md`.
+- **Local-first.** Ollama (`http://localhost:11434`), LM Studio, and llama.cpp (`http://localhost:8080/v1`) are primary citizens. Your code stays strictly on your machine.
+- **Adaptive down.** Terse prompts, curated tool subsets, and tight output token caps for small contexts; rich multi-tool scaffolding only when running on capable hardware or cloud models.
+- **Forgiving protocols.** The `[TOOL name] arg: value [/TOOL]` flat block protocol plus a multi-format resilient parser allows compact models to call tools reliably without stumbling over strict nested JSON.
+- **Automated Tool Repair.** Intercepts malformed tool invocations, streams targeted repair prompts (up to 2 retries), and marks blocked todos rather than silently terminating.
+- **Cloud when needed.** Google Gemini, Anthropic Claude, OpenAI, NVIDIA NIM, OpenRouter, OpenCode Zen, Blackbox AI, and custom OpenAI-compatible endpoints with API keys securely stored in VS Code `SecretStorage`.
+- **Fail-Safe Checkpoints & Rollback.** Automatic pre-mutation file snapshotting across turns with single-click file restoration, chat rewinding with prompt auto-paste, and numbered checkpoint tracking.
+- **Automatic Context Compaction.** Multi-strategy token condensation that monitors context window pressure in real time, triggering automatic or manual `/compact` summarization before overflow occurs.
 
 ---
 
 ## 2. Feature Inventory
 
-### 2.1 Interaction modes (header tabs)
+### 2.1 Interaction Modes
 
-| Mode | File | Behavior | Step cap |
-|------|------|----------|----------|
-| Chat | `src/core/agent/*` | Pure conversation, coding Q&A, code snippets, no side effects | 6 |
-| Plan | `src/core/agent/*` | Read-only investigation (`read_file`, `list_dir`, `find_files`, `search_code`), numbered plan, nothing changed | 10 |
-| Agent | `src/core/agent/*` | Full autonomous coding: edits + commands, one verified step at a time, approval-gated | 25 (cloud safety net 200) |
+Photon provides three specialized operational modes selectable via the top header tabs or keyboard shortcuts:
 
-`Chat 6 / Plan 10 / Agent 25` are hard caps (`MODE_CAPS` in
-`src/core/agent/unifiedEngine.ts`). Saying *continue* starts another turn.
+| Mode | Behavior | File Mutations | Terminal Commands | Step Cap |
+|------|----------|----------------|-------------------|----------|
+| **Chat** | Pure conversation, architecture Q&A, conceptual discussions, and code snippets | ❌ Disabled | ❌ Disabled | 6 steps |
+| **Plan** | Read-only investigation (`read_file`, `list_dir`, `find_files`, `search_code`), structured blueprints, numbered step-by-step action checklists | ❌ Disabled | ❌ Disabled | 10 steps |
+| **Agent** | Full autonomous coding: edits, creates, and moves files, executes commands, checks diagnostics, and verifies work | ✅ Enabled (Approval required) | ✅ Enabled (Approval required) | 25 steps (cloud safety net: 200) |
 
-### 2.2 Adaptive engine (Auto Mode)
-
-Five-stage plan per session (`src/core/adaptive/`):
-
-1. **Machine profiling** (`machineProfiler.ts`) — RAM/CPU/GPU
-   (`nvidia-smi` / registry / `system_profiler`), tier low/mid/high; caps context
-   (`low 8192 / mid 16384 / high 32768`).
-2. **Model profiling** (`modelProfiler.ts`) — params, quantization, family,
-   `context_length` (from `model_info`, else `num_ctx` in modelfile, else family
-   guess), tool/vision/audio/video/thinking flags, tier
-   (`tiny <4B / small <8.5B / medium <20B / large`). Results cached by
-   `name@digest` (10-min TTL, 50 entries) to avoid repeat `/api/show`.
-3. **Task analysis** (`intelligence/policy.ts`, `adaptive/complexity.ts`) —
-   scope (`single_file / multi_file / codebase`), reasoning, risk, verification
-   kinds, ambiguity, estimated steps from keywords + file refs.
-4. **Benchmark integration** (`core/bench/bench.ts`, `host/benchStore.ts`) —
-   measured `tok/s`, tool reliability, reasoning pass; keyed
-   `model+hardwareClass+methodologyVersion`.
-5. **Optimization** (`adaptive/orchestrator.ts`, `adaptive/autoMode.ts`) —
-   picks model + intelligence level with human-readable `rationale` shown in the
-   **Transparency Panel** (`◎`).
-
-Intelligence levels (`intelligence/`): `auto / low (5 tools, 768 out) /
-medium (8, 2048) / high (14, 4096) / max (18, 8192)`, each with temperature/topP,
-prompt detail, map lines, and output budget.
-
-### 2.3 Tool system (14 built-in + cloud + MCP)
-
-Registry: `src/core/tools/registry.ts` (priority selection, `minTier` gating).
-
-| Tool | File | Notes |
-|------|------|-------|
-| `read_file path, start_line?, end_line?` | `builtin/files.ts` | Gutter `0001 │` output, 200-line default cap, 2 MB + binary guard, range guidance |
-| `edit_file path, find!, replace!` | `builtin/files.ts` | Exact → gutter-stripped → fuzzy match, EOL-preserving, ambiguity errors |
-| `write_file path, content!` | `builtin/files.ts` | Create/overwrite, approval-gated |
-| `append_file`, `move_path from!, to!` | `builtin/files.ts` | `cp+rm` cross-device fallback, approval-gated |
-| `list_dir path?, recursive?` | `builtin/files.ts` | Dirs-first sort, ignores `node_modules/.git/dist/...`, BFS ≤ depth 2 / 400 entries |
-| `find_files pattern!` | `builtin/search.ts` + VS Code index | Substring or `**/*.test.ts` glob, cap 25→150 by capability |
-| `search_code query!` | `builtin/search.ts` | Regex, 4000 files / 512 KB / depth 25 guards, batches of 4, 15k clamp |
-| `code_outline path!` | `builtin/search.ts` | Functions/classes/types, 200 hits max |
-| `run_command command!` | `builtin/terminal.ts` | Single-command only (quote-aware chaining guard rejects `&& \|\| ; \| & $() backtick > <`), 60 s timeout (max 300 s), 1 MB buffer, approval-gated |
-| `get_diagnostics` | `builtin/verify.ts` | `vscode.languages.getDiagnostics`, capped display |
-| `web_search query!` | `builtin/web.ts` | DuckDuckGo (+Google fallback), 15 s, 5→8 results |
-| `web_fetch url!` | `builtin/web.ts` | HTTPS-only, SSRF guard incl. decimal/hex/octal IP + IPv6-mapped + `.internal/.local`, manual redirect re-check per hop (max 3), 2 MB slice, script/nav stripped |
-| `todo_write` | `builtin/plan.ts` | Checklist persisted in shared per-turn `ctx.todos` |
-| `think` | `builtin/plan.ts` | Private scratchpad |
-
-Cloud-native aliases for frontier models (`cloud/cloudTools.ts`):
-`write_to_file`, `replace_in_file`, `execute_command` (same chaining guard),
-`search_files`, `list_files`, `list_code_definition_names`, plus lifecycle
-`ask_followup_question` / `attempt_completion`.
-
-**MCP** (`tools/mcp/`): `.vscode/mcp.json` servers (`stdio` allowlist
-`npx/node/python/uvx/bun/deno`, `BLOCKED_ARG_RE` incl. `-y/--yes/install`,
-env filtered to `PATH/NODE_ENV/PYTHONPATH/MCP_*`; `http` HTTPS-only +
-same-host redirect guard). Bridged as `mcp_<id>_<tool>`, default-deny
-(`inferRisk` defaults unknown to `workspace_write` → approval required).
-Stdio client: stderr drained, 1 MB line cap, SIGTERM + 2 s SIGKILL fallback,
-stream destroy.
-
-**Pipeline** (`photon-core/tools/pipeline.ts`): pre/post hooks, bounded retry,
-single-wave sequential execution in the engines (`maxConcurrent=1`).
-
-**Repair** (`core/agent/repair.ts`, `unifiedEngine.ts`): malformed calls get a
-rendered correct-example nudge, ≤2 retries per logical step, then
-`blocked` todo marking.
-
-### 2.4 Providers (local + cloud)
-
-| Provider | File | Notes |
-|----------|------|-------|
-| Ollama (local, primary) | `llm/providers/ollamaProvider.ts`, `ollama/client.ts` | NDJSON stream, connect/idle (not total) timeouts, `keepAlive 30m`, `listModels` concurrency-4 + `allSettled`, JSON errors wrapped, details truncated |
-| llama.cpp (local) | `openaiCompatProvider.ts` (`llamacpp` id) | Auto-discovery via `/v1/models`, no key |
-| OpenAI-compatible | `openaiCompatProvider.ts` | Groq/Together/NIM/OpenRouter/custom; per-attempt timeouts, `Retry-After` honor, tool-index collision fix, malformed-args drop |
-| Gemini | `providers/geminiProvider.ts` | `streamGenerateContent` SSE, `blockReason` surfaced, live `v1beta/models` listing |
-| Claude | `providers/anthropicProvider.ts` | `/v1/messages` SSE, `type:error` surfaced, no empty `tool_use_id`, paginated `v1/models` |
-| NVIDIA / OpenAI / OpenRouter / OpenCode Zen / Blackbox / Custom | `openaiCompatProvider.ts` + `catalogs.ts` | BYOK, `GET /models` live listing (Blackbox static catalog), `keyInBody` + extra headers supported |
-
-Routing (`llm/providerManager.ts`): `model.split(":")[0]` prefix; prefix-less
-names fall back to Ollama; unknown prefixes throw (no silent local misroute).
-`ping`/`listModels` bounded (15 s / 20 s race) so one hung provider can't stall.
-Streaming (`llm/sse.ts`): SSE framing (multi-`data:` reassembly), idle watchdog
-(300 s), abort throws `AbortError` (no silent bare-done), retryable
-`429/500/502/503/504` with backoff.
-
-### 2.5 Engines & turn lifecycle
-
-- **Local/agent loop** (`core/agent/unifiedEngine.ts`, installed over
-  `AgentEngine` by `host/unifiedRuntime.ts`): one tool per step, multi-call
-  queue drained sequentially without re-querying, duplicate/invalid handling,
-  truncation/narration/empty-response nudges (all bounded), per-turn cached
-  specs/system/native-tools + shared todos + spec map.
-- **Cloud loop** (`core/agent/cloudEngine.ts`): native function calling, model
-  decides done via `attempt_completion` or tool-free reply, history trimmed at
-  user boundaries keeping call/result pairs intact, 200-step safety net.
-- **Controller** (`host/PhotonController.ts`): single-owner `promptQueue`
-  drain (`sendPrompt` delegates to `onPrompt`), session-pinned emitter
-  (record-always, post-if-live), `turnEpoch` approval guards, serialized
-  persists, mid-turn cards finalized to `error` on abort, guarded idle posts.
-- **Harness (experimental, behind `photon.experimental.harness`)**:
-  `photon-core/` event-sourced `SessionRegistry` + `AgentRegistry/Inbox` +
-  `AgentLoop` + `ToolPipeline` + `SystemPromptRegistry`.
-
-### 2.6 Workspace understanding (offline RAG)
-
-`host/indexService.ts` + `core/index/`: watches workspace, chunks sliding
-`60 lines / 12 overlap`, caps `4000 chars/chunk`, `80/file`, `8000` chunks,
-`1500 files × 256 KB`, ignores build dirs; embeds batched ×24 via local
-`nomic-embed-text` (or `photon.index.embeddingModel`); pure-TS cosine store;
-retrieves top-6 (threshold 0.2, ≤4000 chars) into agent/plan prompts
-(medium+ only). Persisted `globalStorage/index-<hash>.json` with dim check.
-Status `idle/indexing/ready/unavailable/error` + manual re-index.
-
-### 2.7 Sessions, persistence, safety
-
-| Store | Location | Limits |
-|-------|----------|--------|
-| Sessions | `globalState photon.sessions`, `updatedAt desc` | 40 sessions; persisted 200 msgs / 8k chars / 6k tool result; `KEEP_INLINE_IMAGES 4`; 4 MB guard drops oldest; live 400 msgs; webview 250k/msg |
-| Bench | `globalState photon.bench` | 200 latest `ranAt` |
-| Per-model configs | `globalState photon.perModelConfigs` | `numCtx`, llama.cpp flags |
-| Custom models | `globalState photon.customModels` | post-test added |
-| Secrets | `secrets photon.provider.<id>.apiKey` | never plaintext |
-| Project | `workspaceState` | pinned model, approved MCP ids |
-| Index | `globalStorage/index-<hash>.json` | dim-validated |
-| Project config | `.photon/config.json\|yaml\|yml` | `model, intelligence, numCtx, indexing, autoApprove`; file wins over defaults, per-model wins over file; watcher hot-reloads |
-
-Approval: every `sideEffecting` tool → `requestApproval` → UI card/bottom
-`Approval` → promise; 5-min fail-safe timeout; abort resolves pending as denied;
-`tools.autoApprove` bypass. Paths jailed by `resolveInWorkspace` (lexical `..`
-+ `realpath` symlink check); suggestion probes jailed too.
-
-### 2.8 Diagnostics & bench
-
-- Status bar `Photon: <model> | Auto | (error)` + reasoning tooltip.
-- `Photon: Run Machine + Model Diagnostics` dumps Ollama/provider reachability,
-  machine tier, model tiers, active plan.
-- Photon Bench (M7): `num_ctx 4096, num_predict 160, seed 7` — throughput via
-  `eval_count/eval_duration`, 2× `read_file` reliability, reasoning check;
-  live `tok/s` pill (`accChars/4`, 250 ms throttle) in `ContextMeter`.
-- Context meter: `used / (numCtx − reserve 1024)` bar, amber >80%, tooltip
-  `System + History / Budget`; first user message never dropped; history
-  compacted past ~6 tool pairs into one-line summaries.
-
-### 2.9 VS Code integration
-
-`src/extension.ts` + `src/host/`: `ChatViewProvider` (retained webview),
-`@photon` chat participant + `LanguageModelChatProvider` surface
-(`LmProvider.ts`), commands `photon.openChat / newSession / refreshModels /
-runDiagnostics`, status-bar updater, config-change hot reload, deterministic
-dispose (abort + resolve approvals + MCP/index teardown).
+*Step caps enforce finite execution loops. Typing "continue" seamlessly starts another turn while retaining context.*
 
 ---
 
-## 3. Design Theme — "Void Black + Photon Gradient"
+### 2.2 Adaptive Engine & Machine Profiling
 
-Source of truth: `webview-ui/src/theme/photon.css` (2359 lines), aligned with
-the `photon-website/` palette.
+Photon continuously profiles system resources and model specifications to calculate an `AdaptivePlan` for each session:
 
-**Palette (CSS variables).**
+1. **Hardware Profiling (`machineProfiler.ts`):** Evaluates CPU cores, total/free system RAM, and GPU VRAM via platform tools (`nvidia-smi`, Windows registry, macOS `system_profiler`). Categorizes hardware into tiers (`Low`, `Mid`, `High`) and computes safe context ceilings:
+   - Low: 8,192 tokens (with 22.5% safety buffer to prevent swap thrashing)
+   - Mid: 16,384 tokens
+   - High: 32,768+ tokens
+2. **Model Profiling (`modelProfiler.ts`):** Extracts parameter count, quantization level, context length limit, and native tool-calling capabilities from Ollama manifests or modelfiles. Caches profiles by `name@digest` (10-minute TTL, 50 entries).
+3. **Task Complexity Analysis (`policy.ts`, `complexity.ts`):** Classifies requests into scopes (`single_file`, `multi_file`, `codebase`), reasoning depth (`low`, `medium`, `high`), and destructive risk level.
+4. **Benchmark Integration (`bench.ts`, `benchStore.ts`):** Evaluates real throughput (`tok/s`), tool execution reliability, and reasoning pass rates. Keyed by `model + hardwareClass + methodologyVersion`.
+5. **Auto Mode (`orchestrator.ts`, `autoMode.ts`):** Dynamically picks the optimal model, intelligence level, temperature, and context window. Rationale is surfaced transparently in the **Transparency Panel** (`◎`).
 
-- Surfaces: `--space-900 #07070A` (app bg), `-850 #0a0a0e`, `-800 #0e0e12`,
-  `-700 #151519` (user bubble), `-600 #1c1c22`, `-500 #27272f`; hairline
-  `--line rgba(255,255,255,.07)`.
-- Text: `--text #ececf0`, `--text-dim 55%`, `--text-faint 35%` (alpha-based,
-  website-consistent).
-- Brand: `--red #ff2d2d`, `--orange #ff6b2d`, `--amber #ffc02e`;
-  `--grad-brand linear-gradient(92deg, red 0%, orange 46%, amber 100%)` —
-  used sparingly (accents, active tab underline, focus rings, wordmark).
-- Status: `--ok #34d399`, `--warn amber`, `--err red`.
-- Type: system stack (`-apple-system … Inter`), mono
-  (`SFMono / JetBrains Mono / Cascadia Code / Consolas`); radius
-  `10px / 7px`; spacing scale `4/8/12/16px`; app column `max-width 860px`.
+Intelligence level presets (`intelligence/`):
+- `Auto`: Dynamically computed per turn.
+- `Low`: 5 tools, 768 output token cap, minimal prompt overhead (ideal for 3B–4B models).
+- `Medium`: 8 tools, 2,048 output token cap, standard prompt formatting (7B–8B models).
+- `High`: 14 tools, 4,096 output token cap, rich scaffolding (14B–16B models).
+- `Maximum`: All tools, 8,192 output token cap (32B+ or frontier cloud models).
 
-**Layout & chrome.**
+---
 
-- Centered 860 px column even in wide panels (`gutter 10px`); user bubbles
-  right-aligned (`space-700`), Photon left; message markdown capped `72ch`.
-- Header two-row: top `Chat | Plan | Agent` tabs (red underline) + orbital
-  **Photon** wordmark; bottom `Local | ☁ Cloud` toggle + model picker
-  (`Auto 🤖`, prefix-stripped display, `tier · tok/s`, 320 px ellipsis) and
-  `Auto ◎ / History 🕒 / Refresh ↻ / New + / Settings ⚙`.
-- Hero empty state: title, subtitle, model line, 3 mode-specific suggestion
-  cards (`grid auto-fit 240px`).
-- Messages: streaming `Markdown` (fenced code + lang tag + hover **Copy**),
-  `ToolCard` (status dot grey/amber-pulse/green/red, mono arg ellipsis,
-  220 px result, 4000-char UI cap), approval cards
-  (`Approve / Deny` + remember), 180 px image / `📄` doc chips.
-- Composer: meter inside input, attach chips (`22×22` ×), `+ Attach`
-  (`space-700`), auto-grow textarea (160 px), `↑ Send / ■ Stop`;
-  drag-drop + paste screenshots via `readFileToAttachment`; vision-gated accept;
-  `Enter` send / `Shift+Enter` newline.
-- Panels: History popover (260×320, `updatedAt desc`), Transparency
-  (ranked scores + per-row **Pin**), full-page Settings (intelligence grid,
-  adaptive rationale, ctx overrides, per-model `numCtx` + llama.cpp
-  `-ngl/--fit/-np/-fa/-ctk/-ctv` with live `llama-server` preview + copy,
-  tools, index, MCP `pending→connected`, bench table, machine/model,
-  connection, cloud provider cards with letter logos, key `password + 👁`,
-  `Refresh/Test/Add/✕`).
-- System: `OfflineBanner`, dismissible `ErrorBanner`, `StatusIndicator`
-  (`Thinking / Running tool + spinner + dots`), `*:focus-visible` red 1.5 px,
-  28×28 icon buttons, thin 6 px `space-500` inner scrollbars only
-  (`html overflow hidden`).
+### 2.3 Checkpoint & Rollback System (Copilot & Claude Code Parity)
+
+Photon features a checkpoint and rollback system engineered to undo faulty agent edits and rewind conversation turns.
+
+```
+                    ┌────────────────────────┐
+                    │ User Sends Turn Prompt │
+                    └───────────┬────────────┘
+                                │ beginTurn()
+                                ▼
+                    ┌────────────────────────┐
+                    │ File Mutation Tool     │
+                    │ (write, edit, append)  │
+                    └───────────┬────────────┘
+                                │ recordBeforeChange()
+                                ▼ (lazy pre-mutation snapshot)
+                    ┌────────────────────────┐
+                    │ File Written on Disk   │
+                    └───────────┬────────────┘
+                                │ commitTurn()
+                                ▼
+                    ┌────────────────────────┐
+                    │ Checkpoint #N Created  │
+                    │ (.photon/checkpoints)  │
+                    └────────────────────────┘
+```
+
+#### Key Architecture & Capabilities:
+- **Pure TypeScript Engine Boundary (`checkpointManager.ts`):** Strictly dependency-free with zero `vscode` imports. Persists a bounded sliding window of 60 checkpoints to `.photon/checkpoints.json`.
+- **Lazy Pre-Mutation Tracking (`checkpointTracker`):** Before any file write, edit, append, or move tool modifies a file on disk, Photon captures the file's original ground-truth content, existence status, and modification timestamp (`mtimeMs`). Read-only tools (`read_file`, `list_dir`, `find_files`, `search_code`) incur zero snapshot overhead.
+- **Reverse-Chain Cumulative Rollback:** When rolling back across multi-turn histories (e.g. from Turn 3 back to Turn 1), Photon traverses the chain in reverse order, restoring each affected file to its *earliest pre-mutation state* and deleting any files created after that checkpoint.
+- **Dual Restoration Workflows:**
+  1. **Revert & Rewind Chat:** Restores files on disk to their exact pre-turn state, trims the chat history back to that checkpoint, and automatically pastes the original user prompt back into the composer input box, auto-focused and expanded for easy editing.
+  2. **Files Only:** Reverts file modifications on disk while preserving the entire conversation history.
+- **Numbered Checkpoint Badges:** Checkpoints are sequentially numbered (`Checkpoint #1`, `Checkpoint #2`, etc.) within each chat session.
+- **Interactive Checkpoint Pill:** Every assistant turn that modifies workspace files displays an interactive pill: `Checkpoint #1 · 2 files › Revert`. Clicking toggles a confirmation popover listing modified files and rollback buttons.
+- **Revert Modal (`RevertModal.tsx`):** A dedicated dropdown modal listing all session checkpoints, their relative timestamps (`2m ago`), user prompt quotes, and file tags.
+- **Symbol Cache Synchronization:** Every rollback immediately re-indexes reverted files and removes deleted files from `ProjectContextManager`, keeping symbol references in exact parity with disk.
+
+---
+
+### 2.4 Context Compaction Engine (Copilot & Claude Code Parity)
+
+To prevent conversation context overflows during long-running sessions, Photon implements an automated compaction engine (`compactor.ts`):
+
+- **Automatic Threshold Compaction:** Continuously computes token usage against the model's active context window (`used / window`). When context pressure exceeds **85%**, the engine automatically triggers context compaction before prompt execution.
+- **Structural Summarization (`compactSessionMessages`):**
+  - **Preserved Core Context:** Preserves the initial user request, active task goal, workspace files touched, pending todos, key technical decisions, and the 2 most recent turns.
+  - **Condensed History:** Compresses intermediate turns, tool calls, and diagnostics into a dense `[Context Compaction Summary]` block.
+- **Visual Status & Metrics:** Displays a clean compaction pill in chat and status bars indicating tokens saved, percentage reduction, and active compaction indicators.
+- **Manual Compaction:** Triggerable at any time via the `/compact [focus]` command or by clicking **Compact** in the Context Meter popover.
+
+---
+
+### 2.5 Slash Commands & Composer Autocomplete
+
+Typing `/` in the Composer opens a floating slash-command autocomplete menu with keyboard navigation (`↑`/`↓` to navigate, `Enter`/`Tab` to select, `Esc` to dismiss):
+
+| Slash Command | Parameters | Description |
+|---------------|------------|-------------|
+| `/revert` | Optional: `<number>` | Opens the Checkpoint Revert Modal to select a numbered checkpoint. If a number is provided (e.g. `/revert 1`), immediately reverts files and rewinds chat to that checkpoint. |
+| `/rewind` | None | Instantly rolls back the latest turn's file modifications and rewinds the chat. |
+| `/compact` | Optional: `[focus]` | Condenses conversation history to free up context tokens. An optional focus area can be provided. |
+| `/clear` | None | Clears the active chat session and starts a fresh conversation. |
+
+---
+
+### 2.6 Tool System (14 Built-ins + Cloud + MCP)
+
+Tools are registered in `src/core/tools/registry.ts` with tier-gated availability, concurrency policies, and risk levels:
+
+| Tool | Parameters | Risk | Description |
+|------|------------|------|-------------|
+| `read_file` | `path`, `start_line?`, `end_line?` | Read | Reads file contents with line numbering (`0001 │`). Protected by a 200-line default slice and 2 MB binary guard. |
+| `edit_file` | `path`, `old_str`, `new_str`, `replace_all?` | Write | Performs targeted find-and-replace with whitespace/gutter tolerance. Preserves original line endings. Automatically snapshot-tracked. |
+| `write_file` | `path`, `content` | Write | Creates or overwrites files with automatic directory creation. Approval-gated and snapshot-tracked. |
+| `append_file` | `path`, `content` | Write | Appends text to the end of an existing file. Approval-gated and snapshot-tracked. |
+| `move_path` | `from`, `to` | Write | Safely moves or renames files or directories within the workspace boundary. Approval-gated and snapshot-tracked. |
+| `list_dir` | `path?`, `recursive?` | Read | Lists directory contents (directories first). Ignores `node_modules`, `.git`, `dist`, and build output. |
+| `find_files` | `pattern` | Read | Matches filenames using globs (e.g. `**/*.test.ts`) or substrings. Results capped based on intelligence tier. |
+| `search_code` | `query`, `path?` | Read | Fast regex and substring code search across workspace files with depth and file size guards. |
+| `code_outline` | `path` | Read | Extracts top-level classes, functions, interfaces, and methods. |
+| `run_command` | `command` | Execute | Executes shell commands in the workspace root. Enforces single-command security (rejects chaining operators `&&`, `\|\|`, `;`, `$()`, backticks). Approval-gated with 60s timeout. |
+| `get_diagnostics` | `path?` | Read | Extracts active compiler, linter, and typechecker diagnostics from VS Code. |
+| `web_search` | `query` | Network | Performs web search via DuckDuckGo with Google fallback (15s timeout, 5–8 results). |
+| `web_fetch` | `url` | Network | Fetches and sanitizes web pages. Protected against SSRF (blocks private/loopback IP ranges and non-HTTP schemes). |
+| `todo_write` | `todos` | Workflow | Manages task checklist items (`pending`, `in_progress`, `done`, `blocked`). |
+
+**Cloud Tools Aliasing (`cloudTools.ts`):** Transparently translates standard cloud model function calls (`write_to_file`, `replace_in_file`, `execute_command`, `list_files`, `search_files`) to Photon's workspace engine tools.
+
+**Model Context Protocol (MCP):** Connects external MCP servers declared in `.vscode/mcp.json`. Supports `stdio` (allowlisted runtimes: `node`, `npx`, `python`, `uvx`, `deno`, `bun`) and `http`/SSE transports with strict approval gating and argument sanitization.
+
+---
+
+### 2.7 Multi-Provider LLM Architecture
+
+Photon supports local and cloud LLM providers via a unified streaming client architecture:
+
+| Provider | Transport | Default Endpoint | Features |
+|----------|-----------|------------------|----------|
+| **Ollama** | Native NDJSON HTTP | `http://localhost:11434` | Streaming token generation, model pulling with live progress & ETA, keep-alive management, auto-detection. |
+| **llama.cpp** | OpenAI-compatible SSE | `http://localhost:8080/v1` | Process management, automatic `-ngl` GPU layer calculation, context configuration, zero API key required. |
+| **Google Gemini** | Google API SSE | `generativelanguage.googleapis.com` | Gemini 2.0 Flash, Gemini 1.5 Pro, multimodal image support, high context windows. |
+| **Anthropic Claude** | Messages API SSE | `api.anthropic.com` | Claude 3.5 Sonnet, Claude 3 Opus, Claude 3.5 Haiku, streaming reasoning trace support. |
+| **OpenAI** | Chat Completions SSE | `api.openai.com/v1` | GPT-4o, GPT-4o-mini, o1, o3-mini with reasoning level controls. |
+| **NVIDIA NIM** | OpenAI-compatible SSE | `integrate.api.nvidia.com/v1` | Nemotron-3.5-Super, Llama-3.1-405B, high-speed inference. |
+| **OpenRouter** | OpenAI-compatible SSE | `openrouter.ai/api/v1` | Universal model routing with dynamic model catalog retrieval. |
+| **Custom Providers** | OpenAI-compatible SSE | User defined | Arbitrary local or remote endpoints with custom headers and key-in-body configurations. |
+
+All API keys are securely managed via VS Code's `SecretStorage` API (`secrets.store`), ensuring credentials never leak into git repositories, settings files, or logs.
+
+---
+
+### 2.8 Telemetry & Real-Time Resource Monitoring
+
+Photon features a real-time telemetry and hardware monitoring pipeline:
+
+- **Live Hardware Gauges (`sampleHardwareMetrics`):** Real-time monitoring of system RAM, free RAM, CPU utilization, and GPU VRAM updated at configurable intervals.
+- **Cloud Usage Tracker (`cloudUsage.ts`):** Accumulates session and all-time token usage (input, output, cached tokens) and calculates exact costs in USD using an up-to-date pricing table for all supported frontier models.
+- **Hardware Metrics Modal (`HardwareMetricsModal.tsx`):** Visual modal displaying live hardware telemetry, Ollama VRAM residency, running models, and aggregated cloud billing statistics with one-click reset options.
+
+---
+
+### 2.9 Project Context & Offline RAG
+
+- **Persistent Architecture Memory:** Maintains `.photon/context.json` to store architectural decisions, workspace symbol indexes, key file mappings, and multi-model turn handoffs.
+- **Offline Vector Store (`indexService.ts`):** Chunks workspace files (60 lines / 12 overlap), generates embeddings locally via Ollama (`nomic-embed-text`), and stores vector embeddings in `.photon/index-<hash>.json`. Retrieves top-k semantically relevant snippets for plan and agent turns.
+- **Turn Handoff Tracking:** Automatically logs user goals, assistant responses, and tools executed per turn to preserve continuity across model swaps.
+
+---
+
+## 3. Design Theme & UI Architecture
+
+Photon features a custom **Void Black + Animated Moving Gradient** design system built in `webview-ui/src/theme/photon.css`:
+
+### 3.1 Design Palette
+- **Deep Void Surfaces:** `--space-900: #07070A` (primary void background), `--space-850: #0a0a0e`, `--space-800: #0E0E14` (elevated cards), `--space-700: #151519` (user chat bubbles).
+- **Hairline Borders:** `--line: rgba(255, 255, 255, 0.08)` providing clean, non-intrusive container edges.
+- **High-Contrast Text Hierarchy:** Primary text `#FFFFFF` / `#ECECF0`, secondary text `rgba(255, 255, 255, 0.65)`, faint labels `rgba(255, 255, 255, 0.40)`.
+- **Brand Gradient:** Subtly deployed on active underlines, focus rings, and wordmarks:
+  ```css
+  --grad-brand: linear-gradient(92deg, #FF2D2D 0%, #FF6B2D 46%, #FFC02E 100%);
+  ```
+
+### 3.2 Visual Highlights & Micro-Interactions
+- **Fluid Moving Gradient Hero:** Welcome screen inspired by the modern Gemini UI and the official Photon website, featuring animated, moving blurred mesh gradients behind a bold, matte foreground Photon wordmark.
+- **Smooth Animations:** Hardware-accelerated modal dialog scale-ins (`modalDialogScaleIn`), slide-up popovers (`popoverSlideUp`), and backdrop fades (`modalBackdropFadeIn`).
+- **Seamless Smooth Scrolling:** Native smooth scrolling enabled across the chat message list for a fluid conversation stream.
+- **Elevated Controls & High-Visibility Dropdowns:** Clean, high-contrast menus with white background and dark text on hover for maximum legibility.
+- **Pure SVG Icon Suite:** All controls, status badges, buttons, and checkpoint indicators use clean, crisp vector SVGs with zero emoji dependencies.
 
 ---
 
 ## 4. Configuration Reference
 
-All keys under `photon.*` (`package.json` → Settings UI). Most used:
+All settings are configured under the `photon.*` namespace in VS Code Settings (`Ctrl+,` / `Cmd+,`):
 
-| Setting | Default | Effect |
-|---------|---------|--------|
-| `ollama.baseUrl` | `http://localhost:11434` | Ollama server |
-| `ollama.requestTimeoutMs` | `180000` | Idle gap between tokens (not total cap) |
-| `ollama.connectTimeoutMs` | `300000` | Wait for first response — covers cold model loads on slow disks/VRAM |
-| `ollama.keepAlive` | `"30m"` | Model residency after use; longer = fewer cold loads, more VRAM held (empty = server default) |
-| `ollama.preloadOnStartup` | `true` | Background warmup of selected local model after refresh (first prompt skips cold load) |
-| `llamacpp.baseUrl` | `http://localhost:8080` | llama.cpp OpenAI-compat base (no `/v1`) |
-| `llamacpp.requestTimeoutMs` | `300000` | Stream idle gap for llama.cpp (big prompt evals go quiet for minutes) |
-| `providers.llamacpp.enabled` | `false` | Expose auto-discovered `llamacpp:*` |
-| `defaultModel / defaultMode / interfaceMode` | `""/chat/local` | Startup model/mode/engine stack |
-| `context.reserveOutputTokens` | `1024` | Budget subtracted from `numCtx` |
-| `tools.autoApprove` | `false` | Skip approval prompts |
-| `adaptive.enabled / intelligence.level` | `true/auto` | Auto-tune vs `max/high/medium/low` |
-| `webSearch.provider` | `duckduckgo` | `duckduckgo/google/none` |
-| `index.enabled / index.embeddingModel` | `false/nomic-embed-text` | Offline RAG |
-| `providers.{gemini,claude,nvidia,openai,openrouter,opencode,blackbox}.enabled` | `false` | Cloud toggles (keys in Secrets) |
-| `providers.custom` | `[]` | `{id,label,baseUrl,apiKey?,models?,extraHeaders?,keyInBody?}` |
-| `experimental.harness` | `false` | Event-sourced loop (restart) |
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `photon.ollama.baseUrl` | `http://localhost:11434` | Ollama server URL |
+| `photon.ollama.connectTimeoutMs` | `300000` | Connection timeout for loading cold models into memory |
+| `photon.ollama.requestTimeoutMs` | `180000` | Token stream idle timeout |
+| `photon.ollama.keepAlive` | `"30m"` | Model residency duration in VRAM after turn completion |
+| `photon.llamacpp.baseUrl` | `http://localhost:8080` | llama.cpp server URL |
+| `photon.defaultMode` | `"chat"` | Active mode on launch (`chat`, `plan`, `agent`) |
+| `photon.defaultModel` | `""` | Model to activate on launch |
+| `photon.interfaceMode` | `"local"` | Primary interface mode (`local` or `cloud`) |
+| `photon.intelligence.level` | `"auto"` | Intelligence preset (`auto`, `low`, `medium`, `high`, `max`) |
+| `photon.adaptive.enabled` | `true` | Enable hardware-aware dynamic context and parameter tuning |
+| `photon.tools.autoApprove` | `false` | Bypass user confirmation prompts for file edits and terminal commands |
+| `photon.webSearch.provider` | `"duckduckgo"` | Web search provider (`duckduckgo`, `google`, `none`) |
+| `photon.index.enabled` | `false` | Enable local codebase vector indexing and offline RAG |
+| `photon.index.embeddingModel` | `"nomic-embed-text"` | Ollama model used for local vector embeddings |
+| `photon.experimental.harness` | `false` | Enable event-sourced agent loop architecture |
 
 ---
 
-## 5. Build / Develop / Package
+## 5. Build, Test, & Package
 
+### Prerequisites
+- Node.js `^20.0.0`
+- npm `^10.0.0`
+- VS Code `^1.90.0`
+
+### Build Commands
 ```bash
+# Install dependencies
 npm install
-npm run typecheck   # tsc -p tsconfig.json + webview-ui/tsconfig.json
-npm run build:webview  # vite → dist/webview (55 modules, ~215 KB JS)
-npm run build:ext      # esbuild --production → dist/extension.js (~242 KB)
-npm run build          # both
-npm run package        # build + vsce package → photon-0.1.0.vsix (14 files, ~312 KB)
+
+# Run TypeScript typechecks across root and webview
+npm run typecheck
+
+# Execute unit test suite (244 tests)
+npm test
+
+# Build production bundles (webview + extension host)
+npm run build
+
+# Package VS Code extension VSIX
+npm run package
+
+# Install VSIX into VS Code
 code --install-extension photon-0.1.0.vsix
 ```
 
-Structure: `src/core/` (adaptive, agent, bench, index, intelligence, llm,
-ollama, prompts, protocol, tools) · `src/host/` (provider, controller,
-ChatViewProvider, stores, services) · `src/photon-core/` (harness) ·
-`src/shared/` (types, protocol) · `webview-ui/src/` (App, state/store,
-theme, components) · `docs/` · `media/` · `dist/`.
+---
+
+## 6. Project Directory Structure
+
+```
+Photon/
+├── src/
+│   ├── core/
+│   │   ├── adaptive/         # Hardware profiling, model assessment, task complexity
+│   │   ├── agent/            # Unified agent engine, cloud engine, context compactor
+│   │   ├── bench/            # Photon Bench methodology & throughput measurement
+│   │   ├── checkpoints/      # Checkpoint manager (pure TypeScript, zero VS Code imports)
+│   │   ├── index/            # Local vector embedding, chunker, cosine similarity store
+│   │   ├── intelligence/     # Tool policies, intelligence levels, prompt budgeting
+│   │   ├── llm/              # Provider managers, SSE stream framing, Ollama client
+│   │   └── tools/            # 14 built-in workspace tools, cloud tools, MCP client
+│   ├── host/
+│   │   ├── PhotonController.ts # Primary turn controller & webview communication bridge
+│   │   ├── extension.ts      # Extension activation, commands, and subscription setup
+│   │   ├── indexService.ts   # Workspace file watcher & vector indexing service
+│   │   └── sessionStore.ts   # Multi-session state persistence
+│   └── shared/
+│       ├── protocol.ts       # Typed bidirectional host <-> webview messaging protocol
+│       └── types.ts          # Core domain data models
+├── webview-ui/
+│   ├── src/
+│   │   ├── components/       # React UI: Composer, MessageList, RevertModal, ContextMeter
+│   │   ├── state/            # Central Zustand/useAppState reducer & store
+│   │   ├── theme/            # photon.css (Void Black design theme & animations)
+│   │   └── App.tsx           # Webview application root
+├── test/
+│   └── unit/                 # Node test runner unit tests (checkpoints, compactor, tools)
+└── DOCUMENTATION.md          # Comprehensive technical documentation
+```
 
 ---
 
-## 6. What Changed in This Session (stability + optimization pass)
+## 7. Recent Updates & Changelog
 
-- **Queued-call fix** (`unifiedEngine.ts`, `store.ts`): no premature queued
-  preview (duplicate IDs), drain emits `onAssistantStart` + `running→done/error`
-  in its own bubble, duplicate path closes to `error`, missing-result closes to
-  `error`, webview creates unknown bubbles (capped 500) instead of dropping.
-- **Turn lifecycle** (`PhotonController.ts`): single-owner prompt queue,
-  `turnEpoch`, abort-aware approvals with dedup, dispose resolves approvals,
-  serialized persists, abort finalizes cards, guarded idle/session posts.
-- **Injection/SSRF** (`terminal.ts`, `cloudTools.ts`, `web.ts`, `mcp/*`,
-  `paths.ts`): quote-aware chaining guard; hardened IP/redirect checks;
-  jailed path suggestions; MCP same-host redirect guard.
-- **Providers** (`sse.ts`, 4 providers, manager, `ollama/client.ts`): abort
-  throws, per-attempt timeouts, `Retry-After`, error surfacing, arg validation,
-  bounded aggregation, strict routing, wrapped JSON, truncated details.
-- **Bounds** (`files.ts`, `ToolCard.tsx`, `store.ts`, `mcpStdioClient.ts`):
-  2 MB/binary read guards, 4k card cap, 1 MB MCP line cap, SIGKILL fallback.
-- **Optimizations**: per-turn cached specs/system/native-tools + shared todos
-  + spec map + `toolsRun` counter (`unifiedEngine.ts`); profiler cache
-  (`modelProfiler.ts`); unified `classifyCloudToolPolicy` (`cloudTools.ts`);
-  memoized webview (`store.ts` actions, `Message`, `Markdown`).
-
-Verified: `typecheck` + `build:ext` + `build:webview` + `vsce package` green.
+### Version 0.1.0 (Latest Release)
+- **Checkpoint & Rollback Parity:**
+  - Introduced `CheckpointManager` with lazy pre-mutation file snapshotting.
+  - Multi-turn cumulative reverse-chain rollback for exact disk restoration.
+  - Dual restoration options: "Revert & Rewind Chat" (truncates conversation and pastes user prompt into composer) and "Files Only".
+  - Sequential numbered checkpoints (`Checkpoint #1`, `Checkpoint #2`, …).
+  - Revert Modal (`RevertModal.tsx`) with relative timestamps, prompt quotes, and file tags.
+  - Slash command autocomplete menu (`/revert`, `/rewind`, `/compact`, `/clear`).
+  - Pure SVG icon set replacing all emojis.
+- **Context Compaction Engine:**
+  - Automated threshold compaction triggering at 85% context window capacity.
+  - Preserves goals, active files, pending todos, key decisions, and latest turns while condensing older turns.
+  - Interactive visual status pill in chat displaying tokens saved and compaction metrics.
+  - Dedicated `/compact [focus]` command.
+- **Real-Time Telemetry & Hardware Cost Tracking:**
+  - Live hardware telemetry sampler monitoring CPU, system RAM, free RAM, and GPU VRAM.
+  - Real-time cloud usage tracker calculating exact USD billing with token caching discounts across all major frontier models.
+  - Hardware Metrics Modal (`HardwareMetricsModal.tsx`) with resource utilization gauges.
+- **UI & Motion Upgrades:**
+  - Fluid moving blurred mesh gradient background on the welcome screen with matte finish.
+  - Smooth animation primitives for dialogs, popovers, and chat scrolling.
+  - Enhanced contrast dropdowns and pickers with dark theme styling.

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { PerModelConfig, LlamaCppSettings } from "../../../src/shared/types";
+import { isLocalModel, type PerModelConfig, type LlamaCppSettings } from "../../../src/shared/types";
 import type { AppState, Actions } from "../state/store";
 import { ChevronRightIcon } from "./Icons";
 
@@ -21,9 +21,6 @@ function launchPreview(model: string, baseUrl: string, cfg?: PerModelConfig): st
   if (lc?.extraArgs) parts.push(lc.extraArgs);
   return parts.join(" ");
 }
-
-const isLocalModel = (m: { provider?: string }) =>
-  !m.provider || m.provider === "ollama" || m.provider === "llamacpp";
 
 export function ModelConfigs({ state, actions }: { state: AppState; actions: Actions }) {
   const [editing, setEditing] = useState<string | null>(null);

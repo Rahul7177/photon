@@ -36,6 +36,7 @@ export {
   planRequest,
   decideModel,
   rankModels,
+  selectFallbackModel,
   type AutoModeInput,
   type PlanRequest,
 } from "./adaptive/autoMode";
@@ -50,6 +51,12 @@ export { CloudUsageTracker, estimateCloudCost, getModelPricing, type CloudPricin
 
 // --- Agent turn loop (M9 repair) ------------------------------------------
 export { AgentEngine, type EngineDeps, type TurnEmitter } from "./agent/engine";
+export {
+  classifyRuntimeError,
+  formatNativeToolOutcome,
+  type ClassifiedRuntimeError,
+  type RuntimeErrorCategory,
+} from "./agent/errorRecovery";
 export { runCloudTurn, cloudHistoryFromSession, normalizeCloudToolCall, type CloudEmitter, type CloudTurnInput } from "./agent/cloudEngine";
 export { cloudTools } from "./tools/cloud/cloudTools";
 export { buildCloudSystemPrompt, type CloudSystemInput } from "./prompts/cloudSystem";
@@ -58,13 +65,18 @@ export {
   compactSessionMessages,
   shouldAutoCompact,
   extractCompactionCandidates,
+  extractStructuredCompactionData,
   buildNativeCompactionSummary,
   summarizeWithProviderModel,
+  isToolResultMessage,
+  isUsableProviderSummary,
   DEFAULT_AUTO_COMPACT_THRESHOLD,
   MIN_MESSAGES_FOR_COMPACTION,
   type CompactionResult,
   type CompactionOptions,
   type CompactionCandidateSet,
+  type CompactionRetainedItems,
+  type StructuredCompactionData,
 } from "./agent/compactor";
 export {
   CheckpointManager,
@@ -72,14 +84,33 @@ export {
   type Checkpoint,
   type FileSnapshot,
   type CheckpointRollbackResult,
+  type FileRollbackStatus,
+  type FileRollbackResult,
+  type RollbackOptions,
 } from "./checkpoints/checkpointManager";
 export { buildRepairPrompt, MAX_REPAIRS } from "./agent/repair";
 
 // --- Capability profiler / Photon Bench (M7) ------------------------------
-export { runBench, BENCH_VERSION, type BenchOptions } from "./bench/bench";
+export {
+  runBench,
+  evaluateCodingPatchOutput,
+  compareRoutingVsBaseline,
+  BENCH_VERSION,
+  type BenchOptions,
+  type CodingOutcomeMetrics,
+  type RoutingEvalOutcome,
+  type RoutingComparisonReport,
+} from "./bench/bench";
 
 // --- Workspace indexing (M10) ---------------------------------------------
-export { WorkspaceIndex } from "./index/indexer";
+export {
+  WorkspaceIndex,
+  shouldIndexFile,
+  evaluateRetrieval,
+  MAX_INDEXABLE_FILE_BYTES,
+  type RetrievalEvalCase,
+  type RetrievalEvalReport,
+} from "./index/indexer";
 export { VectorStore } from "./index/vectorStore";
 export { chunkText } from "./index/chunker";
 export type { Chunk, IndexedChunk, RetrievedChunk, EmbedFn } from "./index/types";
@@ -87,7 +118,20 @@ export type { Chunk, IndexedChunk, RetrievedChunk, EmbedFn } from "./index/types
 // --- Tools + MCP (M11) -----------------------------------------------------
 export { ToolRegistry } from "./tools/registry";
 export { builtinTools } from "./tools/builtin";
-export { McpManager, MCP_PREFIX, type McpServerConfig } from "./tools/mcp/bridge";
+export {
+  McpManager,
+  MCP_PREFIX,
+  type McpServerConfig,
+  type McpToolPermission,
+  type McpServerPermissions,
+  type McpAuditEntry,
+} from "./tools/mcp/bridge";
+export {
+  validateRemoteEndpoint,
+  isPrivateOrProhibitedIp,
+  isSafeRemoteHostname,
+  type EndpointValidationResult,
+} from "./tools/mcp/dnsValidator";
 export type { ToolContext, Tool, ToolResult } from "./tools/types";
 
 // --- Prompt + protocol -----------------------------------------------------

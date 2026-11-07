@@ -15,7 +15,7 @@ export class SessionStore {
 
   loadAll(): SessionState[] {
     const raw = this.context.globalState.get<SessionState[]>(STORAGE_KEY, []);
-    return [...raw].sort((a, b) => b.updatedAt - a.updatedAt);
+    return [...raw].map(sanitizeRestoredSession).sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
   async upsert(session: SessionState): Promise<void> {
@@ -63,12 +63,28 @@ export function toSummary(session: SessionState): SessionSummary {
   };
 }
 
-function capForStorage(s: SessionState): SessionState {
+function sanitizeRestoredSession(s: SessionState): SessionState {
+  return {
+    ...s,
+    messages: (s.messages ?? []).map((m) => ({
+      ...m,
+      streaming: false,
+      toolCalls: m.toolCalls?.map((c) =>
+        c.status === "running" || c.status === "proposed"
+          ? { ...c, status: "error" as const, error: c.error ?? "Interrupted before completion." }
+          : c
+      ),
+    })),
+  };
+}
+
+export function capForStorage(s: SessionState): SessionState {
   const msgs = s.messages.length > MAX_PERSISTED_MESSAGES ? s.messages.slice(-MAX_PERSISTED_MESSAGES) : s.messages;
   return {
     ...s,
     messages: msgs.map((m) => ({
       ...m,
+      streaming: false,
       content: m.content.length > MAX_PERSISTED_MSG_CONTENT ? m.content.slice(0, MAX_PERSISTED_MSG_CONTENT) + `\n… [truncated ${m.content.length - MAX_PERSISTED_MSG_CONTENT} chars for storage]` : m.content,
       // Reasoning traces are display-only (never fed back to the model):
       // keep a truncated copy so the collapsed block survives reloads.

@@ -5,6 +5,7 @@ import { toNativeTools } from "../protocol/serialize";
 import { estimateTokens } from "../adaptive/tokens";
 import { clamp } from "../tools/types";
 import type { Tool, ToolContext } from "../tools/types";
+import { classifyRuntimeError, formatNativeToolOutcome, sanitizeToolPairing } from "./errorRecovery";
 
 /**
  * CLOUD ENGINE — token-economical native tool-calling loop for frontier cloud models.
@@ -533,15 +534,29 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
       return;
     }
     if (streamError) {
-      if (streamRetries < MAX_STREAM_RETRIES) {
+      const classified = classifyRuntimeError(streamError, signal);
+      if (classified.category === "cancelled" || signal.aborted) {
+        emitter.onGenerationStats(null);
+        emitter.onDone(
+          assistantId,
+          !content.trim() && calls.length === 0 ? "Stopped before the model replied." : "Stopped."
+        );
+        return;
+      }
+      if (
+        classified.retryable &&
+        streamRetries < MAX_STREAM_RETRIES &&
+        !content.trim() &&
+        calls.length === 0
+      ) {
         streamRetries++;
-        ctx.log(`[cloud] stream error (${(streamError as Error).message}) — retrying.`);
+        ctx.log(`[cloud] transient ${classified.category} error (${classified.rawMessage}) — retrying (${streamRetries}/${MAX_STREAM_RETRIES}).`);
         emitter.onAssistantCancel(assistantId);
         step--;
         continue;
       }
       emitter.onGenerationStats(null);
-      emitter.onError(`Model error: ${(streamError as Error).message}`);
+      emitter.onError(classified.userMessage);
       emitter.onDone(assistantId);
       return;
     }
@@ -639,6 +654,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
     const runOneCall = async (ec: { pending: PendingCall; tool?: Tool; callObj: ToolCall }) => {
       const { pending: c, tool, callObj } = ec;
       emitter.onPhase("working", c.name);
+      emitter.onToolUpdate(assistantId, { ...callObj, status: "running" });
       let output: string;
       let okResult: boolean;
       if (!tool) {
@@ -665,7 +681,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
         role: "tool" as const,
         tool_call_id: c.id,
         name: c.name,
-        content: clamp(output, MAX_TOOL_RESULT_CHARS),
+        content: formatNativeToolOutcome(c.name, clamp(output, MAX_TOOL_RESULT_CHARS), okResult),
       };
     };
 
@@ -744,8 +760,10 @@ function fitToWindow(system: string, history: LLMMessage[], window: number, _mod
     cut++;
     if (keepFirst && cut === 1) cut = 2;
   }
-  if (keepFirst) return [systemMsg(system), history[0], ...history.slice(Math.max(cut, 1))];
-  return [systemMsg(system), ...history.slice(cut)];
+  const rawFitted = keepFirst
+    ? [systemMsg(system), history[0], ...history.slice(Math.max(cut, 1))]
+    : [systemMsg(system), ...history.slice(cut)];
+  return sanitizeToolPairing(rawFitted);
 }
 
 function systemMsg(content: string): LLMMessage {
@@ -768,7 +786,7 @@ export function cloudHistoryFromSession(messages: ChatMessage[]): LLMMessage[] {
       if (images.length) msg.images = images;
       out.push(msg);
     } else if (m.role === "assistant") {
-      const calls = (m.toolCalls ?? []).filter((c) => c.status !== "error" || c.result !== undefined);
+      const calls = m.toolCalls ?? [];
       if (calls.length) {
         out.push({
           role: "assistant",
@@ -780,21 +798,27 @@ export function cloudHistoryFromSession(messages: ChatMessage[]): LLMMessage[] {
           })),
         });
         for (const c of calls) {
-          if (c.result !== undefined) {
-            out.push({
-              role: "tool",
-              tool_call_id: c.id,
-              name: c.name,
-              content: c.result,
-            });
-          }
+          const outcome =
+            c.result !== undefined
+              ? c.result
+              : c.error !== undefined
+              ? c.error
+              : c.status === "denied"
+              ? "Tool execution declined by user."
+              : "Tool execution was cancelled.";
+          out.push({
+            role: "tool",
+            tool_call_id: c.id,
+            name: c.name,
+            content: outcome,
+          });
         }
       } else if (m.content.trim()) {
         out.push({ role: "assistant", content: m.content });
       }
     } else if (m.role === "tool") {
-      out.push({ role: "tool", content: m.content });
+      out.push({ role: "tool", content: m.content, tool_call_id: (m as any).toolCallId, name: (m as any).name });
     }
   }
-  return out;
+  return sanitizeToolPairing(out);
 }

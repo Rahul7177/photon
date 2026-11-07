@@ -1,9 +1,10 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 
-import type { LocalRuntimeId, LocalRuntimeInfo, LocalRuntimeState, PortOwner } from "../../shared/types";
+import type { LocalRuntimeId, LocalRuntimeInfo, LocalRuntimeState, ModelInfo, PortOwner } from "../../shared/types";
 
 const execAsync = promisify(exec);
 
@@ -99,7 +100,7 @@ export function defaultDeps(): DetectorDeps {
       const { stdout } = await execAsync(cmd, { timeout: 3000, windowsHide: true });
       return stdout;
     },
-    timeoutMs: 400,
+    timeoutMs: 2000,
   };
 }
 
@@ -126,11 +127,17 @@ export function candidatePaths(
   const j = (...p: string[]) => joinFor(platform, ...p);
 
   if (platform === "win32") {
-    const local = env.LOCALAPPDATA;
-    const pf = env.PROGRAMFILES;
+    const local = env.LOCALAPPDATA ?? env.LocalAppData ?? (env.USERPROFILE ? j(env.USERPROFILE, "AppData", "Local") : undefined);
+    const pf = env.PROGRAMFILES ?? env.ProgramFiles;
     if (id === "ollama") {
-      if (local) out.push(j(local, "Programs", "Ollama", "ollama.exe"));
-      if (pf) out.push(j(pf, "Ollama", "ollama.exe"));
+      if (local) {
+        out.push(j(local, "Programs", "Ollama", "ollama.exe"));
+        out.push(j(local, "Programs", "Ollama", "ollama app.exe"));
+      }
+      if (pf) {
+        out.push(j(pf, "Ollama", "ollama.exe"));
+        out.push(j(pf, "Ollama", "ollama app.exe"));
+      }
     } else if (id === "lmstudio" && local) {
       const root = j(local, "LM-Studio");
       for (const d of deps.listDir(root)) {
@@ -163,17 +170,27 @@ export function candidatePaths(
 
 async function registryOllamaPath(deps: DetectorDeps): Promise<string | undefined> {
   if (deps.platform !== "win32") return undefined;
-  try {
-    const out = await deps.run(
-      'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall" /s /v InstallLocation /f Ollama'
-    );
-    const m = out.match(/InstallLocation\s+REG_SZ\s+(.+)/i);
-    if (m) {
-      const candidate = path.win32.join(m[1].trim(), "ollama.exe");
-      if (deps.fileExists(candidate)) return candidate;
+  const queries = [
+    'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall" /s /v InstallLocation /f Ollama',
+    'reg query "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall" /s /v InstallLocation /f Ollama',
+  ];
+  for (const cmd of queries) {
+    try {
+      const out = await deps.run(cmd);
+      const lines = out.split(/\r?\n/);
+      for (const line of lines) {
+        const m = line.match(/InstallLocation\s+REG_SZ\s+(.+)/i);
+        if (m) {
+          const dir = m[1].trim();
+          const cand1 = path.win32.join(dir, "ollama.exe");
+          if (deps.fileExists(cand1)) return cand1;
+          const cand2 = path.win32.join(dir, "ollama app.exe");
+          if (deps.fileExists(cand2)) return cand2;
+        }
+      }
+    } catch {
+      /* key absent — try next */
     }
-  } catch {
-    /* key absent — not installed via registry */
   }
   return undefined;
 }
@@ -194,6 +211,23 @@ export async function findBinary(
     if (deps.fileExists(p)) return p;
   }
   if (spec.id === "ollama") {
+    if (deps.platform === "win32") {
+      try {
+        const whereOut = await deps.run("where.exe ollama.exe");
+        const match = whereOut.split(/\r?\n/).map((l) => l.trim()).find((l) => l.toLowerCase().endsWith(".exe"));
+        if (match && deps.fileExists(match)) return match;
+      } catch {
+        /* not in where.exe */
+      }
+    } else {
+      try {
+        const whichOut = await deps.run("which ollama");
+        const match = whichOut.split(/\r?\n/).map((l) => l.trim())[0];
+        if (match && deps.fileExists(match)) return match;
+      } catch {
+        /* not in which */
+      }
+    }
     const reg = await registryOllamaPath(deps);
     if (reg) return reg;
     if (deps.platform === "linux") {
@@ -356,4 +390,80 @@ export async function detectLocalRuntimes(
   const deps = { ...defaultDeps(), ...overrides };
   return Promise.all(RUNTIME_SPECS.map((s) => detectRuntime(s, deps)));
 }
+
+/**
+ * Sense installed Ollama models directly from disk manifests (`~/.ollama/models/manifests`
+ * or `OLLAMA_MODELS/manifests`) so Photon knows which models are already downloaded even
+ * before the Ollama server daemon is started or if it's temporarily unreachable.
+ */
+export function scanDiskOllamaModels(
+  homedir: string = os.homedir(),
+  env: NodeJS.ProcessEnv = process.env
+): ModelInfo[] {
+  try {
+    const modelsRoot = env.OLLAMA_MODELS
+      ? env.OLLAMA_MODELS.trim()
+      : path.join(homedir, ".ollama", "models");
+    const manifestsRoot = path.join(modelsRoot, "manifests");
+    if (!fs.existsSync(manifestsRoot)) return [];
+
+    const results: ModelInfo[] = [];
+    const seen = new Set<string>();
+
+    const walk = (dir: string, relParts: string[]) => {
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(fullPath, [...relParts, entry.name]);
+        } else if (entry.isFile() && relParts.length >= 2) {
+          // Typical layout: registry.ollama.ai / library / <model> / <tag>
+          // or registry.ollama.ai / <namespace> / <model> / <tag>
+          const tag = entry.name;
+          const withoutRegistry =
+            relParts[0].includes(".") ? relParts.slice(1) : relParts;
+          if (withoutRegistry.length === 0) continue;
+          const modelPath =
+            withoutRegistry[0] === "library" && withoutRegistry.length >= 2
+              ? withoutRegistry.slice(1).join("/")
+              : withoutRegistry.join("/");
+          const name = `${modelPath}:${tag}`;
+          if (seen.has(name.toLowerCase())) continue;
+          seen.add(name.toLowerCase());
+
+          let sizeBytes: number | undefined;
+          try {
+            const raw = fs.readFileSync(fullPath, "utf8");
+            const parsed = JSON.parse(raw) as {
+              layers?: Array<{ mediaType?: string; size?: number }>;
+            };
+            if (Array.isArray(parsed.layers)) {
+              const total = parsed.layers.reduce((acc, l) => acc + (typeof l.size === "number" ? l.size : 0), 0);
+              if (total > 0) sizeBytes = total;
+            }
+          } catch {
+            /* ignore malformed manifest */
+          }
+
+          results.push({
+            name,
+            sizeBytes,
+            provider: "ollama",
+          });
+        }
+      }
+    };
+
+    walk(manifestsRoot, []);
+    return results;
+  } catch {
+    return [];
+  }
+}
+
 

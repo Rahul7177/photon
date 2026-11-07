@@ -71,6 +71,35 @@ describe("binary discovery", () => {
     assert.equal(byId(r, "ollama").binaryPath, p);
   });
 
+  it("finds ollama via Windows registry even when preceded by unrelated InstallLocations", async () => {
+    const p = "C:\\Users\\test\\AppData\\Local\\Programs\\Ollama\\ollama.exe";
+    const regOutput = [
+      "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\GitHubDesktop",
+      "    InstallLocation    REG_SZ    C:\\Users\\test\\AppData\\Local\\GitHubDesktop",
+      "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{44E83376-CE68-45EB-8FC1-393500EB558C}_is1",
+      "    InstallLocation    REG_SZ    C:\\Users\\test\\AppData\\Local\\Programs\\Ollama\\",
+    ].join("\r\n");
+
+    const r = await detectLocalRuntimes(
+      makeDeps({
+        files: [p],
+        commands: { "reg query": regOutput },
+      })
+    );
+    assert.equal(byId(r, "ollama").binaryPath, p);
+  });
+
+  it("finds ollama via where.exe fallback on Windows", async () => {
+    const p = "C:\\Custom\\Ollama\\ollama.exe";
+    const r = await detectLocalRuntimes(
+      makeDeps({
+        files: [p],
+        commands: { "where.exe": `${p}\r\n` },
+      })
+    );
+    assert.equal(byId(r, "ollama").binaryPath, p);
+  });
+
   it("finds LM Studio lms.exe under versioned app-* dir", () => {
     const paths = candidatePaths("lmstudio", {
       platform: "win32",

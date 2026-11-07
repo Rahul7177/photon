@@ -31,7 +31,26 @@ export interface EngineDeps {
 }
 
 /**
- * Local AgentEngine — delegates directly to the unified engine loop.
+ * Canonical Agent Execution Architecture (P1 Item 5):
+ *
+ * Photon routes every user prompt through `PhotonController.runPrompt()`, which executes:
+ *  1. Adaptive / Cloud Plan Resolution (`planRequest` or `cloudPlan`).
+ *  2. Automatic Context Compaction check (`shouldAutoCompact` at 75% of active model's context limit).
+ *  3. Checkpoint Turn Initialization (`CheckpointManager.beginTurn`).
+ *  4. Engine Dispatch based on `interfaceMode`:
+ *     - Local Mode (`interfaceMode === "local"`):
+ *       `AgentEngine.runTurn()` -> `runUnifiedTurn()` (`./unifiedEngine.ts`).
+ *       Uses `ToolPipeline` (`../../photon-core/tools/pipeline.ts`), adaptive context fitting (`fitToWindow`),
+ *       dual tool protocol support (`photon-block` and `native`), bounded repair/narration nudges,
+ *       and sequential tool-call draining for smaller local models.
+ *     - Cloud Mode (`interfaceMode === "cloud"`):
+ *       `PhotonController.runCloudTurn()` -> `runCloudTurn()` (`./cloudEngine.ts`).
+ *       Purpose-built for frontier cloud APIs with native function calling, parallel read-only tool waves,
+ *       industry tool-name aliasing (`normalizeCloudToolCall`), stale tool-output deduplication
+ *       (`compactCloudHistory`), and exact provider token/cache accounting.
+ *  5. Post-Turn Finalization:
+ *     Stream state cleanup (`streaming = false`), cross-model handoff (`ProjectContextManager.recordTurnHandoff`),
+ *     checkpoint commit (`CheckpointManager.commitTurn`), and session persistence.
  */
 export class AgentEngine {
   constructor(private deps: EngineDeps) {}

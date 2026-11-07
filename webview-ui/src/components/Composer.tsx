@@ -1,5 +1,12 @@
 import { useRef, useState, useEffect, useMemo } from "react";
-import type { Attachment, Mode, ThinkingSetting } from "../../../src/shared/types";
+import {
+  isLocalModel,
+  matchInstalledModelName,
+  type Attachment,
+  type Mode,
+  type ModelInfo,
+  type ThinkingSetting,
+} from "../../../src/shared/types";
 import type { AppState, Actions } from "../state/store";
 import { ContextMeter, ContextIconTrigger } from "./ContextMeter";
 import { PullProgressBar } from "./PullProgressBar";
@@ -20,11 +27,30 @@ import {
   BoltIcon,
   RewindIcon,
 } from "./Icons";
+import { ProviderLogo } from "./ProviderLogos";
 
-const MODES: { id: Mode; label: string; hint: string; icon: JSX.Element }[] = [
-  { id: "chat", label: "Chat", hint: "Direct conversation & code snippets without workspace edits", icon: <ChatModeIcon /> },
-  { id: "plan", label: "Plan", hint: "Read-only investigation → step-by-step architecture plan", icon: <PlanModeIcon /> },
-  { id: "agent", label: "Agent", hint: "Autonomous file edits, terminal execution, and verification", icon: <AgentModeIcon /> },
+const MODES: { id: Mode; label: string; badge: string; hint: string; icon: JSX.Element }[] = [
+  {
+    id: "chat",
+    label: "Chat",
+    badge: "No file edits",
+    hint: "Direct conversation & code snippets without workspace edits",
+    icon: <ChatModeIcon />,
+  },
+  {
+    id: "plan",
+    label: "Plan",
+    badge: "Read-only tools",
+    hint: "Read-only investigation → step-by-step architecture plan",
+    icon: <PlanModeIcon />,
+  },
+  {
+    id: "agent",
+    label: "Agent",
+    badge: "Edits & commands",
+    hint: "Autonomous file edits, terminal execution, and verification",
+    icon: <AgentModeIcon />,
+  },
 ];
 
 const THINKING_OPTIONS: Array<{ value: ThinkingSetting; label: string }> = [
@@ -35,8 +61,6 @@ const THINKING_OPTIONS: Array<{ value: ThinkingSetting; label: string }> = [
   { value: "high", label: "High" },
   { value: "xtrahigh", label: "Extra High" },
 ];
-
-const AUTO = "__auto__";
 
 const SLASH_COMMANDS: Array<{
   cmd: string;
@@ -85,9 +109,18 @@ function ModeDropdown({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => v
         setOpen(false);
       }
     }
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setOpen(false);
+      }
+    }
     if (open) {
       document.addEventListener("mousedown", handleClickOutside);
-      return () => document.removeEventListener("mousedown", handleClickOutside);
+      document.addEventListener("keydown", handleKeyDown);
+      return () => {
+        document.removeEventListener("mousedown", handleClickOutside);
+        document.removeEventListener("keydown", handleKeyDown);
+      };
     }
   }, [open]);
 
@@ -97,16 +130,17 @@ function ModeDropdown({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => v
         type="button"
         className="mode-dropdown-trigger"
         onClick={() => setOpen(!open)}
-        title={currentMode.hint}
+        title={`${currentMode.label} mode (${currentMode.badge}) — ${currentMode.hint}`}
+        aria-label={`Select mode (current: ${currentMode.label} — ${currentMode.badge})`}
         aria-haspopup="listbox"
         aria-expanded={open}
       >
-        <span className="mode-dropdown-icon">{currentMode.icon}</span>
+        <span className="mode-dropdown-icon" aria-hidden="true">{currentMode.icon}</span>
         <span>{currentMode.label}</span>
         <ChevronDownIcon />
       </button>
       {open && (
-        <ul className="mode-dropdown-menu" role="listbox">
+        <ul className="mode-dropdown-menu" role="listbox" aria-label="Interaction modes">
           {MODES.map((m) => (
             <li key={m.id} role="option" aria-selected={mode === m.id}>
               <button
@@ -118,9 +152,12 @@ function ModeDropdown({ mode, onChange }: { mode: Mode; onChange: (m: Mode) => v
                 }}
                 title={m.hint}
               >
-                <span className="mode-dropdown-icon">{m.icon}</span>
+                <span className="mode-dropdown-icon" aria-hidden="true">{m.icon}</span>
                 <div className="mode-dropdown-item-text">
-                  <span className="mode-dropdown-item-label">{m.label}</span>
+                  <div className="mode-dropdown-item-top">
+                    <span className="mode-dropdown-item-label">{m.label}</span>
+                    <span className="mode-dropdown-item-badge">{m.badge}</span>
+                  </div>
                   <span className="mode-dropdown-item-hint">{m.hint}</span>
                 </div>
               </button>
@@ -150,28 +187,78 @@ function ModelDropdown({
         setOpen(false);
       }
     }
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setOpen(false);
+      }
+    }
     if (open) {
       document.addEventListener("mousedown", handleClickOutside);
-      return () => document.removeEventListener("mousedown", handleClickOutside);
+      document.addEventListener("keydown", handleKeyDown);
+      return () => {
+        document.removeEventListener("mousedown", handleClickOutside);
+        document.removeEventListener("keydown", handleKeyDown);
+      };
     }
   }, [open]);
 
+  const localModels = useMemo(
+    () => state.models.filter(isLocalModel),
+    [state.models]
+  );
+
+  const cloudGroups = useMemo(() => {
+    if (state.config.interfaceMode !== "cloud") return [];
+    const map = new Map<string, { id: string; label: string; models: typeof state.models }>();
+    const cloudModels = state.models.filter((m) => !isLocalModel(m));
+    for (const m of cloudModels) {
+      let pid = m.provider || "custom";
+      if ((!m.provider || pid === "custom") && m.name.includes(":")) {
+        pid = m.name.split(":")[0];
+      }
+      const prov = state.config.providers.find((p) => p.id === pid);
+      const label = prov?.label || pid.charAt(0).toUpperCase() + pid.slice(1);
+      if (!map.has(pid)) {
+        map.set(pid, { id: pid, label, models: [] });
+      }
+      map.get(pid)!.models.push(m);
+    }
+    return Array.from(map.values());
+  }, [state.config.interfaceMode, state.models, state.config.providers]);
+
+  const activeCount = state.config.interfaceMode === "local" ? localModels.length : cloudGroups.length;
   const isDisabled =
-    state.models.length === 0 &&
+    activeCount === 0 &&
     (!state.recommendations || state.recommendations.models.length === 0);
+
+  const currentProviderId = useMemo(() => {
+    if (state.config.interfaceMode !== "cloud" || !state.selectedModel || state.config.autoSelectModel) {
+      return undefined;
+    }
+    if (state.selectedModel.includes(":")) {
+      return state.selectedModel.split(":")[0];
+    }
+    return undefined;
+  }, [state.config.interfaceMode, state.selectedModel, state.config.autoSelectModel]);
+
+  const currentProviderLabel = useMemo(() => {
+    if (!currentProviderId) return undefined;
+    const p = state.config.providers.find((prov) => prov.id === currentProviderId);
+    return p?.label || currentProviderId;
+  }, [currentProviderId, state.config.providers]);
 
   const currentLabel = useMemo(() => {
     if (!state.ready) return "Loading models…";
     if (state.config.autoSelectModel) return "Auto-Select";
     if (!state.selectedModel) {
-      return state.models.length === 0 ? "No models configured" : "Select model";
+      return activeCount === 0 ? "No models configured" : "Select model";
     }
     const cleanName =
       state.config.interfaceMode === "cloud" && state.selectedModel.includes(":")
         ? state.selectedModel.split(":").slice(1).join(":")
         : state.selectedModel;
     return cleanName;
-  }, [state.ready, state.config.autoSelectModel, state.selectedModel, state.config.interfaceMode, state.models.length]);
+  }, [state.ready, state.config.autoSelectModel, state.selectedModel, state.config.interfaceMode, activeCount]);
 
   return (
     <div className={`model-dropdown${open ? " open" : ""}`} ref={wrapperRef}>
@@ -183,27 +270,37 @@ function ModelDropdown({
         title={
           state.config.autoSelectModel
             ? `Auto — Photon picks the model per request${state.selectedModel ? ` (last: ${state.selectedModel})` : ""}`
-            : state.selectedModel
+            : state.selectedModel || "Select model"
         }
+        aria-label={`Select model (current: ${currentLabel})`}
         aria-haspopup="listbox"
         aria-expanded={open}
       >
+        {currentProviderId && (
+          <span className="model-dropdown-trigger-logo" title={currentProviderLabel} aria-hidden="true">
+            <ProviderLogo providerId={currentProviderId} label={currentProviderLabel} size={13} />
+          </span>
+        )}
         <span className="model-dropdown-label">{currentLabel}</span>
         <ChevronDownIcon />
       </button>
 
       {open && (
-        <div className="model-dropdown-menu" role="listbox">
+        <div className="model-dropdown-menu" role="listbox" aria-label="Available models">
           {!state.ready && (
             <div className="model-dropdown-empty">Loading models…</div>
           )}
-          {state.ready && state.models.length === 0 && (!state.recommendations || state.recommendations.models.length === 0) && (
-            <div className="model-dropdown-empty">No models configured</div>
+          {state.ready && activeCount === 0 && (!state.recommendations || state.recommendations.models.length === 0) && (
+            <div className="model-dropdown-empty">
+              No {state.config.interfaceMode === "local" ? "local" : "cloud"} models configured
+            </div>
           )}
 
-          {state.ready && state.models.length > 0 && (
+          {state.ready && activeCount > 0 && (
             <button
               type="button"
+              role="option"
+              aria-selected={state.config.autoSelectModel}
               className={`model-dropdown-item${state.config.autoSelectModel ? " active" : ""}`}
               onClick={() => {
                 actions.setAutoSelect(true);
@@ -211,21 +308,25 @@ function ModelDropdown({
               }}
             >
               <span className="model-dropdown-item-title">Auto-Select</span>
+              <span className="model-dropdown-item-meta">Adaptive per task</span>
             </button>
           )}
 
           {state.config.interfaceMode === "local" ? (
             <>
-              {state.models.length > 0 && (
+              {localModels.length > 0 && (
                 <div className="model-dropdown-section-header">Installed Local Models</div>
               )}
-              {state.models.map((m) => {
+              {localModels.map((m) => {
                 const isSelected = !state.config.autoSelectModel && state.selectedModel === m.name;
                 const tps = benchTps(state.benchResults, m.name);
+                const isBestFit = state.recommendations?.bestInstalledName === m.name;
                 return (
                   <button
                     key={m.name}
                     type="button"
+                    role="option"
+                    aria-selected={isSelected}
                     className={`model-dropdown-item${isSelected ? " active" : ""}`}
                     onClick={() => {
                       actions.setModel(m.name);
@@ -233,9 +334,14 @@ function ModelDropdown({
                     }}
                     title={m.name}
                   >
-                    <span className="model-dropdown-item-title">{m.name}</span>
-                    {(m.tier || tps) && (
+                    <span className="model-dropdown-item-title">
+                      {m.name}
+                      {isBestFit ? " ★" : ""}
+                    </span>
+                    {(m.tier || tps || isBestFit) && (
                       <span className="model-dropdown-item-meta">
+                        {isBestFit ? " Best Fit" : ""}
+                        {isBestFit && (m.tier || tps) ? " · " : ""}
                         {m.tier ? `${m.tier}` : ""}
                         {m.tier && tps ? " · " : ""}
                         {tps ? `${tps} tok/s` : ""}
@@ -246,8 +352,9 @@ function ModelDropdown({
               })}
 
               {(() => {
+                const installedNames = localModels.map((m) => m.name);
                 const uninstalled = (state.recommendations?.models || []).filter(
-                  (rec) => !state.models.some((m) => m.name.toLowerCase() === rec.name.toLowerCase())
+                  (rec) => !rec.installed && !matchInstalledModelName(rec.name, installedNames)
                 );
                 if (uninstalled.length === 0) return null;
                 return (
@@ -276,25 +383,42 @@ function ModelDropdown({
             </>
           ) : (
             <>
-              {state.models.map((m) => {
-                const isSelected = !state.config.autoSelectModel && state.selectedModel === m.name;
-                const cleanName =
-                  m.name.includes(":") ? m.name.split(":").slice(1).join(":") : m.name;
-                return (
-                  <button
-                    key={m.name}
-                    type="button"
-                    className={`model-dropdown-item${isSelected ? " active" : ""}`}
-                    onClick={() => {
-                      actions.setModel(m.name);
-                      setOpen(false);
-                    }}
-                    title={m.name}
-                  >
-                    <span className="model-dropdown-item-title">{cleanName}</span>
-                  </button>
-                );
-              })}
+              {cloudGroups.length === 0 && state.models.length > 0 && (
+                <div className="model-dropdown-empty">No cloud models configured</div>
+              )}
+              {cloudGroups.map((group) => (
+                <div key={group.id} className="model-dropdown-group">
+                  <div className="model-dropdown-provider-header">
+                    <ProviderLogo providerId={group.id} label={group.label} size={13} />
+                    <span className="model-dropdown-provider-name">{group.label}</span>
+                  </div>
+                  {group.models.map((m) => {
+                    const isSelected = !state.config.autoSelectModel && state.selectedModel === m.name;
+                    const cleanName =
+                      m.name.includes(":") ? m.name.split(":").slice(1).join(":") : m.name;
+                    const testRes = state.modelTestResults[m.name];
+                    return (
+                      <button
+                        key={m.name}
+                        type="button"
+                        role="option"
+                        aria-selected={isSelected}
+                        className={`model-dropdown-item${isSelected ? " active" : ""}`}
+                        onClick={() => {
+                          actions.setModel(m.name);
+                          setOpen(false);
+                        }}
+                        title={m.name}
+                      >
+                        <span className="model-dropdown-item-title">{cleanName}</span>
+                        {testRes && testRes.ok && (
+                          <span className="model-dropdown-item-meta">{testRes.latencyMs}ms</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
             </>
           )}
         </div>
@@ -332,6 +456,16 @@ export function Composer({
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
+  // Close tuning popover on Escape
+  useEffect(() => {
+    if (!tuningOpen) return;
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setTuningOpen(false);
+    };
+    document.addEventListener("keydown", onEsc);
+    return () => document.removeEventListener("keydown", onEsc);
+  }, [tuningOpen]);
+
   // Automatically insert draft prompt (e.g. from checkpoint rollback / rewind chat)
   useEffect(() => {
     if (typeof state.draftPrompt === "string" && state.draftPrompt.length > 0) {
@@ -362,6 +496,15 @@ export function Composer({
   const canSend = (text.trim().length > 0 || attachments.length > 0) && !!state.selectedModel && !busy;
   const model = state.models.find((m) => m.name === state.selectedModel);
   const supportsVision = model?.vision === true;
+
+  const currentModeInfo = MODES.find((m) => m.id === state.mode) || MODES[0];
+  const isCloudMode = state.config.interfaceMode === "cloud";
+  const activeCloudProviderLabel = useMemo(() => {
+    if (!isCloudMode || !state.selectedModel) return "Cloud API";
+    const prefix = state.selectedModel.includes(":") ? state.selectedModel.split(":")[0] : "";
+    const p = state.config.providers.find((x) => x.id === prefix);
+    return p?.label || (prefix ? prefix.toUpperCase() : "Cloud API");
+  }, [isCloudMode, state.selectedModel, state.config.providers]);
 
   const submit = () => {
     const trimmed = text.trim();
@@ -467,7 +610,7 @@ export function Composer({
     <div className="composer">
       {/* Progressive-Disclosure Context & Runtime Tuning Popover */}
       {tuningOpen && (
-        <div className="tuning-popover">
+        <div className="tuning-popover" role="dialog" aria-label="Context and runtime tuning">
           <div className="tuning-popover-head">
             <span className="tuning-popover-title">Context &amp; Runtime</span>
             <div className="tuning-popover-actions">
@@ -476,6 +619,7 @@ export function Composer({
                 className="icon-btn"
                 onClick={actions.refreshModels}
                 title="Refresh available models"
+                aria-label="Refresh available models"
               >
                 <RefreshIcon />
               </button>
@@ -483,7 +627,8 @@ export function Composer({
                 type="button"
                 className="icon-btn"
                 onClick={() => setTuningOpen(false)}
-                title="Close"
+                title="Close (Esc)"
+                aria-label="Close context and runtime popover"
               >
                 <CloseIcon />
               </button>
@@ -507,8 +652,9 @@ export function Composer({
 
           <div className="tuning-grid">
             <div className="tuning-field">
-              <label className="tuning-label">Context Limit</label>
+              <label className="tuning-label" htmlFor="photon-ctx-limit-select">Context Limit</label>
               <select
+                id="photon-ctx-limit-select"
                 className="tuning-select"
                 value={
                   state.config.interfaceMode === "cloud"
@@ -552,8 +698,9 @@ export function Composer({
             </div>
 
             <div className="tuning-field">
-              <label className="tuning-label">Reasoning</label>
+              <label className="tuning-label" htmlFor="photon-reasoning-select">Reasoning</label>
               <select
+                id="photon-reasoning-select"
                 className="tuning-select"
                 value={
                   thinkingSupported && thinkingOptions.some((o) => o.value === state.config.thinkingLevel)
@@ -574,13 +721,13 @@ export function Composer({
         </div>
       )}
 
-      {attachError && <div className="attach-error">{attachError}</div>}
+      {attachError && <div className="attach-error" role="alert">{attachError}</div>}
 
       {attachments.length > 0 && (
-        <div className="attach-row">
+        <div className="attach-row" aria-label="Attached files">
           {attachments.map((a) => (
             <div key={a.id} className="attach-chip" title={a.name}>
-              <span className="attach-kind">
+              <span className="attach-kind" aria-hidden="true">
                 {a.kind === "image" ? <ImageFileIcon /> : <FileCodeIcon />}
               </span>
               <span className="attach-name">{a.name}</span>
@@ -589,7 +736,8 @@ export function Composer({
                 type="button"
                 className="attach-remove"
                 onClick={() => setAttachments((list) => list.filter((x) => x.id !== a.id))}
-                title="Remove attachment"
+                title={`Remove ${a.name}`}
+                aria-label={`Remove attachment ${a.name}`}
               >
                 ×
               </button>
@@ -603,7 +751,7 @@ export function Composer({
 
       {/* Model Install Prompt Confirmation (Phase 5.3) */}
       {confirmInstallModel && (
-        <div className="model-install-prompt-banner">
+        <div className="model-install-prompt-banner" role="region" aria-label="Install model confirmation">
           <div className="prompt-left">
             <BoltIcon />
             <span>Install <strong>{confirmInstallModel}</strong> now?</span>
@@ -636,7 +784,7 @@ export function Composer({
 
       {/* Slash Commands Dropdown Menu */}
       {showSlashMenu && (
-        <div className="slash-menu-popover">
+        <div className="slash-menu-popover" role="listbox" aria-label="Slash commands">
           <div className="slash-menu-head">
             <span>Commands</span>
             <span className="slash-menu-hint">↑↓ to navigate · Enter to select · Esc to dismiss</span>
@@ -646,6 +794,8 @@ export function Composer({
               <button
                 key={item.cmd}
                 type="button"
+                role="option"
+                aria-selected={idx === slashIndex}
                 className={`slash-menu-item${idx === slashIndex ? " active" : ""}`}
                 onClick={() => {
                   item.run(actions, setText);
@@ -654,7 +804,7 @@ export function Composer({
                 onMouseEnter={() => setSlashIndex(idx)}
               >
                 <div className="slash-item-left">
-                  <span className="slash-item-icon">
+                  <span className="slash-item-icon" aria-hidden="true">
                     {item.cmd === "/revert" || item.cmd === "/rewind" ? (
                       <RewindIcon size={13} />
                     ) : (
@@ -677,6 +827,7 @@ export function Composer({
             ref={taRef}
             rows={1}
             value={text}
+            aria-label={placeholder(state)}
             placeholder={placeholder(state)}
             onChange={(e) => {
               setText(e.target.value);
@@ -703,6 +854,7 @@ export function Composer({
               type="button"
               className="attach-btn"
               title={supportsVision ? "Attach image or code file" : "Attach text or code file"}
+              aria-label={supportsVision ? "Attach image or code file" : "Attach text or code file"}
               onClick={() => fileRef.current?.click()}
               disabled={busy || !state.selectedModel}
             >
@@ -711,11 +863,17 @@ export function Composer({
 
             <ModeDropdown mode={state.mode} onChange={(m) => actions.setMode(m)} />
 
-            <span className="composer-divider" />
+            <span className="composer-divider" aria-hidden="true" />
 
-            <div className="iface-toggle" title="Switch between Local (Ollama/llama.cpp) and Cloud provider APIs">
+            <div
+              className="iface-toggle"
+              role="group"
+              aria-label="Inference execution target"
+              title="Switch between Local (on-device Ollama/llama.cpp) and Cloud provider APIs"
+            >
               <button
                 type="button"
+                aria-pressed={state.config.interfaceMode === "local"}
                 className={state.config.interfaceMode === "local" ? "active" : ""}
                 onClick={() => actions.setInterfaceMode("local")}
               >
@@ -723,6 +881,7 @@ export function Composer({
               </button>
               <button
                 type="button"
+                aria-pressed={state.config.interfaceMode === "cloud"}
                 className={state.config.interfaceMode === "cloud" ? "active" : ""}
                 onClick={() => actions.setInterfaceMode("cloud")}
               >
@@ -745,11 +904,24 @@ export function Composer({
               onClick={() => setTuningOpen((o) => !o)}
             />
             {busy ? (
-              <button type="button" className="send-btn stop" title="Stop generation" onClick={actions.cancel}>
+              <button
+                type="button"
+                className="send-btn stop"
+                title="Stop generation"
+                aria-label="Stop generation"
+                onClick={actions.cancel}
+              >
                 <StopSquareIcon />
               </button>
             ) : (
-              <button type="button" className="send-btn" title="Send message (Enter)" disabled={!canSend} onClick={submit}>
+              <button
+                type="button"
+                className="send-btn"
+                title="Send message (Enter)"
+                aria-label="Send message"
+                disabled={!canSend}
+                onClick={submit}
+              >
                 <SendArrowIcon />
               </button>
             )}

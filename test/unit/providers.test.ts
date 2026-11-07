@@ -169,5 +169,77 @@ describe("LLM Providers & SSE Event Stream Framing", () => {
       );
     });
   });
+
+  describe("Wire Model Stripping across Providers", () => {
+    it("OpenAICompatProvider strips provider prefix on wire request body", async () => {
+      let sentBody: any = null;
+      const originalFetch = globalThis.fetch;
+      try {
+        globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+          sentBody = JSON.parse(init?.body as string);
+          return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          });
+        }) as any;
+
+        const { OpenAICompatProvider } = await import("../../src/core/llm/providers/openaiCompatProvider");
+        const prov = new OpenAICompatProvider({
+          id: "nvidia",
+          label: "NVIDIA NIM",
+          baseUrl: "https://integrate.api.nvidia.com/v1",
+          apiKey: "nvapi-test",
+          enabled: true,
+          models: [{ id: "meta/llama-3.1-70b-instruct", name: "nvidia:meta/llama-3.1-70b-instruct", contextLength: 32768, toolTrained: true, tier: "large" }],
+        });
+
+        const chunks: any[] = [];
+        for await (const chunk of prov.chatStream({
+          model: "nvidia:meta/llama-3.1-70b-instruct",
+          messages: [{ role: "user", content: "hi" }],
+        })) {
+          chunks.push(chunk);
+        }
+
+        assert.ok(chunks.length > 0);
+        assert.equal(sentBody.model, "meta/llama-3.1-70b-instruct", "Must strip 'nvidia:' prefix for upstream API");
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it("AnthropicProvider strips 'claude:' prefix for wire requests", async () => {
+      let sentBody: any = null;
+      const originalFetch = globalThis.fetch;
+      try {
+        globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+          sentBody = JSON.parse(init?.body as string);
+          return new Response('event: message_delta\ndata: {"delta":{"text":"hello"}}\n\n', {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          });
+        }) as any;
+
+        const { AnthropicProvider } = await import("../../src/core/llm/providers/anthropicProvider");
+        const prov = new AnthropicProvider({
+          apiKey: "sk-ant-test",
+          enabled: true,
+          models: [{ id: "claude-3-5-sonnet-latest", name: "claude:claude-3-5-sonnet-latest", contextLength: 200000, toolTrained: true, tier: "large" }],
+        });
+
+        const chunks: any[] = [];
+        for await (const chunk of prov.chatStream({
+          model: "claude:claude-3-5-sonnet-latest",
+          messages: [{ role: "user", content: "hi" }],
+        })) {
+          chunks.push(chunk);
+        }
+
+        assert.equal(sentBody.model, "claude-3-5-sonnet-latest", "Must strip 'claude:' prefix for Anthropic API");
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+  });
 });
 

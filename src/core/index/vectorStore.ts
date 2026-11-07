@@ -25,19 +25,20 @@ export class VectorStore {
 
   /** Replace all chunks for a file (incremental re-index). Vectors normalized here. */
   setFile(path: string, chunks: IndexedChunk[]): void {
-    const normalized = chunks.map((c) => ({ ...c, vector: normalize(c.vector) }));
+    const normPath = normalizePathKey(path);
+    const normalized = chunks.map((c) => ({ ...c, path: normPath, vector: normalize(c.vector) }));
     if (normalized[0]?.vector.length) this.dim = normalized[0].vector.length;
-    this.byPath.set(path, normalized);
+    this.byPath.set(normPath, normalized);
     this.dirty = true;
     this.enforceCap();
   }
 
   removeFile(path: string): void {
-    if (this.byPath.delete(path)) this.dirty = true;
+    if (this.byPath.delete(normalizePathKey(path))) this.dirty = true;
   }
 
   hasFile(path: string): boolean {
-    return this.byPath.has(path);
+    return this.byPath.has(normalizePathKey(path));
   }
 
   clear(): void {
@@ -91,9 +92,10 @@ export class VectorStore {
       if (declaredDim && c.vector.length !== declaredDim) continue;
       // Reject non-finite / wrong-dim vectors outright.
       if (c.vector.length === 0 || !c.vector.every((x) => Number.isFinite(x))) continue;
-      const list = store.byPath.get(c.path) ?? [];
-      list.push(c);
-      store.byPath.set(c.path, list);
+      const normPath = normalizePathKey(c.path);
+      const list = store.byPath.get(normPath) ?? [];
+      list.push({ ...c, path: normPath });
+      store.byPath.set(normPath, list);
       loaded++;
     }
     store.dim = declaredDim || store.dim;
@@ -121,6 +123,10 @@ export class VectorStore {
     }
     this.dirty = true;
   }
+}
+
+function normalizePathKey(p: string): string {
+  return p.replace(/\\/g, "/").replace(/^\.\//, "");
 }
 
 function normalize(v: number[]): number[] {

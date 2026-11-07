@@ -69,10 +69,16 @@ export function RevertModal({
 
   return (
     <div className="modal-backdrop revert-modal-backdrop" onClick={onClose}>
-      <div className="revert-modal" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="revert-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Revert to Checkpoint"
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="revert-modal-head">
           <div className="revert-modal-title-row">
-            <span className="revert-modal-icon">
+            <span className="revert-modal-icon" aria-hidden="true">
               <RewindIcon size={16} />
             </span>
             <div>
@@ -87,6 +93,7 @@ export function RevertModal({
             className="icon-btn"
             onClick={onClose}
             title="Close (Esc)"
+            aria-label="Close Revert to Checkpoint modal"
           >
             <CloseIcon />
           </button>
@@ -115,6 +122,14 @@ export function RevertModal({
                     <span className="revert-checkpoint-file-count">
                       {cp.filesCount} file{cp.filesCount === 1 ? "" : "s"}
                     </span>
+                    {cp.hasUnrestorableFiles && (
+                      <span
+                        className="revert-checkpoint-warn-badge"
+                        title={`Large files (>2MB) without content snapshot: ${cp.unrestorableFiles?.join(", ")}`}
+                      >
+                        ⚠️ &gt;2MB files unrestorable
+                      </span>
+                    )}
                   </div>
 
                   <div className="revert-checkpoint-prompt" title={cp.label}>
@@ -123,9 +138,15 @@ export function RevertModal({
 
                   <div className="revert-checkpoint-files">
                     {cp.files.map((file) => (
-                      <span key={file} className="revert-file-tag" title={file}>
+                      <button
+                        key={file}
+                        type="button"
+                        className="revert-file-tag"
+                        title={`Open ${file} in editor`}
+                        onClick={() => actions.openFile(file)}
+                      >
                         {file}
-                      </span>
+                      </button>
                     ))}
                   </div>
 

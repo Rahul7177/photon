@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import type { AppState, Actions } from "../state/store";
 import { ClockIcon, GearIcon, LightbulbIcon, PlusIcon, BrainIcon, PhotonLogoIcon, CloseIcon } from "./Icons";
 import { SessionHistory } from "./SessionHistory";
@@ -18,6 +18,18 @@ export function Header({
   const [historyOpen, setHistoryOpen] = useState(false);
   const [autoOpen, setAutoOpen] = useState(false);
 
+  useEffect(() => {
+    if (!historyOpen && !autoOpen) return;
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setHistoryOpen(false);
+        setAutoOpen(false);
+      }
+    };
+    document.addEventListener("keydown", onEsc);
+    return () => document.removeEventListener("keydown", onEsc);
+  }, [historyOpen, autoOpen]);
+
   const sessionTitle = useMemo(() => {
     if (!state.activeSessionId) return "";
     const s = state.sessions.find((x) => x.id === state.activeSessionId);
@@ -36,7 +48,7 @@ export function Header({
     <header className="header">
       <div className="header-row">
         <div className="header-brand-group">
-          <span className="header-logo" aria-hidden title="Photon">
+          <span className="header-logo" aria-hidden="true" title="Photon">
             <PhotonLogoIcon size={16} />
           </span>
           <span className={`session-title ${!sessionTitle ? "brand-wordmark" : ""}`}>
@@ -46,8 +58,8 @@ export function Header({
 
         <div className="header-actions">
           {state.pullProgress && state.pullProgress.phase === "pulling" && (
-            <div className="header-pull-pill" title={state.pullProgress.status}>
-              <span className="pull-spinner" />
+            <div className="header-pull-pill" title={state.pullProgress.status} role="status" aria-live="polite">
+              <span className="pull-spinner" aria-hidden="true" />
               <span className="header-pull-text">
                 {state.pullProgress.model} ({state.pullProgress.percent !== undefined ? `${state.pullProgress.percent}%` : "pulling"})
               </span>
@@ -56,6 +68,7 @@ export function Header({
                 className="header-pull-cancel"
                 onClick={actions.cancelPull}
                 title="Cancel download"
+                aria-label={`Cancel ${state.pullProgress.model} download`}
               >
                 <CloseIcon />
               </button>
@@ -74,31 +87,49 @@ export function Header({
               actions.requestProjectContext();
               onOpenContextModal();
             }}
-            aria-label="Project Context & Memory"
+            aria-label={`Project Context and Memory (${indexedCount} files indexed)`}
           >
             <BrainIcon />
-            {hasHandoffReady && <span className="ctx-handoff-dot" />}
+            {hasHandoffReady && <span className="ctx-handoff-dot" aria-hidden="true" />}
           </button>
           {state.config.autoSelectModel && (
             <button
-              className="icon-btn active"
+              type="button"
+              className={`icon-btn ${autoOpen ? "active" : ""}`}
               title="Auto-routing active — inspect model selection"
+              aria-label="Inspect auto-routing model selection"
+              aria-expanded={autoOpen}
               onClick={() => setAutoOpen((o) => !o)}
             >
               <LightbulbIcon />
             </button>
           )}
           <button
+            type="button"
             className={`icon-btn ${historyOpen ? "active" : ""}`}
             title="Session history"
+            aria-label="Session history"
+            aria-expanded={historyOpen}
             onClick={() => setHistoryOpen((o) => !o)}
           >
             <ClockIcon />
           </button>
-          <button className="icon-btn" title="New session" onClick={actions.newSession}>
+          <button
+            type="button"
+            className="icon-btn"
+            title="New session"
+            aria-label="Start new session"
+            onClick={actions.newSession}
+          >
             <PlusIcon />
           </button>
-          <button className="icon-btn" title="Settings & Providers" onClick={onOpenSettings}>
+          <button
+            type="button"
+            className="icon-btn"
+            title="Settings & Providers"
+            aria-label="Settings and Providers"
+            onClick={onOpenSettings}
+          >
             <GearIcon />
           </button>
           {autoOpen && <TransparencyPanel state={state} actions={actions} onClose={() => setAutoOpen(false)} />}

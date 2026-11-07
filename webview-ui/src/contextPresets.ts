@@ -1,4 +1,4 @@
-import type { MachineProfile, ModelInfo } from "../../src/shared/types";
+import { isLocalModel, type MachineProfile, type ModelInfo } from "../../src/shared/types";
 
 export const CONTEXT_PRESETS: { value: number; label: string; short: string }[] = [
   { value: 0, label: "Auto (Hardware-Aware)", short: "Auto ctx" },
@@ -43,7 +43,7 @@ export function checkContextWindowOverflow(
   const neededKvGb = (selectedTokens / 1024) * kvGbPer1k;
   const totalNeededGb = weightGb + neededKvGb;
 
-  const isLocal = !model?.provider || model.provider === "ollama" || model.provider === "llamacpp";
+  const isLocal = isLocalModel(model);
   if (!isLocal) {
     if (selectedTokens > modelMax) {
       return {

@@ -3,7 +3,7 @@ import type { AppState, Actions } from "../state/store";
 import type { ChatMessage } from "../../../src/shared/types";
 import { Message } from "./Message";
 import { AssistantTurn } from "./AssistantTurn";
-import { Approval } from "./Approval";
+import { ClaudeThinkingIndicator, getClaudeThinkingLabel } from "./StatusIndicator";
 import { BoltIcon } from "./Icons";
 
 type TurnGroup =
@@ -99,13 +99,23 @@ export function MessageList({
         );
       })}
 
-      {state.pendingApproval && (
-        <Approval
-          call={state.pendingApproval}
-          actions={actions}
-          onResolved={() => dispatch({ type: "_clearApproval" })}
-        />
-      )}
+      {/* Claude Code-style live thinking indicator when turn is active before assistant chunks */}
+      {(() => {
+        const isWorking = state.status === "thinking" || state.status === "running";
+        const lastMsg = state.messages[state.messages.length - 1];
+        if (isWorking && lastMsg && lastMsg.role === "user") {
+          return (
+            <div className="msg assistant">
+              <div className="msg-body">
+                <ClaudeThinkingIndicator
+                  label={getClaudeThinkingLabel(state.statusDetail, state.status)}
+                />
+              </div>
+            </div>
+          );
+        }
+        return null;
+      })()}
 
       {state.isCompacting && (
         <div className="msg-compact-wrapper in-progress" role="status" aria-live="polite">

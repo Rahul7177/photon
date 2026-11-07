@@ -162,8 +162,11 @@ export class OpenAICompatProvider implements LLMProvider {
   }
 
   async *chatStream(req: LLMChatRequest, signal?: AbortSignal): AsyncGenerator<LLMChatChunk> {
+    const wireModel = req.model.startsWith(`${this.id}:`)
+      ? req.model.slice(this.id.length + 1)
+      : req.model;
     const body: Record<string, unknown> = {
-      model: req.model,
+      model: wireModel,
       messages: req.messages.map((m, mi) => {
         if (m.role === "tool") {
           return {

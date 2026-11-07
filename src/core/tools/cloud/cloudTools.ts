@@ -202,26 +202,43 @@ export const cloudExecuteCommand: Tool = {
       toolCall.statusDetail = `High-risk action: ${secAnalysis.reason}`;
     }
     const approved = await ctx.requestApproval(toolCall);
+    if (ctx.signal.aborted) return fail("Command cancelled.");
     if (!approved) return fail(secAnalysis.isDangerous ? `User declined high-risk action: ${secAnalysis.reason}` : "User declined to run the command.");
     ctx.log(`$ ${command}`);
     return new Promise((resolve) => {
+      if (ctx.signal.aborted) return resolve(fail("Command cancelled."));
+      let settled = false;
+      const finish = (res: ReturnType<typeof ok>) => {
+        if (settled) return;
+        settled = true;
+        resolve(res);
+      };
       let child: ReturnType<typeof exec> | undefined;
-      const onAbort = () => child?.kill();
+      const onAbort = () => {
+        if (child) {
+          try { child.stdout?.destroy(); child.stderr?.destroy(); child.stdin?.destroy(); } catch { /* ignore */ }
+          try { child.kill(); } catch { /* ignore */ }
+          if (process.platform === "win32" && child.pid) {
+            try { exec(`taskkill /pid ${child.pid} /T /F`, { windowsHide: true }); } catch { /* ignore */ }
+          }
+        }
+        finish(fail("Command cancelled."));
+      };
       child = exec(
         command,
         { cwd: ctx.workspaceRoot, timeout: timeoutMs, maxBuffer: COMMAND_MAX_BUFFER, windowsHide: true },
         (error, stdout, stderr) => {
           ctx.signal.removeEventListener("abort", onAbort);
+          if (settled || ctx.signal.aborted) return finish(fail("Command cancelled."));
           const out = [stdout, stderr].filter(Boolean).join("\n").trim();
-          if (ctx.signal.aborted) return resolve(fail("Command cancelled."));
           const code = error ? ((error as unknown as { code?: number }).code ?? 1) : 0;
           const header = `Exit code ${code}.`;
           const outputText = `${header}\n${clamp(out || error?.message || "(no output)", outputBudget(ctx))}`;
           if (code !== 0) {
             // Return full stdout and stderr so the cloud model knows exactly why the command or test failed
-            return resolve(fail(outputText));
+            return finish(fail(outputText));
           }
-          resolve(ok(outputText));
+          finish(ok(outputText));
         }
       );
       ctx.signal.addEventListener("abort", onAbort, { once: true });

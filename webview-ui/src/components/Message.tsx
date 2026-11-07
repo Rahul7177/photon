@@ -4,6 +4,7 @@ import { Markdown } from "./Markdown";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolCard } from "./ToolCard";
 import { TurnProcess } from "./TurnProcess";
+import { ClaudeThinkingIndicator } from "./StatusIndicator";
 import { FileCodeIcon, ErrorCrossIcon, ChevronRightIcon, BoltIcon, RewindIcon } from "./Icons";
 import { fmtTokens } from "./ContextMeter";
 import type { Actions } from "../state/store";
@@ -32,11 +33,11 @@ export const Message = memo(function Message({ message, pendingApproval, actions
   const notice = hasVisibleText(message.notice) ? message.notice! : "";
   // The trace is "live" only while no answer/tool activity has started yet.
   const thinkingLive = isStreaming && !hasContent && toolCalls.length === 0;
-  const showCursor = isStreaming && !hasContent && !hasThinking && !isUser && toolCalls.length === 0;
+  const showThinking = isStreaming && !hasContent && !isUser && toolCalls.length === 0;
 
   // Nothing to paint (empty user bubble, empty notice, stripped message):
   // render no wrapper at all so no bordered box or stray gap is left behind.
-  if (!attachments.length && !hasContent && !hasThinking && !toolCalls.length && !notice && !showCursor) {
+  if (!attachments.length && !hasContent && !hasThinking && !toolCalls.length && !notice && !showThinking) {
     return null;
   }
 
@@ -70,9 +71,9 @@ export const Message = memo(function Message({ message, pendingApproval, actions
         </div>
       )}
 
-      {showCursor && (
+      {showThinking && (
         <div className="msg-body">
-          <span className="cursor-blink" />
+          <ClaudeThinkingIndicator label={hasThinking ? "Thinking..." : "Generating..."} />
         </div>
       )}
 

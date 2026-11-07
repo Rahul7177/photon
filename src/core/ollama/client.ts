@@ -78,10 +78,30 @@ export class OllamaClient {
   async ping(): Promise<boolean> {
     try {
       const res = await this.fetch("/api/version", { method: "GET" }, 4000);
-      return res.ok;
+      if (res.ok) return true;
     } catch {
-      return false;
+      /* try IPv4 fallback below if configured with localhost */
     }
+    if (this.opts.baseUrl.includes("://localhost")) {
+      const ipv4Url = this.opts.baseUrl.replace("://localhost", "://127.0.0.1");
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 3000);
+      try {
+        const res = await fetch(`${ipv4Url.replace(/\/+$/, "")}/api/version`, {
+          method: "GET",
+          signal: ctrl.signal,
+        });
+        if (res.ok) {
+          this.opts.baseUrl = ipv4Url;
+          return true;
+        }
+      } catch {
+        /* unreachable on 127.0.0.1 too */
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    return false;
   }
 
   async listModels(): Promise<OllamaTagsResponse> {

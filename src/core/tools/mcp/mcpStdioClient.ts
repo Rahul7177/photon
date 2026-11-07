@@ -37,7 +37,13 @@ export class McpStdioClient implements IMcpClient {
   ) {}
 
   async connect(timeoutMs = 10_000): Promise<void> {
-    const child = spawn(this.command, this.args, {
+    let cmd = this.command;
+    if (process.platform === "win32" && !/\.(exe|cmd|bat)$/i.test(cmd)) {
+      if (cmd === "npx" || cmd === "npm" || cmd === "pnpm" || cmd === "yarn") {
+        cmd = `${cmd}.cmd`;
+      }
+    }
+    const child = spawn(cmd, this.args, {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, ...this.env },
       cwd: this.cwd,

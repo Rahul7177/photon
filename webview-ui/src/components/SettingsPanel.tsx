@@ -1,6 +1,12 @@
 import { useState, useEffect } from "react";
 import type { ReactNode } from "react";
-import type { IndexStatus, IntelligenceSetting, ModelCapability } from "../../../src/shared/types";
+import {
+  isLocalModel,
+  matchInstalledModelName,
+  type IndexStatus,
+  type IntelligenceSetting,
+  type ModelCapability,
+} from "../../../src/shared/types";
 import type { AppState, Actions } from "../state/store";
 import {
   BackIcon,
@@ -136,6 +142,19 @@ export function SettingsPanel({
           <BackIcon />
         </button>
         <span className="settings-title">Settings</span>
+        <button
+          type="button"
+          className="btn btn-sm"
+          style={{ marginLeft: "auto" }}
+          onClick={() => {
+            onClose();
+            actions.openOnboarding();
+          }}
+          title="Launch the guided Local & Cloud Provider Setup Wizard"
+        >
+          <SparkleIcon />
+          <span>Setup Wizard</span>
+        </button>
       </div>
 
       <nav className="settings-tabs">
@@ -297,7 +316,103 @@ export function SettingsPanel({
                 )}
               </Category>
 
-              <Category title="Recommended Local Models" iconNode={<SparkleIcon />}>
+              <Category title="Installed Local Models" iconNode={<CpuIcon />}>
+                <div className="sensed-runtimes-head">
+                  <span className="settings-hint">
+                    Models sensed on your machine ({state.models.filter((m) => isLocalModel(m)).length} found)
+                  </span>
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    onClick={() => {
+                      actions.detectProviders();
+                      actions.refreshModels();
+                      actions.requestRecommendations(state.recommendations?.goal);
+                    }}
+                  >
+                    <RefreshIcon />
+                    <span>Scan Models</span>
+                  </button>
+                </div>
+
+                {(() => {
+                  const localInstalled = state.models.filter((m) => isLocalModel(m));
+                  const evalMap = new Map(
+                    (state.recommendations?.evaluatedInstalled ?? []).map((e) => [e.name, e])
+                  );
+                  if (localInstalled.length === 0) {
+                    return (
+                      <div className="settings-hint" style={{ padding: "6px 0" }}>
+                        No local models sensed yet. Click <strong>Scan Models</strong> or pull a recommended model below.
+                      </div>
+                    );
+                  }
+                  const sorted = [...localInstalled].sort((a, b) => {
+                    const ea = evalMap.get(a.name);
+                    const eb = evalMap.get(b.name);
+                    return Number(Boolean(eb?.recommended)) - Number(Boolean(ea?.recommended));
+                  });
+                  return (
+                    <div className="rec-model-list">
+                      {sorted.map((m) => {
+                        const ev = evalMap.get(m.name);
+                        const isSelected = state.selectedModel === m.name;
+                        const sizeGb =
+                          ev?.sizeGb ??
+                          (m.sizeBytes ? Math.round((m.sizeBytes / 1024 ** 3) * 10) / 10 : undefined);
+                        return (
+                          <div
+                            key={m.name}
+                            className={`rec-model-card ${ev?.recommended ? "rec-highlight" : ""}`}
+                          >
+                            <div className="rec-model-head">
+                              <span className="rec-model-title">{ev?.label || m.name}</span>
+                              {ev?.recommended && (
+                                <span className="rec-star-badge" title={ev.reason}>
+                                  <StarIcon size={10} />
+                                  <span>Recommended for Hardware</span>
+                                </span>
+                              )}
+                              {ev?.fit && (
+                                <span className={`rec-fit-badge ${ev.fit.badge}`}>
+                                  {ev.fit.label}
+                                </span>
+                              )}
+                              {sizeGb !== undefined && (
+                                <span className="rec-model-size">{sizeGb.toFixed(1)} GB</span>
+                              )}
+                            </div>
+                            <div className="rec-model-foot">
+                              <code className="rec-model-code">{m.name}</code>
+                              {isSelected ? (
+                                <span className="model-added-tag">
+                                  <CheckIcon size={11} />
+                                  <span>Active</span>
+                                </span>
+                              ) : (
+                                <button
+                                  type="button"
+                                  className="btn btn-sm primary"
+                                  onClick={() => {
+                                    if (state.config.interfaceMode !== "local") {
+                                      actions.setInterfaceMode("local");
+                                    }
+                                    actions.setModel(m.name);
+                                  }}
+                                >
+                                  Use Model
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
+              </Category>
+
+              <Category title="Recommended Local Models Catalog" iconNode={<SparkleIcon />}>
                 <div className="sensed-runtimes-head">
                   <span className="settings-hint">
                     {state.machine?.gpu
@@ -339,11 +454,15 @@ export function SettingsPanel({
                 {state.recommendations && state.recommendations.models.length > 0 ? (
                   <div className="rec-model-list">
                     {state.recommendations.models.map((rec) => {
-                      const installed = state.models.some(
-                        (m) =>
-                          m.name.toLowerCase() === rec.name.toLowerCase() ||
-                          m.name.toLowerCase().startsWith(`${rec.name.toLowerCase()}-`)
-                      );
+                      const matchedName =
+                        rec.installedName ??
+                        matchInstalledModelName(
+                          rec.name,
+                          state.models.map((m) => m.name)
+                        );
+                      const installed = rec.installed || Boolean(matchedName);
+                      const targetModelName = matchedName ?? rec.name;
+                      const isSelected = installed && state.selectedModel === targetModelName;
                       const pullingThis =
                         isPulling &&
                         state.pullProgress?.model.toLowerCase() === rec.name.toLowerCase();
@@ -367,12 +486,32 @@ export function SettingsPanel({
                             <span className="rec-model-size">{rec.sizeGb.toFixed(1)} GB</span>
                           </div>
                           <div className="rec-model-foot">
-                            <code className="rec-model-code">{rec.name}</code>
+                            <code className="rec-model-code">
+                              {installed && matchedName && matchedName !== rec.name
+                                ? `${rec.name} (${matchedName})`
+                                : rec.name}
+                            </code>
                             {installed ? (
-                              <span className="model-added-tag">
-                                <CheckIcon size={11} />
-                                <span>Installed</span>
-                              </span>
+                              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                                <span className="model-added-tag">
+                                  <CheckIcon size={11} />
+                                  <span>Installed</span>
+                                </span>
+                                {!isSelected && (
+                                  <button
+                                    type="button"
+                                    className="btn btn-sm"
+                                    onClick={() => {
+                                      if (state.config.interfaceMode !== "local") {
+                                        actions.setInterfaceMode("local");
+                                      }
+                                      actions.setModel(targetModelName);
+                                    }}
+                                  >
+                                    Select
+                                  </button>
+                                )}
+                              </div>
                             ) : pullingThis ? (
                               <span className="btn btn-sm" style={{ opacity: 0.6 }}>
                                 Pulling…

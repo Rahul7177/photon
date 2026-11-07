@@ -124,7 +124,8 @@ export class GeminiProvider implements LLMProvider {
     if (req.options?.num_predict && req.options.num_predict > 0) gc.maxOutputTokens = req.options.num_predict;
     applyGeminiThinking(gc, req.model, req.options?.thinkingLevel);
     if (req.tools?.length) body.tools = [{ functionDeclarations: (req.tools as GeminiInputFunction[]).map(toGeminiFunctionDeclaration) }];
-    const url = `${GEMINI_BASE}/models/${req.model}:streamGenerateContent?alt=sse`;
+    const wireModel = req.model.startsWith("gemini:") ? req.model.slice("gemini:".length) : req.model;
+    const url = `${GEMINI_BASE}/models/${wireModel}:streamGenerateContent?alt=sse`;
     const res = await fetchWithRetry(
       url,
       { method: "POST", headers: { "Content-Type": "application/json", ...geminiHeaders(this.apiKey) }, body: JSON.stringify(body), signal },

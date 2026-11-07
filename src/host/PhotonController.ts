@@ -1,23 +1,24 @@
 import * as os from "node:os";
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
-import type {
-  AdaptivePlan,
-  Attachment,
-  AutoDecision,
-  ChatMessage,
-  CloudUsageSummary,
-  HardwareMetrics,
-  IndexStatus,
-  IntelligenceSetting,
-  MachineProfile,
-  Mode,
-  ModelCapability,
-  ModelInfo,
-  OllamaRuntimeModel,
-  SessionState,
-  ThinkingLevel,
-  ToolCall,
+import {
+  matchInstalledModelName,
+  type AdaptivePlan,
+  type Attachment,
+  type AutoDecision,
+  type ChatMessage,
+  type CloudUsageSummary,
+  type HardwareMetrics,
+  type IndexStatus,
+  type IntelligenceSetting,
+  type MachineProfile,
+  type Mode,
+  type ModelCapability,
+  type ModelInfo,
+  type OllamaRuntimeModel,
+  type SessionState,
+  type ThinkingLevel,
+  type ToolCall,
 } from "../shared/types";
 import type { HostMessage, PhotonConfig, ToolSummary, ViewMessage } from "../shared/protocol";
 import { OllamaClient } from "../core/ollama/client";
@@ -39,14 +40,8 @@ import { CheckpointManager, getCheckpointManager } from "../core/checkpoints/che
 import type { DiagnosticInfo, ToolContext } from "../core/tools/types";
 import { ProviderManager } from "../core/llm/providerManager";
 import { OllamaProvider } from "../core/llm/providers/ollamaProvider";
-import { OpenAICompatProvider, type OpenAICompatConfig } from "../core/llm/providers/openaiCompatProvider";
-import { GeminiProvider } from "../core/llm/providers/geminiProvider";
-import { AnthropicProvider } from "../core/llm/providers/anthropicProvider";
-import {
-  BLACKBOX_MODELS,
-  customModel,
-} from "../core/llm/catalogs";
-import type { LLMProvider, ProviderModel } from "../core/llm/types";
+import type { OpenAICompatConfig } from "../core/llm/providers/openaiCompatProvider";
+import type { LLMProvider } from "../core/llm/types";
 import { SessionStore } from "./sessionStore";
 import { BenchStore } from "./benchStore";
 import { ProjectStore } from "./projectStore";
@@ -55,46 +50,24 @@ import { ModelConfigStore } from "./modelConfigStore";
 import { getProjectContextManager, ProjectContextManager } from "../core/context/projectContext";
 import { LocalProcessManager, installOptions, type StartableId } from "./localProcessManager";
 import { recommendModels, MODEL_CATALOG } from "../core/adaptive/modelAdvisor";
+import { scanDiskOllamaModels } from "../core/adaptive/runtimeDetector";
 import { ModelInstaller } from "../core/ollama/modelInstaller";
 import { loadProjectConfig, type ProjectConfig } from "./projectConfig";
-import { SessionRegistry, PhotonSession } from "../photon-core/session/store";
-import { AgentRegistry, PhotonAgent } from "../photon-core/agent/agent";
-import { ToolPipeline } from "../photon-core/tools/pipeline";
-import { SystemPromptRegistry } from "../photon-core/systemPrompt/registry";
-import { AgentLoop } from "../photon-core/loop/agentLoop";
-import { bridgeLegacyProvider } from "../photon-core/llm/types.v2";
+import {
+  ProviderCatalogService,
+  deriveCustomProviderId,
+} from "./providerCatalogService";
+import { ApprovalService, parseMcpConfigJson } from "./approvalService";
+import {
+  MAX_SESSION_MESSAGES,
+  finalizeTurnMessages,
+  pruneInlineImages,
+  rewindMessagesToCheckpoint,
+} from "./sessionCoordinator";
 
 const DEFAULT_EMBEDDING_MODEL = "nomic-embed-text";
 
-/** Inline base64 images kept in PERSISTED sessions. Images dominate storage —
- *  a few screenshots would otherwise bloat every globalState rewrite forever.
- *  The live in-memory session keeps everything; only the stored copy is pruned. */
-const KEEP_INLINE_IMAGES = 4;
-
-function pruneInlineImages(session: SessionState): SessionState {
-  let remaining = KEEP_INLINE_IMAGES;
-  const messages = [...session.messages]
-    .reverse()
-    .map((m) => {
-      const imageCount = m.attachments?.filter((a) => a.dataBase64).length ?? 0;
-      if (!imageCount) return m;
-      const keep = Math.max(0, remaining);
-      remaining -= imageCount;
-      if (keep >= imageCount) return m;
-      let toStrip = imageCount - keep;
-      const attachments = m.attachments!.map((a) =>
-        a.dataBase64 && toStrip-- > 0 ? { ...a, dataBase64: undefined } : a
-      );
-      return { ...m, attachments };
-    })
-    .reverse();
-  return { ...session, messages };
-}
-
 type Post = (msg: HostMessage) => void;
-
-// Cap messages kept per session (memory + persisted-blob size).
-const MAX_SESSION_MESSAGES = 400;
 
 /**
  * Owns all runtime state for a Photon session and mediates between the webview
@@ -132,21 +105,16 @@ export class PhotonController {
   private plan: AdaptivePlan | null = null;
   private userNumCtx: number | undefined;
   private session: SessionState;
-  // --- Harness-inspired durable core (alongside legacy for incremental migration) ---
-  private durableSessions = new SessionRegistry();
-  private agentRegistry: AgentRegistry;
-  private toolPipeline = new ToolPipeline();
-  private systemPromptRegistry = new SystemPromptRegistry();
-  private agentLoop: AgentLoop;
-  private activeHarnessAgent: PhotonAgent | null = null;
 
   private turnAbort?: AbortController;
   /** Cancels an in-flight benchmark run. */
   private benchAbort?: AbortController;
-  private autoApprove: boolean;
   private reachable = false;
-  private pendingApprovals = new Map<string, (approved: boolean) => void>();
   private rawPost: Post = () => {};
+  /** Manages tool execution approval lifecycles and auto-approve state. */
+  private readonly approvals: ApprovalService;
+  /** Manages cloud/local provider catalogs, custom models, and live model caching. */
+  private readonly providerCatalog: ProviderCatalogService;
   /** One-click start/stop of local providers (Ollama, llama-server). */
   private readonly localProcs = new LocalProcessManager();
   /** Streams ollama pull with progress, disk pre-check and cancel. */
@@ -157,9 +125,6 @@ export class PhotonController {
   private statusUpdater?: (text: string, tooltip: string) => void;
   /** Guards the one-time expensive setup so a webview re-mount can't re-run it. */
   private initPromise?: Promise<void>;
-  /** Last successfully fetched per-provider live model lists, so a webview
-   *  remount can repaint the settings cards without refetching. */
-  private liveModelCache = new Map<string, ModelInfo[]>();
   /** Maintains project-wide symbol index, file outlines, smart path resolution and cross-model handoff. */
   private ctxMgr?: ProjectContextManager;
   /** Checkpoint Manager tracks pre-mutation file states for 1-click turn rollbacks. */
@@ -193,18 +158,47 @@ export class PhotonController {
     this.providers = new ProviderManager([this.ollamaProvider]);
     this.mode = cfg.get<Mode>("defaultMode", "chat");
     this.interfaceMode = cfg.get<"local" | "cloud">("interfaceMode", "local");
-    this.autoApprove = cfg.get<boolean>("tools.autoApprove", false);
+    this.approvals = new ApprovalService(cfg.get<boolean>("tools.autoApprove", false));
+    this.providerCatalog = new ProviderCatalogService({
+      getAddedModels: () => this.context.globalState.get<ModelInfo[]>("photon.customModels") ?? [],
+      setAddedModels: async (models) => {
+        await this.context.globalState.update("photon.customModels", models);
+      },
+      getCachedLiveModels: () =>
+        this.context.globalState.get<Record<string, ModelInfo[]>>("photon.cachedProviderModels") ?? {},
+      setCachedLiveModels: async (cache) => {
+        await this.context.globalState.update("photon.cachedProviderModels", cache);
+      },
+      getProviderEnabled: (id) =>
+        vscode.workspace.getConfiguration("photon").get<boolean>(`providers.${id}.enabled`, false),
+      setProviderEnabled: async (id, enabled) => {
+        await vscode.workspace
+          .getConfiguration("photon")
+          .update(`providers.${id}.enabled`, enabled, vscode.ConfigurationTarget.Global);
+      },
+      getSecretApiKey: async (id) =>
+        (await this.context.secrets.get(`photon.provider.${id}.apiKey`)) ?? "",
+      setSecretApiKey: async (id, apiKey) => {
+        await this.context.secrets.store(`photon.provider.${id}.apiKey`, apiKey);
+      },
+      deleteSecretApiKey: async (id) => {
+        await this.context.secrets.delete(`photon.provider.${id}.apiKey`);
+      },
+      getLlamaCppBaseUrl: () =>
+        vscode.workspace.getConfiguration("photon").get<string>("llamacpp.baseUrl", "http://localhost:8080"),
+      getCustomProviders: () =>
+        vscode.workspace.getConfiguration("photon").get<OpenAICompatConfig[]>("providers.custom", []),
+      setCustomProviders: async (providers) => {
+        await vscode.workspace
+          .getConfiguration("photon")
+          .update("providers.custom", providers, vscode.ConfigurationTarget.Global);
+      },
+    });
     this.sessionStore = new SessionStore(context);
     this.benchStore = new BenchStore(context);
     this.projectStore = new ProjectStore(context);
     this.modelConfigs = new ModelConfigStore(context);
-    // MCP bridges into BOTH registries — legacy engine + harness pipeline stay in sync
-    const mcpRegistryBridge = {
-      register: (t: any) => { this.registry.register(t); this.toolPipeline.register(t); return () => { this.registry["tools"]?.delete?.(t.spec.name); (this.toolPipeline as any).tools?.delete?.(t.spec.name); }; },
-      registerAll: (ts: any[]) => { this.registry.registerAll(ts); this.toolPipeline.registerAll(ts); },
-      unregisterByPrefix: (p: string) => { this.registry.unregisterByPrefix(p); (this.toolPipeline as any).tools && [...(this.toolPipeline as any).tools.keys()].filter((k: string)=>k.startsWith(p)).forEach((k: string)=>(this.toolPipeline as any).tools.delete(k)); },
-    } as any;
-    this.mcp = new McpManager(mcpRegistryBridge, (m) => this.output.appendLine(`[mcp] ${m}`));
+    this.mcp = new McpManager(this.registry, (m) => this.output.appendLine(`[mcp] ${m}`));
     this.index = new IndexService(
       context,
       this.client,
@@ -212,41 +206,6 @@ export class PhotonController {
       (status) => this.safePost({ type: "indexStatus", payload: status })
     );
     this.registry.registerAll(builtinTools());
-    // Mirror tools into harness pipeline (keeps single source of truth)
-    this.toolPipeline.registerAll(builtinTools() as any);
-    this.agentRegistry = new AgentRegistry(this.durableSessions);
-    this.agentLoop = new AgentLoop({
-      llm: bridgeLegacyProvider(this.providers as any),
-      tools: this.toolPipeline,
-      systemPrompt: this.systemPromptRegistry,
-      workspaceName: vscode.workspace.workspaceFolders?.[0]?.name,
-      retrieveContext: (query, signal) => this.index.retrieveContext(query, signal),
-      reserveOutputTokens: cfg.get<number>("context.reserveOutputTokens", 1024),
-      buildPlan: (prompt, mode, attachmentsCount) => {
-        const { decision, plan } = planRequest({
-          prompt,
-          mode: this.mode,
-          attachmentCount: attachmentsCount,
-          models: this.modelsForUi(),
-          machine: this.machine,
-          benchByModel: this.benchStore.byModel(),
-          pinnedModel: this.autoSelect ? undefined : this.selectedModel || undefined,
-          intelligence: this.effectiveIntelligence(),
-          reserveOutputTokens: cfg.get<number>("context.reserveOutputTokens", 1024),
-          adaptiveEnabled: this.adaptiveEnabled(),
-          userNumCtx: this.effectiveNumCtx(),
-        });
-        this.lastDecision = decision;
-        return plan;
-      },
-      buildToolContext: (signal, capability) => this.buildToolContext(signal),
-    });
-    // Intelligence as pre-step waterfall (harness pattern) — keep moat in orchestrator
-    // The loop's buildPlan already runs orchestrator; this hook mirrors auto decision transparency
-    this.agentLoop.onPreStep(async (decision: any, next: any) => {
-      if (decision.plan) this.plan = decision.plan;
-      return next();
-    });
     this.engine = new AgentEngine({
       client: this.providers,
       registry: this.registry,
@@ -314,7 +273,7 @@ export class PhotonController {
         if (!e.affectsConfiguration("photon")) return;
         try {
           const c = vscode.workspace.getConfiguration("photon");
-          this.autoApprove = c.get<boolean>("tools.autoApprove", false);
+          this.approvals.autoApprove = c.get<boolean>("tools.autoApprove", false);
           this.syncClientConfig();
           this.recomputePlan();
           this.pushPlan();
@@ -424,10 +383,14 @@ export class PhotonController {
       this.autoSelect = false;
     }
 
+    // Restore cached provider models from globalState so they are instantly visible on startup
+    this.providerCatalog.restoreLiveModelCache();
+
     this.machine = await profileMachine().catch(() => null);
     void this.pushHardwareMetrics();
     await this.rebuildProviders();
     await this.connectAndLoad();
+    void this.autoRefreshConfiguredProviders();
     await this.setupMcp();
     await this.configureIndex();
     if (this.ctxMgr) {
@@ -450,7 +413,7 @@ export class PhotonController {
     }
     this.projectConfig = result.config;
     // The file may enable auto-approve for the project (it can enable, not disable).
-    if (this.projectConfig?.autoApprove) this.autoApprove = true;
+    if (this.projectConfig?.autoApprove) this.approvals.autoApprove = true;
 
     // Phase 1.4: Sync file-based per-model configs → ModelConfigStore (file wins).
     // The file is the source of truth for team-shared overrides; the extension's
@@ -518,7 +481,7 @@ export class PhotonController {
     if (this.lastDecision) this.safePost({ type: "decision", payload: this.lastDecision });
     // Repaint cached provider model lists so settings cards don't look empty
     // after a panel close/reopen.
-    for (const [id, models] of this.liveModelCache) {
+    for (const [id, models] of this.providerCatalog.liveModelCache) {
       this.safePost({ type: "providerModels", payload: { id, models } });
     }
     this.updateStatusBar();
@@ -526,15 +489,11 @@ export class PhotonController {
     void this.detectProviders();
   }
 
-  /** Ping every configured provider and, if any is reachable, load the model list. */
+  /** Ping Ollama and load all available models across local and cloud providers. */
   private async connectAndLoad(): Promise<void> {
     this.syncClientConfig();
-    this.reachable = await this.providers.ping();
-    if (this.reachable) {
-      await this.loadModels();
-    } else {
-      this.output.appendLine(`[connect] No provider reachable (Ollama at ${this.client.baseUrl} and cloud providers).`);
-    }
+    this.reachable = await this.client.ping().catch(() => false);
+    await this.loadModels();
   }
 
   /** Models visible in the picker for the active interface mode. Stacks are independent. */
@@ -563,7 +522,7 @@ export class PhotonController {
     this.recomputePlan();
     this.safePost({
       type: "models",
-      payload: { models: visible, selected: this.selectedModel, ollamaReachable: this.reachable },
+      payload: { models: this.models, selected: this.selectedModel, ollamaReachable: this.reachable },
     });
     this.pushPlan();
     this.pushConfig();
@@ -578,17 +537,31 @@ export class PhotonController {
     const installed = this.models.map((m) => m.name);
     this.safePost({
       type: "modelRecommendations",
-      payload: recommendModels(this.machine, { goal, ctxTokens, installed }),
+      payload: recommendModels(this.machine, { goal, ctxTokens, installed, installedModels: this.models }),
     });
   }
 
   /** Detect local runtimes and push them (with install guidance) to the webview. */
-  private async detectProviders(): Promise<void> {
+  private async detectProviders(reloadModels = false): Promise<void> {
     const runtimes = await this.localProcs.detect();
     for (const r of runtimes) {
       if (r.state === "not_installed") r.installOptions = installOptions(r.id, process.platform);
     }
     this.safePost({ type: "providerRuntimes", payload: runtimes });
+    if (reloadModels) {
+      await this.connectAndLoad();
+      this.recomputePlan();
+      this.safePost({
+        type: "models",
+        payload: {
+          models: this.models,
+          selected: this.selectedModel,
+          ollamaReachable: this.reachable,
+        },
+      });
+      this.pushPlan();
+      this.sendRecommendations();
+    }
   }
 
   /** One-click provider start; refreshes the model catalog once it is ready. */
@@ -609,6 +582,9 @@ export class PhotonController {
       if (state.phase === "running") {
         await this.refresh();
         void vscode.window.showInformationMessage(`Photon: ${id === "ollama" ? "Ollama" : "llama.cpp"} is running.`);
+      } else if (state.phase === "error") {
+        this.output.appendLine(`[local] Failed to start ${id}: ${state.message}`);
+        void vscode.window.showErrorMessage(`Photon: Failed to start ${id === "ollama" ? "Ollama" : "llama.cpp"}: ${state.message}`);
       }
     } finally {
       sub.dispose();
@@ -663,7 +639,10 @@ export class PhotonController {
   /** Select a freshly pulled model. */
   private activateInstalledModel(modelName: string): void {
     try {
-      const match = this.models.find((m) => m.name.toLowerCase() === modelName.toLowerCase());
+      const matchedName = matchInstalledModelName(modelName, this.models.map((m) => m.name));
+      const match = matchedName
+        ? this.models.find((m) => m.name === matchedName)
+        : this.models.find((m) => m.name.toLowerCase() === modelName.toLowerCase());
       if (!match) return;
       this.autoSelect = false;
       this.selectedModel = match.name;
@@ -672,7 +651,7 @@ export class PhotonController {
       this.pushConfig();
       this.safePost({
         type: "models",
-        payload: { models: this.modelsForUi(), selected: this.selectedModel, ollamaReachable: this.reachable },
+        payload: { models: this.models, selected: this.selectedModel, ollamaReachable: this.reachable },
       });
     } catch {}
   }
@@ -684,7 +663,7 @@ export class PhotonController {
     this.safePost({
       type: "models",
       payload: {
-        models: this.modelsForUi(),
+        models: this.models,
         selected: this.selectedModel,
         ollamaReachable: this.reachable,
       },
@@ -703,6 +682,17 @@ export class PhotonController {
       // successful test; Ollama reports everything installed locally.
       const all = await this.providers.listModels();
 
+      // Also sense local Ollama models on disk so installed models are visible
+      // even when the Ollama server daemon is stopped or starting up.
+      const diskModels = scanDiskOllamaModels();
+      const existingNames = all.map((m) => m.name);
+      for (const dm of diskModels) {
+        if (!matchInstalledModelName(dm.name, existingNames)) {
+          all.push(dm);
+          existingNames.push(dm.name);
+        }
+      }
+
       this.models = all;
       const preferred = vscode.workspace
         .getConfiguration("photon")
@@ -716,21 +706,12 @@ export class PhotonController {
       }
       this.output.appendLine(`[models] loaded ${this.models.length} model(s) across ${this.providers.active().length} provider(s).`);
     } catch (e) {
-      this.models = [];
+      this.models = scanDiskOllamaModels();
       this.output.appendLine(`[models] ${(e as Error).message}`);
     }
   }
 
   /* --------------------------- cloud providers ---------------------------- */
-
-  /** Models the user explicitly added to the picker after testing, per provider. */
-  private addedModels(): ModelInfo[] {
-    return this.context.globalState.get<ModelInfo[]>("photon.customModels") ?? [];
-  }
-
-  private async setAddedModels(models: ModelInfo[]): Promise<void> {
-    await this.context.globalState.update("photon.customModels", models);
-  }
 
   /** Fetch the models a provider's API exposes for THIS account's key and push
    *  them to the webview. A failed fetch (bad key, no quota, network) is
@@ -740,10 +721,16 @@ export class PhotonController {
     const p = this.providers.all().find((x) => x.id === id);
     if (!p || !p.fetchLiveModels || !p.isConfigured()) return;
     try {
-      const models = await p.fetchLiveModels();
-      this.liveModelCache.set(id, models);
+      const { models, autoAddedCount } = await this.providerCatalog.fetchAndCacheLiveModels(p);
       this.safePost({ type: "providerModels", payload: { id, models } });
       this.output.appendLine(`[providers] ${id}: ${models.length} model(s) available to this key.`);
+
+      if (autoAddedCount > 0) {
+        await this.rebuildProviders();
+        await this.refresh();
+        this.pushConfig();
+        this.output.appendLine(`[providers] ${id}: Auto-added ${autoAddedCount} top model(s) to picker.`);
+      }
     } catch (e) {
       this.safePost({
         type: "providerModels",
@@ -753,11 +740,20 @@ export class PhotonController {
     }
   }
 
+  /** Background-refresh models for every configured and enabled cloud provider. */
+  private async autoRefreshConfiguredProviders(): Promise<void> {
+    for (const p of this.providers.all()) {
+      if (p.id !== "ollama" && p.isConfigured() && p.fetchLiveModels) {
+        void this.pushLiveModels(p.id);
+      }
+    }
+  }
+
   /** Rebuild the provider set from settings + stored API keys. Keeps the same
    *  ProviderManager instance so the engine's reference stays valid. */
   private async rebuildProviders(): Promise<void> {
-    const cloud = await this.buildCloudProviders();
-    const llamacpp = await this.buildLlamaCppProvider();
+    const cloud = await this.providerCatalog.buildCloudProviders();
+    const llamacpp = await this.providerCatalog.buildLlamaCppProvider();
     const locals: LLMProvider[] = [this.ollamaProvider];
     if (llamacpp) locals.push(llamacpp);
     this.providers.setProviders([...locals, ...cloud]);
@@ -766,191 +762,9 @@ export class PhotonController {
     );
   }
 
-  /** Local llama.cpp server — OpenAI-compatible at /v1, no API key needed. */
-  private async buildLlamaCppProvider(): Promise<LLMProvider | null> {
-    const cfg = vscode.workspace.getConfiguration("photon");
-    const baseUrl = cfg.get<string>("llamacpp.baseUrl", "http://localhost:8080");
-    const normalized = (baseUrl || "http://localhost:8080").replace(/\/+$/, "").replace(/\/v1$/, "") + "/v1";
-    const enabled = cfg.get<boolean>("providers.llamacpp.enabled", false);
-    const apiKey = (await this.context.secrets.get("photon.provider.llamacpp.apiKey")) ?? "";
-    const models = this.addedModels()
-      .filter((m) => m.provider === "llamacpp")
-      .map((m) => ({
-        id: m.name.startsWith("llamacpp:") ? m.name.slice("llamacpp:".length) : m.name,
-        name: m.name,
-        paramsB: m.paramsB,
-        contextLength: m.contextLength,
-        toolTrained: m.toolTrained,
-        vision: m.vision,
-        audio: m.audio,
-        video: m.video,
-        thinking: m.thinking,
-        capabilities: m.capabilities,
-        tier: m.tier,
-      }));
-    return new OpenAICompatProvider({
-      id: "llamacpp",
-      label: "llama.cpp",
-      baseUrl: normalized,
-      apiKey,
-      enabled,
-      models,
-      requireApiKey: false,
-    });
-  }
-
-  /** Build cloud provider instances from settings + secrets.
-   *  Cloud catalogs start EMPTY: a model only appears in the picker after the
-   *  user fetched their account's live model list, tested it, and added it.
-   *  That way the dropdown reflects what the user's API key can actually use,
-   *  not every model a provider publishes. */
-  private async buildCloudProviders(): Promise<LLMProvider[]> {
-    const cfg = vscode.workspace.getConfiguration("photon");
-    const out: LLMProvider[] = [];
-
-    const enabled = (id: string) => cfg.get<boolean>(`providers.${id}.enabled`, false);
-    const apiKey = async (id: string) =>
-      (await this.context.secrets.get(`photon.provider.${id}.apiKey`)) ?? "";
-
-    /** Models the user explicitly added for a provider prefix ("gemini", …),
-     *  converted to the ProviderModel shape the provider configs expect. */
-    const addedFor = (id: string): ProviderModel[] =>
-      this.addedModels()
-        .filter((m) => m.provider === id)
-        .map((m) => ({
-          id: m.name.startsWith(`${id}:`) ? m.name.slice(id.length + 1) : m.name,
-          name: m.name,
-          paramsB: m.paramsB,
-          contextLength: m.contextLength,
-          toolTrained: m.toolTrained,
-          vision: m.vision,
-          audio: m.audio,
-          video: m.video,
-          thinking: m.thinking,
-          capabilities: m.capabilities,
-          tier: m.tier,
-        }));
-
-    // Google Gemini
-    out.push(
-      new GeminiProvider({
-        apiKey: await apiKey("gemini"),
-        enabled: enabled("gemini"),
-        models: addedFor("gemini"),
-      })
-    );
-
-    // Anthropic Claude
-    out.push(
-      new AnthropicProvider({
-        apiKey: await apiKey("claude"),
-        enabled: enabled("claude"),
-        models: addedFor("claude"),
-      })
-    );
-
-    // NVIDIA NIM (OpenAI-compatible)
-    out.push(
-      new OpenAICompatProvider({
-        id: "nvidia",
-        label: "NVIDIA NIM",
-        baseUrl: "https://integrate.api.nvidia.com/v1",
-        apiKey: await apiKey("nvidia"),
-        enabled: enabled("nvidia"),
-        models: addedFor("nvidia"),
-      })
-    );
-
-    // OpenAI (OpenAI-compatible)
-    out.push(
-      new OpenAICompatProvider({
-        id: "openai",
-        label: "OpenAI",
-        baseUrl: "https://api.openai.com/v1",
-        apiKey: await apiKey("openai"),
-        enabled: enabled("openai"),
-        models: addedFor("openai"),
-      })
-    );
-
-    // OpenRouter (OpenAI-compatible)
-    out.push(
-      new OpenAICompatProvider({
-        id: "openrouter",
-        label: "OpenRouter",
-        baseUrl: "https://openrouter.ai/api/v1",
-        apiKey: await apiKey("openrouter"),
-        enabled: enabled("openrouter"),
-        models: addedFor("openrouter"),
-        // Attribution headers OpenRouter asks for so usage shows on their dashboards.
-        extraHeaders: { "HTTP-Referer": "https://github.com/photon-vscode", "X-Title": "Photon" },
-      })
-    );
-
-    // OpenCode Zen (OpenAI-compatible gateway)
-    out.push(
-      new OpenAICompatProvider({
-        id: "opencode",
-        label: "OpenCode Zen",
-        baseUrl: "https://opencode.ai/zen/v1",
-        apiKey: await apiKey("opencode"),
-        enabled: enabled("opencode"),
-        models: addedFor("opencode"),
-      })
-    );
-
-    // Blackbox AI (OpenAI-compatible, key in body). No live model listing is
-    // available, so keep the small curated catalog as suggestions; users can
-    // still add model ids manually from the settings panel.
-    out.push(
-      new OpenAICompatProvider({
-        id: "blackbox",
-        label: "Blackbox AI",
-        baseUrl: "https://api.blackbox.ai",
-        apiKey: await apiKey("blackbox"),
-        enabled: enabled("blackbox"),
-        keyInBody: true,
-        extraHeaders: { "Agent-Id": "photon" },
-        models: [
-          ...BLACKBOX_MODELS,
-          // Skip manually-added ids already covered by the curated catalog.
-          ...addedFor("blackbox").filter(
-            (m) => !BLACKBOX_MODELS.some((b) => b.id === m.id)
-          ),
-        ],
-      })
-    );
-
-    // Custom OpenAI-compatible endpoints (added via the settings UI)
-    const custom = cfg.get<OpenAICompatConfig[]>("providers.custom", []);
-    for (const c of custom) {
-      if (!c.id || !c.baseUrl) continue;
-      out.push(
-        new OpenAICompatProvider({
-          id: c.id,
-          label: c.label || c.id,
-          baseUrl: c.baseUrl,
-          apiKey: c.apiKey || (await apiKey(c.id)),
-          enabled: c.enabled !== false,
-          models: addedFor(c.id),
-          extraHeaders: c.extraHeaders,
-          keyInBody: c.keyInBody,
-        })
-      );
-    }
-
-    return out;
-  }
-
   /** Status of every provider for the settings UI. */
   private providerStatuses() {
-    return this.providers.all().map((p) => ({
-      id: p.id,
-      label: p.label,
-      enabled: p.enabled,
-      configured: p.isConfigured(),
-      modelCount: p.enabled && p.isConfigured() ? this.models.filter((m) => m.provider === p.id).length : 0,
-    }));
+    return this.providerCatalog.providerStatuses(this.providers.all(), this.models);
   }
 
   /* --------------------------------- MCP (M11) -------------------------------- */
@@ -1133,7 +947,7 @@ export class PhotonController {
         this.pushConfig();
         return;
       case "setAutoApprove":
-        this.autoApprove = msg.payload.enabled;
+        this.approvals.autoApprove = msg.payload.enabled;
         await vscode.workspace
           .getConfiguration("photon")
           .update("tools.autoApprove", msg.payload.enabled, vscode.ConfigurationTarget.Global);
@@ -1182,6 +996,10 @@ export class PhotonController {
             `photon.provider.${msg.payload.id}.apiKey`,
             msg.payload.apiKey
           );
+          // Auto-enable provider when an API key is connected
+          await vscode.workspace
+            .getConfiguration("photon")
+            .update(`providers.${msg.payload.id}.enabled`, true, vscode.ConfigurationTarget.Global);
         } else {
           await this.context.secrets.delete(`photon.provider.${msg.payload.id}.apiKey`);
         }
@@ -1193,7 +1011,7 @@ export class PhotonController {
         // the provider card via the providerModels error field.
         if (msg.payload.apiKey) await this.pushLiveModels(msg.payload.id);
         else {
-          this.liveModelCache.delete(msg.payload.id);
+          this.providerCatalog.liveModelCache.delete(msg.payload.id);
           this.safePost({ type: "providerModels", payload: { id: msg.payload.id, models: [] } });
         }
         return;
@@ -1236,7 +1054,15 @@ export class PhotonController {
         await this.deleteSession(msg.payload.id);
         return;
       case "detectProviders":
-        return this.detectProviders();
+        return this.detectProviders(true);
+      case "completeOnboarding":
+        await this.context.globalState.update("photon.onboardingCompleted", true);
+        this.safePost({ type: "onboardingStatus", payload: { show: false } });
+        return;
+      case "openOnboarding":
+        this.safePost({ type: "onboardingStatus", payload: { show: true } });
+        await this.detectProviders(true);
+        return;
       case "requestRecommendations":
         this.sendRecommendations(msg.payload?.goal, msg.payload?.ctxTokens);
         return;
@@ -1269,11 +1095,14 @@ export class PhotonController {
       case "refreshModels":
         return this.refresh();
       case "toolApproval": {
-        const resolve = this.pendingApprovals.get(msg.payload.callId);
-        if (resolve) {
-          this.pendingApprovals.delete(msg.payload.callId);
-          if (msg.payload.remember) this.autoApprove = true;
-          resolve(msg.payload.approved);
+        const { autoApproveChanged } = this.approvals.resolveApproval(
+          msg.payload.callId,
+          msg.payload.approved,
+          msg.payload.remember,
+          msg.payload.toolName
+        );
+        if (autoApproveChanged) {
+          this.pushConfig();
         }
         return;
       }
@@ -1292,78 +1121,27 @@ export class PhotonController {
       }
       case "testModel": {
         const { providerId, model } = msg.payload;
-        const bare = model.name.startsWith(`${providerId}:`)
-          ? model.name.slice(providerId.length + 1)
-          : model.name;
-        // Report with the prefixed name so the webview keys results correctly.
-        const resultModel: ModelInfo = { ...model, name: `${providerId}:${bare}`, provider: providerId };
-
         const p = this.providers.all().find((x) => x.id === providerId);
-        if (!p) {
-          this.safePost({
-            type: "modelTestResult",
-            payload: { providerId, model: resultModel, ok: false, error: `Provider ${providerId} not found` },
-          });
-          return;
-        }
-        if (!p.isConfigured()) {
-          this.safePost({
-            type: "modelTestResult",
-            payload: { providerId, model: resultModel, ok: false, error: `${p.label} has no API key set` },
-          });
-          return;
-        }
-        try {
-          const start = Date.now();
-          const stream = p.chatStream(
-            { model: bare, messages: [{ role: "user", content: "Reply with exactly: ok" }] },
-            AbortSignal.timeout(20_000)
-          );
-          let responded = false;
-          for await (const chunk of stream) {
-            if (chunk.message?.content || chunk.done) {
-              responded = true;
-              break;
-            }
-          }
-          if (!responded) throw new Error("The model returned an empty response.");
-          this.safePost({
-            type: "modelTestResult",
-            payload: { providerId, model: resultModel, ok: true, latencyMs: Date.now() - start },
-          });
-        } catch (e) {
-          this.safePost({
-            type: "modelTestResult",
-            payload: { providerId, model: resultModel, ok: false, error: (e as Error).message },
-          });
-        }
+        const testRes = await this.providerCatalog.testProviderModel(p, providerId, model);
+        this.safePost({
+          type: "modelTestResult",
+          payload: testRes,
+        });
         return;
       }
       case "addAvailableModel": {
         const { providerId, model } = msg.payload;
-        const bare = model.name.startsWith(`${providerId}:`)
-          ? model.name.slice(providerId.length + 1)
-          : model.name;
-        const prefixed = `${providerId}:${bare}`;
-        const added = this.addedModels();
-        if (!added.some((m) => m.name === prefixed)) {
-          added.push({ ...customModel(bare, providerId), ...model, name: prefixed, provider: providerId });
-          await this.setAddedModels(added);
-          // Rebuild so the owning provider's catalog includes the new model,
-          // then refresh to push the updated picker list to the webview.
-          await this.rebuildProviders();
-          await this.refresh();
-          this.pushConfig();
-        }
+        const { bare } = await this.providerCatalog.addModelToPicker(providerId, model);
+        await this.rebuildProviders();
+        await this.refresh();
+        this.pushConfig();
+        void vscode.window.showInformationMessage(`Photon: Added ${bare} to ${providerId} model picker.`);
         return;
       }
       case "removeAvailableModel": {
         const name = msg.payload.name;
-        const added = this.addedModels();
-        const next = added.filter((m) => m.name !== name);
-        if (next.length !== added.length) {
-          await this.setAddedModels(next);
-          // If the removed model was selected, drop the selection.
+        const removed = await this.providerCatalog.removeModelFromPicker(name);
+        if (removed) {
           if (this.selectedModel === name) this.selectedModel = "";
           await this.rebuildProviders();
           await this.refresh();
@@ -1376,9 +1154,7 @@ export class PhotonController {
         if (!label.trim() || !baseUrl.trim()) return;
         const cfg = vscode.workspace.getConfiguration("photon");
         const existing = cfg.get<OpenAICompatConfig[]>("providers.custom", []);
-        // Derive a stable unique id from the label (used as the model prefix).
-        let id = label.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "custom";
-        while (existing.some((c) => c.id === id)) id = `${id}-2`;
+        const id = deriveCustomProviderId(label, existing.map((c) => c.id));
         await cfg.update(
           "providers.custom",
           [...existing, { id, label: label.trim(), baseUrl: baseUrl.trim(), enabled: true }],
@@ -1406,8 +1182,10 @@ export class PhotonController {
         );
         await this.context.secrets.delete(`photon.provider.${id}.apiKey`);
         // Also drop any models the user had added under this provider.
-        await this.setAddedModels(this.addedModels().filter((m) => m.provider !== id));
-        this.liveModelCache.delete(id);
+        await this.providerCatalog.setAddedModels(
+          this.providerCatalog.addedModels().filter((m) => m.provider !== id)
+        );
+        this.providerCatalog.liveModelCache.delete(id);
         await this.rebuildProviders();
         await this.refresh();
         this.pushConfig();
@@ -1488,6 +1266,36 @@ export class PhotonController {
       case "getCheckpoints":
         this.pushSessionCheckpoints();
         return;
+      case "openFile":
+        await this.openWorkspaceFile(msg.payload.path, msg.payload.line);
+        return;
+    }
+  }
+
+  private async openWorkspaceFile(targetPath: string, line?: number): Promise<void> {
+    if (!targetPath || !targetPath.trim()) return;
+    const rootUri = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!rootUri) return;
+    const pathMod = require("node:path") as typeof import("node:path");
+    const rootFs = pathMod.resolve(rootUri.fsPath);
+    const cleaned = targetPath.trim().replace(/^[/\\]+/, "");
+    const absPath = pathMod.resolve(rootFs, cleaned);
+    const rel = pathMod.relative(rootFs, absPath);
+    if (rel.startsWith("..") || pathMod.isAbsolute(rel)) {
+      this.output.appendLine(`[openFile] Refused path outside workspace: ${targetPath}`);
+      return;
+    }
+    try {
+      const uri = vscode.Uri.file(absPath);
+      const doc = await vscode.workspace.openTextDocument(uri);
+      const lineIdx = typeof line === "number" && line > 0 ? Math.max(0, line - 1) : 0;
+      const pos = new vscode.Position(lineIdx, 0);
+      await vscode.window.showTextDocument(doc, {
+        preview: true,
+        selection: line ? new vscode.Range(pos, pos) : undefined,
+      });
+    } catch (e) {
+      this.output.appendLine(`[openFile] Could not open ${targetPath}: ${(e as Error).message}`);
     }
   }
 
@@ -1498,10 +1306,7 @@ export class PhotonController {
     this.turnAbort?.abort();
     // Resolve any pending approval prompts as "denied" so the tool call that is
     // awaiting them unwinds instead of hanging forever.
-    for (const [id, resolve] of this.pendingApprovals) {
-      this.pendingApprovals.delete(id);
-      resolve(false);
-    }
+    this.approvals.cancelAllPending();
   }
 
   private promptQueue: Array<{ text: string; attachments?: Attachment[] }> = [];
@@ -1513,15 +1318,25 @@ export class PhotonController {
       this.safePost({ type: "status", payload: { kind: "running", detail: `Queued (${this.promptQueue.length}) — will run after current turn.` } });
       return;
     }
-    await this.runPrompt(text, attachments);
-    // Drain queued prompts (preserves order, like harness Inbox.claim)
-    if (this.promptQueue.length && !this.drainingQueue) {
-      this.drainingQueue = true;
-      while (this.promptQueue.length) {
-        const next = this.promptQueue.shift()!;
-        await this.runPrompt(next.text, next.attachments);
+    try {
+      await this.runPrompt(text, attachments);
+    } finally {
+      // Drain queued prompts (preserves order, like harness Inbox.claim)
+      if (this.promptQueue.length && !this.drainingQueue) {
+        this.drainingQueue = true;
+        try {
+          while (this.promptQueue.length) {
+            const next = this.promptQueue.shift()!;
+            try {
+              await this.runPrompt(next.text, next.attachments);
+            } catch (err) {
+              this.output.appendLine(`[queue] Prompt failed: ${(err as Error).message}`);
+            }
+          }
+        } finally {
+          this.drainingQueue = false;
+        }
       }
-      this.drainingQueue = false;
     }
   }
   private async runPrompt(text: string, attachments?: Attachment[]): Promise<void> {
@@ -1567,11 +1382,17 @@ export class PhotonController {
     // A running benchmark must not compete with a real turn for the model.
     this.benchAbort?.abort();
 
+    this.safePost({
+      type: "status",
+      payload: { kind: "thinking", detail: "Selecting model & execution plan" },
+    });
+
     // Auto Mode (M8): choose the model + plan for THIS request. When the user
     // has a model pinned/selected, that wins but is still ranked for transparency.
     const cfg = vscode.workspace.getConfiguration("photon");
     // Per-model ctx: if a model has a stored numCtx/llamacpp.ctx, honor it for THIS turn.
     const perModelCtx = (m: string) => this.effectiveNumCtxFor(m);
+    const prevModel = this.selectedModel || undefined;
     let { decision, plan } = planRequest({
       prompt: text,
       mode: this.mode,
@@ -1580,6 +1401,7 @@ export class PhotonController {
       machine: this.machine,
       benchByModel: this.benchStore.byModel(),
       pinnedModel: this.autoSelect ? undefined : this.selectedModel || undefined,
+      previousModel: prevModel,
       intelligence: this.effectiveIntelligence(),
       reserveOutputTokens: cfg.get<number>("context.reserveOutputTokens", 1024),
       adaptiveEnabled: this.adaptiveEnabled(),
@@ -1615,38 +1437,32 @@ export class PhotonController {
     this.plan = plan;
     // Cloud mode: swap the adaptive plan for the permissive cloud plan (but keep per-model ctx if set).
     if (this.interfaceMode === "cloud") {
-      const m = this.models.find((x) => x.name === plan.model) ?? this.modelsForUi()[0];
+      const targetModelName = plan.model;
+      const m = this.models.find((x) => x.name === targetModelName) ?? this.modelsForUi()[0];
       if (m) {
         const cPlan = this.cloudPlan(m, this.mode);
         const pCtx = this.modelConfigs.get(m.name)?.numCtx ?? this.modelConfigs.get(m.name)?.llamacpp?.ctx;
         if (pCtx && pCtx > 0) { cPlan.numCtx = pCtx; cPlan.contextWindow = pCtx; }
+        plan = cPlan;
         this.plan = cPlan;
       }
     }
     this.lastDecision = decision;
+    if (decision.escalationNotice) {
+      this.output.appendLine(`[routing] ${decision.escalationNotice}`);
+    }
     this.safePost({ type: "decision", payload: decision });
     this.pushPlan();
     this.updateStatusBar();
 
-    // Auto context compaction: if conversation tokens reach >= 75% of context window,
+    // Auto context compaction: if conversation tokens reach >= 75% of the active model's context window,
     // compact history before running the turn (like GitHub Copilot & Claude Code).
-    const activeCtxWindow = this.plan?.numCtx || (this.plan as any)?.contextWindow || 32768;
-    if (shouldAutoCompact(this.session.messages, activeCtxWindow, this.plan?.model, 0.75)) {
+    const activeCtxWindow = this.getActiveContextLimit(plan.model);
+    if (shouldAutoCompact(this.session.messages, activeCtxWindow, plan.model, 0.75)) {
       this.output.appendLine(
-        `[compactor] Context usage >= 75% of ${activeCtxWindow} tokens — auto-compacting session before turn.`
+        `[compactor] Context usage >= 75% of ${activeCtxWindow} tokens (model=${plan.model}) — auto-compacting session before turn.`
       );
       await this.runCompactCommand(undefined, true);
-    }
-    // Phase 0.1 harness exercise — keep legacy AgentEngine as active path; harness behind flag logs parity
-    if (vscode.workspace.getConfiguration("photon").get<boolean>("experimental.harness", false)) {
-      try {
-        const hs: any = (this.durableSessions as any).get?.(this.session.id) ?? this.durableSessions.create(this.session.id as any, { workspaceName: vscode.workspace.workspaceFolders?.[0]?.name });
-        const tid = randomUUID();
-        hs.append("turn/start", { turnId: tid, at: Date.now() } as any);
-        hs.append("user/message", { id: randomUUID(), content: text.slice(0,120), source: { kind: "user" }, createdAt: Date.now() } as any);
-        this.output.appendLine(`[harness] turn/start ${tid} model=${plan.model} ctx=${plan.numCtx} events=${hs.allEvents().length}`);
-        hs.append("turn/end", { turnId: tid, reason: "stop", at: Date.now() } as any);
-      } catch (e) { this.output.appendLine(`[harness] exercise failed: ${(e as Error).message}`); }
     }
 
     // Pin the target session for this turn so a mid-stream session switch
@@ -1688,19 +1504,7 @@ export class PhotonController {
       // Finalize messages left mid-stream by an abort/error: without this a
       // reload shows a perpetual spinner, and empty assistant bubbles created
       // before any content arrived would linger forever.
-      let touched = false;
-      for (const m of session.messages) {
-        if (m.streaming) {
-          m.streaming = false;
-          m.notice ??= "Stopped.";
-          touched = true;
-        }
-      }
-      const before = session.messages.length;
-      session.messages = session.messages.filter(
-        (m) => !(m.role === "assistant" && !m.content.trim() && !m.toolCalls?.length && !m.notice)
-      );
-      touched = touched || session.messages.length !== before;
+      let touched = finalizeTurnMessages(session);
       if (this.ctxMgr) {
         const lastUserMsg = [...session.messages].reverse().find((m) => m.role === "user");
         const lastAsstMsg = [...session.messages].reverse().find((m) => m.role === "assistant" && m.content.trim());
@@ -1751,13 +1555,33 @@ export class PhotonController {
   }
 
   /**
+   * Resolve the active model's effective context limit (in tokens).
+   * Checks per-model configuration overrides, active execution plan, and model catalog metadata.
+   */
+  private getActiveContextLimit(modelName?: string): number {
+    const mName = modelName || this.plan?.model || this.selectedModel;
+    if (mName) {
+      const cfg = this.modelConfigs.get(mName);
+      const cfgCtx = cfg?.numCtx ?? cfg?.llamacpp?.ctx;
+      if (cfgCtx && cfgCtx > 0) return cfgCtx;
+    }
+    const planCtx = (this.plan as any)?.contextWindow || this.plan?.numCtx;
+    if (planCtx && planCtx > 0) return planCtx;
+    if (mName) {
+      const m = this.models.find((x) => x.name === mName);
+      if (m?.contextLength && m.contextLength > 0) return m.contextLength;
+    }
+    return this.interfaceMode === "cloud" ? 128_000 : 32_768;
+  }
+
+  /**
    * Compact the active session's context window (automatic or user-triggered).
    * Follows GitHub Copilot and Claude Code compaction architecture.
    */
   private async runCompactCommand(focus?: string, isAuto = false): Promise<void> {
     const session = this.session;
-    const window = this.plan?.numCtx || (this.plan as any)?.contextWindow || 32768;
-    const model = this.selectedModel || this.plan?.model;
+    const model = this.plan?.model || this.selectedModel;
+    const window = this.getActiveContextLimit(model);
 
     this.output.appendLine(
       `[compactor] Running ${isAuto ? "automatic" : "manual"} context compaction (messages=${session.messages.length}, window=${window}, model=${model})`
@@ -1773,6 +1597,7 @@ export class PhotonController {
       },
     });
 
+    let resultCompacted = false;
     try {
       const result = await compactSessionMessages({
         messages: session.messages,
@@ -1786,16 +1611,14 @@ export class PhotonController {
 
       if (!result.compacted) {
         if (!isAuto) {
-          this.safePost({
-            type: "status",
-            payload: {
-              kind: "idle",
-              detail: "Context window is already clean and optimal. No compaction needed yet.",
-            },
-          });
+          vscode.window.showInformationMessage(
+            "Photon: Context window is already optimal. Compaction requires at least 4 conversation turns."
+          );
         }
         return;
       }
+
+      resultCompacted = true;
 
       session.messages = result.newMessages;
       session.updatedAt = Date.now();
@@ -1829,7 +1652,17 @@ export class PhotonController {
       );
     } finally {
       this.safePost({ type: "compactingStatus", payload: { active: false } });
-      this.safePost({ type: "status", payload: { kind: "idle" } });
+      if (!isAuto && !resultCompacted) {
+        this.safePost({
+          type: "status",
+          payload: {
+            kind: "idle",
+            detail: "Context window is already clean and optimal. No compaction needed yet.",
+          },
+        });
+      } else {
+        this.safePost({ type: "status", payload: { kind: "idle" } });
+      }
     }
   }
 
@@ -1848,12 +1681,25 @@ export class PhotonController {
     const cpNumLabel = cpNum ? `Checkpoint #${cpNum}` : `checkpoint`;
 
     const result = await this.checkpointMgr.rollbackToCheckpoint(checkpointId);
-    if (!result.success && result.errors.length > 0 && result.revertedFiles.length === 0) {
+    if (!result.success && result.revertedFiles.length === 0 && result.deletedFiles.length === 0) {
       this.safePost({
         type: "error",
-        payload: { message: `Rollback failed: ${result.errors.join("; ")}` },
+        payload: { message: `Rollback aborted (checkpoint preserved): ${result.errors.join("; ")}` },
       });
       return;
+    } else if (!result.success) {
+      const failedOrConflict = result.fileResults.filter(
+        (f) => f.status === "failed" || f.status === "conflict"
+      );
+      const detail = failedOrConflict
+        .map((f) => `${f.relativePath} (${f.status}: ${f.reason || "unknown"})`)
+        .join("; ");
+      this.safePost({
+        type: "error",
+        payload: {
+          message: `Rollback partially completed: ${detail}. Checkpoint preserved for retry.`,
+        },
+      });
     }
 
     // Refresh symbol index for reverted/deleted files
@@ -1866,35 +1712,14 @@ export class PhotonController {
 
     if (rewindChat) {
       const session = this.session;
-
-      // Locate the user prompt for this checkpoint:
-      let userMsgIdx = session.messages.findIndex(
-        (m) =>
-          (m.role === "user" && m.checkpointId === checkpointId) ||
-          (m.role === "user" && m.id === result.targetTurnMessageId)
+      const rewound = rewindMessagesToCheckpoint(
+        session.messages,
+        checkpointId,
+        result.targetTurnMessageId,
+        result.label || ""
       );
-
-      if (userMsgIdx === -1) {
-        // Fallback: look for an assistant message with checkpointId and get preceding user message
-        const asstIdx = session.messages.findIndex((m) => m.checkpointId === checkpointId);
-        if (asstIdx >= 0) {
-          for (let i = asstIdx - 1; i >= 0; i--) {
-            if (session.messages[i].role === "user") {
-              userMsgIdx = i;
-              break;
-            }
-          }
-        }
-      }
-
-      if (userMsgIdx >= 0) {
-        restoredPrompt = session.messages[userMsgIdx].content;
-        // Truncate messages to BEFORE this user message:
-        session.messages = session.messages.slice(0, userMsgIdx);
-      } else {
-        restoredPrompt = result.label || "";
-      }
-
+      restoredPrompt = rewound.restoredPrompt;
+      session.messages = rewound.rewoundMessages;
       session.updatedAt = Date.now();
       await this.persistActiveSession(session);
       this.safePost({ type: "sessionLoaded", payload: session });
@@ -2113,6 +1938,7 @@ export class PhotonController {
       return;
     }
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    emitter.onPhase("thinking", "Retrieving project context");
     const workspaceMap = await buildWorkspaceMap(root).catch(() => undefined);
     // Classify tool policy here too so the system prompt matches the actual
     // tool surface. The unifiedRuntime monkey-patch also sets it, but the
@@ -2229,12 +2055,14 @@ export class PhotonController {
   }
 
   private requestApproval(call: ToolCall): Promise<boolean> {
-    if (this.autoApprove || !call.sideEffecting) return Promise.resolve(true);
-    return new Promise<boolean>((resolve) => {
-      this.pendingApprovals.set(call.id, resolve);
+    return this.approvals.requestApproval(call, (pendingCall) => {
+      this.safePost({
+        type: "status",
+        payload: { kind: "running", detail: `Waiting for approval: ${pendingCall.name}` },
+      });
       this.safePost({
         type: "toolApprovalRequest",
-        payload: { messageId: "", call },
+        payload: { messageId: "", call: pendingCall },
       });
     });
   }
@@ -2278,7 +2106,7 @@ export class PhotonController {
   private buildConfig(): PhotonConfig {
     const cfg = vscode.workspace.getConfiguration("photon");
     return {
-      autoApprove: this.autoApprove,
+      autoApprove: this.approvals.autoApprove,
       adaptiveEnabled: this.adaptiveEnabled(),
       webSearchProvider: cfg.get<"duckduckgo" | "none">("webSearch.provider", "duckduckgo"),
       ollamaBaseUrl: this.client.baseUrl,
@@ -2359,7 +2187,7 @@ export class PhotonController {
     return {
       session: this.session,
       sessions: this.sessionStore.summaries(),
-      models: this.modelsForUi(),
+      models: this.models,
       selectedModel: this.selectedModel,
       mode: this.mode,
       machine: this.machine,
@@ -2375,6 +2203,7 @@ export class PhotonController {
       hardwareMetrics: this.latestHardwareMetrics,
       ollamaRuntime: this.latestOllamaRuntime,
       cloudUsage: this.cloudUsageTracker.getSummary(),
+      showOnboarding: !this.context.globalState.get<boolean>("photon.onboardingCompleted", false),
     };
   }
 
@@ -2438,7 +2267,7 @@ export class PhotonController {
     this.pushPlan();
     this.safePost({
       type: "models",
-      payload: { models: this.modelsForUi(), selected: this.selectedModel, ollamaReachable: this.reachable },
+      payload: { models: this.models, selected: this.selectedModel, ollamaReachable: this.reachable },
     });
     this.pushSessionCheckpoints();
   }
@@ -2467,21 +2296,7 @@ export class PhotonController {
       const mcpPath = vscode.Uri.joinPath(root, ".vscode", "mcp.json");
       const fs = require("node:fs") as typeof import("node:fs");
       const raw = fs.readFileSync(mcpPath.fsPath, "utf8");
-      const json = JSON.parse(raw) as {
-        servers?: Record<
-          string,
-          { url?: string; headers?: Record<string, string>; command?: string; args?: string[]; env?: Record<string, string> }
-        >;
-      };
-      const out: McpServerConfig[] = [];
-      for (const [id, v] of Object.entries(json.servers ?? {})) {
-        if (typeof v.url === "string") {
-          out.push({ id, transport: "http", url: v.url, headers: v.headers });
-        } else if (typeof v.command === "string") {
-          out.push({ id, transport: "stdio", command: v.command, args: v.args, env: v.env });
-        }
-      }
-      return out;
+      return parseMcpConfigJson(raw);
     } catch {
       return [];
     }
@@ -2518,22 +2333,7 @@ export class PhotonController {
 
   /** Public method for Chat Participant to send a prompt directly */
   async sendPrompt(text: string, attachments?: Attachment[]): Promise<void> {
-    // Use the same queue logic as onPrompt
-    if (this.turnAbort && !this.turnAbort.signal.aborted) {
-      this.promptQueue.push({ text, attachments });
-      this.safePost({ type: "status", payload: { kind: "running", detail: `Queued (${this.promptQueue.length}) — will run after current turn.` } });
-      return;
-    }
-    await this.runPrompt(text, attachments);
-    // Drain queued prompts (preserves order, like harness Inbox.claim)
-    if (this.promptQueue.length && !this.drainingQueue) {
-      this.drainingQueue = true;
-      while (this.promptQueue.length) {
-        const next = this.promptQueue.shift()!;
-        await this.runPrompt(next.text, next.attachments);
-      }
-      this.drainingQueue = false;
-    }
+    return this.onPrompt(text, attachments);
   }
 }
 

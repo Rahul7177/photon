@@ -88,6 +88,7 @@ export type HostMessage =
     }
   | { type: "checkpointsList"; payload: { checkpoints: CheckpointSummary[] } }
   | { type: "openRevertModal"; payload?: { checkpoints?: CheckpointSummary[] } }
+  | { type: "onboardingStatus"; payload: { show: boolean } }
   | { type: "error"; payload: { message: string } };
 
 export interface CheckpointSummary {
@@ -98,6 +99,8 @@ export interface CheckpointSummary {
   filesCount: number;
   files: string[];
   messageId: string;
+  hasUnrestorableFiles?: boolean;
+  unrestorableFiles?: string[];
 }
 
 export interface PhotonConfig {
@@ -150,6 +153,7 @@ export interface InitPayload {
   hardwareMetrics?: HardwareMetrics | null;
   cloudUsage?: CloudUsageSummary;
   projectContext?: ProjectContextSummary | null;
+  showOnboarding?: boolean;
 }
 
 /* ------------------------------ webview -> host ------------------------------ */
@@ -164,7 +168,7 @@ export type ViewMessage =
   | { type: "switchSession"; payload: { id: string } }
   | { type: "deleteSession"; payload: { id: string } }
   | { type: "refreshModels" }
-  | { type: "toolApproval"; payload: { callId: string; approved: boolean; remember?: boolean } }
+  | { type: "toolApproval"; payload: { callId: string; approved: boolean; remember?: boolean; toolName?: string } }
   | { type: "setContextWindow"; payload: { numCtx: number } }
   | { type: "setAutoApprove"; payload: { enabled: boolean } }
   | { type: "setAdaptiveEnabled"; payload: { enabled: boolean } }
@@ -216,4 +220,7 @@ export type ViewMessage =
   | { type: "compactContext"; payload?: { focus?: string } }
   | { type: "rollbackCheckpoint"; payload: { checkpointId: string; rewindChat?: boolean } }
   | { type: "getCheckpoints"; payload?: { sessionId?: string } }
-  | { type: "revertToNumber"; payload: { checkpointNumber: number } };
+  | { type: "revertToNumber"; payload: { checkpointNumber: number } }
+  | { type: "openFile"; payload: { path: string; line?: number } }
+  | { type: "completeOnboarding" }
+  | { type: "openOnboarding" };

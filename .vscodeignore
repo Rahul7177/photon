@@ -1,4 +1,5 @@
 .vscode/**
+.photon/**
 webview-ui/**
 src/**
 node_modules/**

@@ -15,6 +15,64 @@ export const BLACKBOX_MODELS: ProviderModel[] = [
   { id: "llama-3.3-70b", name: "blackbox:llama-3.3-70b", paramsB: 70, contextLength: 128_000, toolTrained: true, tier: "large", capabilities: ["tools"] },
 ];
 
+/** Curated flagship and top-tier models per provider. */
+export const RECOMMENDED_PROVIDER_MODELS: Record<string, string[]> = {
+  gemini: [
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-pro",
+    "gemini-1.5-flash",
+  ],
+  claude: [
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-sonnet-latest",
+    "claude-3-5-haiku-20241022",
+    "claude-3-5-haiku-latest",
+    "claude-3-opus-20240229",
+  ],
+  openai: [
+    "gpt-4o",
+    "gpt-4o-mini",
+    "o3-mini",
+    "o1",
+    "chatgpt-4o-latest",
+  ],
+  nvidia: [
+    "meta/llama-3.1-70b-instruct",
+    "nvidia/llama-3.1-nemotron-70b-instruct",
+    "deepseek-ai/deepseek-r1",
+    "qwen/qwen2.5-coder-32b-instruct",
+  ],
+  openrouter: [
+    "anthropic/claude-3.5-sonnet",
+    "openai/gpt-4o",
+    "google/gemini-2.0-flash-001",
+    "deepseek/deepseek-r1",
+    "meta-llama/llama-3.3-70b-instruct",
+  ],
+  opencode: [
+    "claude-3-5-sonnet",
+    "gpt-4o",
+    "qwen2.5-coder-32b",
+    "deepseek-coder-v2",
+  ],
+  blackbox: [
+    "blackboxai-pro",
+    "blackboxai-pro-plus",
+    "llama-3.3-70b",
+  ],
+};
+
+/** Checks whether a model ID or clean name is considered a recommended/flagship model for the provider. */
+export function isRecommendedModel(providerId: string, modelName: string): boolean {
+  const normProv = (providerId || "").toLowerCase();
+  const clean = modelName.includes(":") ? modelName.split(":").slice(1).join(":") : modelName;
+  const list = RECOMMENDED_PROVIDER_MODELS[normProv];
+  if (!list) return false;
+  const target = clean.toLowerCase();
+  return list.some((rec) => target === rec.toLowerCase() || target.startsWith(rec.toLowerCase()));
+}
+
 /** Default profile for a user-supplied custom OpenAI-compatible model. */
 export function customModel(id: string, providerId: string): ProviderModel {
   const caps = inferCapabilities(id);

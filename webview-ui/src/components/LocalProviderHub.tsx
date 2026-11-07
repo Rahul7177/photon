@@ -28,6 +28,7 @@ export function LocalProviderHub({
   const isRunning = state.ollamaReachable || ollama?.state === "running";
   const isConflict = ollama?.state === "port_conflict";
   const isNotInstalled = ollama?.state === "not_installed";
+  const hasError = !isRunning && lifecycle?.phase === "error";
   const isStopped =
     !isRunning && (ollama?.state === "installed_stopped" || (!isNotInstalled && !isConflict));
 
@@ -46,7 +47,7 @@ export function LocalProviderHub({
               <span>Ollama</span>
               <span
                 className={`hub-badge ${
-                  isRunning ? "ok" : isStarting ? "warn" : isConflict ? "error" : "faint"
+                  isRunning ? "ok" : isStarting ? "warn" : isConflict || hasError ? "error" : "faint"
                 }`}
               >
                 {isRunning ? (
@@ -65,6 +66,11 @@ export function LocalProviderHub({
                   <>
                     <AlertTriangleIcon />
                     <span>Port Conflict</span>
+                  </>
+                ) : hasError ? (
+                  <>
+                    <AlertTriangleIcon />
+                    <span>Failed to Start</span>
                   </>
                 ) : isNotInstalled ? (
                   <span>Not Installed</span>
@@ -85,15 +91,17 @@ export function LocalProviderHub({
                   ? "Port 11434 is in use"
                   : isStarting
                     ? "Starting background service…"
-                    : isNotInstalled
-                      ? "Not found on PATH"
-                      : "Service stopped"}
+                    : hasError
+                      ? (lifecycle?.message || "Failed to start service")
+                      : isNotInstalled
+                        ? "Not found on PATH"
+                        : "Service stopped"}
             </div>
           </div>
         </div>
 
         <div className="hub-header-actions">
-          {!isRunning && !isStarting && isStopped && (
+          {!isRunning && !isStarting && (isStopped || hasError) && (
             <button
               type="button"
               className="btn primary btn-sm"

@@ -1,26 +1,20 @@
 import * as vscode from "vscode";
 import type { OllamaClient } from "../core/ollama/client";
 import { VectorStore } from "../core/index/vectorStore";
-import { WorkspaceIndex } from "../core/index/indexer";
+import { WorkspaceIndex, shouldIndexFile, MAX_INDEXABLE_FILE_BYTES } from "../core/index/indexer";
 import type { IndexStatus } from "../shared/types";
 
 // Bounds so a huge repo never freezes the host or blows memory (M10 checklist).
 const MAX_FILES = 1500;
-const MAX_FILE_BYTES = 256 * 1024;
+const MAX_FILE_BYTES = MAX_INDEXABLE_FILE_BYTES;
 const FILE_GLOB =
   "**/*.{ts,tsx,js,jsx,mjs,cjs,py,go,rs,java,c,cc,cpp,h,hpp,cs,rb,php,swift,kt,scala,vue,svelte,md,json,yaml,yml,toml,sh}";
-const EXCLUDE_GLOB = "**/{node_modules,.git,dist,out,build,.next,.venv,__pycache__,.turbo,coverage,.cache}/**";
+const EXCLUDE_GLOB = "**/{node_modules,.git,.photon,dist,out,build,.next,.venv,__pycache__,.turbo,coverage,.cache,target,vendor}/**";
 const DEBOUNCE_MS = 800;
 const SAVE_DEBOUNCE_MS = 4000;
 
-/** Directory segments never indexed — mirrors EXCLUDE_GLOB for watcher events. */
-const IGNORED_SEGMENTS = new Set([
-  "node_modules", ".git", "dist", "out", "build", ".next", ".venv",
-  "__pycache__", ".turbo", "coverage", ".cache",
-]);
-
 function isIgnoredPath(rel: string): boolean {
-  return rel.split(/[\\/]/).some((seg) => IGNORED_SEGMENTS.has(seg));
+  return !shouldIndexFile(rel).indexable;
 }
 
 /**
@@ -34,6 +28,7 @@ export class IndexService {
   private store = new VectorStore();
   private index?: WorkspaceIndex;
   private watcher?: vscode.FileSystemWatcher;
+  private renameSub?: vscode.Disposable;
   private abort?: AbortController;
   private readonly pendingFiles = new Set<string>();
   private debounceTimer?: ReturnType<typeof setTimeout>;
@@ -174,6 +169,8 @@ export class IndexService {
   private disposeWatcher(): void {
     this.watcher?.dispose();
     this.watcher = undefined;
+    this.renameSub?.dispose();
+    this.renameSub = undefined;
   }
 
   /* ------------------------------- internals ------------------------------ */
@@ -199,6 +196,19 @@ export class IndexService {
       this.publishReady();
       this.scheduleSave();
     });
+    this.renameSub = vscode.workspace.onDidRenameFiles((event) => {
+      if (!this.index) return;
+      for (const { oldUri, newUri } of event.files) {
+        const oldRel = vscode.workspace.asRelativePath(oldUri, false);
+        const newRel = vscode.workspace.asRelativePath(newUri, false);
+        this.index.removeFile(oldRel);
+        if (!isIgnoredPath(newRel)) {
+          this.queueFile(newRel);
+        }
+      }
+      this.publishReady();
+      this.scheduleSave();
+    });
     this.watcher = w;
   }
 
@@ -221,7 +231,10 @@ export class IndexService {
         const uri = this.relToUri(rel);
         if (!uri) continue;
         const stat = await vscode.workspace.fs.stat(uri);
-        if (stat.size > MAX_FILE_BYTES) continue;
+        if (stat.size > MAX_FILE_BYTES) {
+          this.index.removeFile(rel);
+          continue;
+        }
         const bytes = await vscode.workspace.fs.readFile(uri);
         await this.index.indexFile(rel, Buffer.from(bytes).toString("utf8"), signal);
       } catch (e) {

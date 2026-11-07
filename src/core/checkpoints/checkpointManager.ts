@@ -8,6 +8,21 @@ export interface FileSnapshot {
   existed: boolean;
   content?: string;
   mtimeMs?: number;
+  oversized?: boolean;
+  sizeBytes?: number;
+}
+
+export type FileRollbackStatus = "restored" | "deleted" | "skipped" | "conflict" | "failed";
+
+export interface FileRollbackResult {
+  relativePath: string;
+  status: FileRollbackStatus;
+  reason?: string;
+}
+
+export interface RollbackOptions {
+  /** If true, overwrite external modifications and ignore conflict detection */
+  force?: boolean;
 }
 
 export interface Checkpoint {
@@ -20,6 +35,9 @@ export interface Checkpoint {
   label: string;
   files: Record<string, FileSnapshot>;
   modifiedFilesCount: number;
+  hasUnrestorableFiles?: boolean;
+  unrestorableFiles?: string[];
+  postMutationMtimes?: Record<string, number>;
 }
 
 export interface CheckpointRollbackResult {
@@ -28,6 +46,7 @@ export interface CheckpointRollbackResult {
   label: string;
   revertedFiles: string[];
   deletedFiles: string[];
+  fileResults: FileRollbackResult[];
   errors: string[];
   targetTurnMessageId: string;
 }
@@ -131,6 +150,8 @@ export class CheckpointManager {
           relativePath: norm,
           existed: true,
           mtimeMs: stat.mtimeMs,
+          oversized: true,
+          sizeBytes: stat.size,
         });
         return;
       }
@@ -141,6 +162,7 @@ export class CheckpointManager {
         existed: true,
         content,
         mtimeMs: stat.mtimeMs,
+        sizeBytes: stat.size,
       });
     } catch {
       // Best-effort capture; do not block tool execution if stat/read fails
@@ -164,8 +186,25 @@ export class CheckpointManager {
     }
 
     const filesObj: Record<string, FileSnapshot> = {};
+    const unrestorable: string[] = [];
+    const postMutationMtimes: Record<string, number> = {};
+
     for (const [k, v] of turn.files.entries()) {
       filesObj[k] = v;
+      if (v.oversized) {
+        unrestorable.push(k);
+      }
+      const r = resolveInWorkspace(this.workspaceRoot, k);
+      if (!("error" in r)) {
+        try {
+          const stat = await fs.stat(r.abs).catch(() => null);
+          if (stat) {
+            postMutationMtimes[k] = stat.mtimeMs;
+          }
+        } catch {
+          // ignore
+        }
+      }
     }
 
     await this.ensureInitialized();
@@ -182,6 +221,9 @@ export class CheckpointManager {
       label: turn.label,
       files: filesObj,
       modifiedFilesCount: turn.files.size,
+      hasUnrestorableFiles: unrestorable.length > 0 ? true : undefined,
+      unrestorableFiles: unrestorable.length > 0 ? unrestorable : undefined,
+      postMutationMtimes,
     };
 
     this.checkpoints.push(checkpoint);
@@ -206,8 +248,14 @@ export class CheckpointManager {
    * Rollback the workspace files to the exact state before the specified checkpoint.
    * Walks backward through all checkpoints from the latest down to targetId,
    * restoring the earliest pre-mutation file state for each touched file.
+   *
+   * If any file restoration fails or encounters external conflict, the checkpoint
+   * records are PRESERVED so that the user can retry without losing recovery state.
    */
-  async rollbackToCheckpoint(checkpointId: string): Promise<CheckpointRollbackResult> {
+  async rollbackToCheckpoint(
+    checkpointId: string,
+    options?: RollbackOptions
+  ): Promise<CheckpointRollbackResult> {
     await this.ensureInitialized();
 
     const targetIdx = this.checkpoints.findIndex((cp) => cp.id === checkpointId);
@@ -218,6 +266,7 @@ export class CheckpointManager {
         label: "",
         revertedFiles: [],
         deletedFiles: [],
+        fileResults: [],
         errors: [`Checkpoint "${checkpointId}" not found.`],
         targetTurnMessageId: "",
       };
@@ -231,6 +280,9 @@ export class CheckpointManager {
     // (i.e. its state right before the target checkpoint turn began).
     const fileStates = new Map<string, FileSnapshot>();
 
+    // Track the latest known post-mutation time recorded by checkpoints for each file
+    const latestPostMtimes = new Map<string, number>();
+
     // Process from oldest in the affected range to newest: earliest snapshot wins
     for (const cp of affectedCheckpoints) {
       for (const [rel, snap] of Object.entries(cp.files)) {
@@ -238,8 +290,14 @@ export class CheckpointManager {
           fileStates.set(rel, snap);
         }
       }
+      if (cp.postMutationMtimes) {
+        for (const [rel, mt] of Object.entries(cp.postMutationMtimes)) {
+          latestPostMtimes.set(rel, mt);
+        }
+      }
     }
 
+    const fileResults: FileRollbackResult[] = [];
     const revertedFiles: string[] = [];
     const deletedFiles: string[] = [];
     const errors: string[] = [];
@@ -247,39 +305,87 @@ export class CheckpointManager {
     for (const [rel, snap] of fileStates.entries()) {
       const r = resolveInWorkspace(this.workspaceRoot, rel);
       if ("error" in r) {
-        errors.push(`Could not resolve "${rel}": ${r.error}`);
+        const msg = `Could not resolve "${rel}": ${r.error}`;
+        errors.push(msg);
+        fileResults.push({ relativePath: rel, status: "failed", reason: msg });
         continue;
       }
 
+      // 1. Files larger than 2MB where content could not be retained
+      if (snap.oversized || (snap.existed && snap.content === undefined)) {
+        const sizeDesc = snap.sizeBytes
+          ? ` (${Math.round((snap.sizeBytes / (1024 * 1024)) * 10) / 10} MB)`
+          : "";
+        const msg = `File exceeds 2 MB limit${sizeDesc}; original content was not retained for rollback.`;
+        errors.push(`Cannot restore "${rel}": ${msg}`);
+        fileResults.push({ relativePath: rel, status: "failed", reason: msg });
+        continue;
+      }
+
+      // 2. Check current status on disk
+      const currentStat = await fs.stat(r.abs).catch(() => null);
+
+      // 3. Detect external modifications (newer user work after checkpoint)
+      if (currentStat && !options?.force) {
+        const knownPostMtime = latestPostMtimes.get(rel) || target.timestamp;
+        // If current file has an mtime > 1000ms after the checkpoint/mutation time, user edited it externally
+        if (currentStat.mtimeMs > knownPostMtime + 1000) {
+          const msg = `File was modified externally after checkpoint was created (last modified: ${new Date(
+            currentStat.mtimeMs
+          ).toLocaleTimeString()}). Pass force=true to overwrite.`;
+          errors.push(`Conflict on "${rel}": ${msg}`);
+          fileResults.push({ relativePath: rel, status: "conflict", reason: msg });
+          continue;
+        }
+      }
+
+      // 4. Restore or delete
       try {
         if (snap.existed && snap.content !== undefined) {
           // Restore file content
           await fs.mkdir(path.dirname(r.abs), { recursive: true });
           await fs.writeFile(r.abs, snap.content, "utf8");
           revertedFiles.push(rel);
+          fileResults.push({ relativePath: rel, status: "restored" });
         } else if (!snap.existed) {
           // File was created in or after this checkpoint; remove it
-          const exists = await fs.stat(r.abs).then(() => true).catch(() => false);
-          if (exists) {
+          if (currentStat) {
             await fs.rm(r.abs, { force: true });
             deletedFiles.push(rel);
+            fileResults.push({ relativePath: rel, status: "deleted" });
+          } else {
+            fileResults.push({
+              relativePath: rel,
+              status: "skipped",
+              reason: "File was already absent",
+            });
           }
         }
       } catch (e) {
-        errors.push(`Failed to revert "${rel}": ${(e as Error).message}`);
+        const msg = `Failed to process "${rel}": ${(e as Error).message}`;
+        errors.push(msg);
+        fileResults.push({ relativePath: rel, status: "failed", reason: msg });
       }
     }
 
-    // Prune the rolled-back checkpoints from the stored list
-    this.checkpoints = this.checkpoints.slice(0, targetIdx);
-    await this.persist();
+    const hasFailure =
+      errors.length > 0 ||
+      fileResults.some((r) => r.status === "failed" || r.status === "conflict");
+
+    // Only prune checkpoint history if ALL file restorations succeeded!
+    // If any failed or conflicted, preserve checkpoints so the user can fix and retry!
+    if (!hasFailure) {
+      this.checkpoints = this.checkpoints.slice(0, targetIdx);
+      await this.persist();
+    }
 
     return {
-      success: errors.length === 0,
+      success: !hasFailure,
       checkpointId: target.id,
       label: target.label,
       revertedFiles,
       deletedFiles,
+      fileResults,
       errors,
       targetTurnMessageId: target.messageId,
     };
@@ -322,6 +428,8 @@ export class CheckpointManager {
     filesCount: number;
     files: string[];
     messageId: string;
+    hasUnrestorableFiles?: boolean;
+    unrestorableFiles?: string[];
   }> {
     return this.listCheckpoints(sessionId).map((cp) => ({
       id: cp.id,
@@ -331,6 +439,8 @@ export class CheckpointManager {
       filesCount: cp.modifiedFilesCount,
       files: Object.keys(cp.files),
       messageId: cp.messageId,
+      hasUnrestorableFiles: cp.hasUnrestorableFiles,
+      unrestorableFiles: cp.unrestorableFiles,
     }));
   }
 

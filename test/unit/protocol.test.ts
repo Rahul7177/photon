@@ -239,4 +239,128 @@ Have a great day!
       assert.deepEqual(nativeTools[0].function.parameters.required, ["path"]);
     });
   });
+
+  describe("P1 Item 11: Cross-Model & Adversarial Protocol Evaluation", () => {
+    it("resolves ambiguous parameter aliases across model families", () => {
+      const text = `
+\`\`\`tool
+TOOL_NAME: replace_in_file
+BEGIN_ARG: filepath
+src/app.ts
+END_ARG
+BEGIN_ARG: old_text
+const a = 1;
+END_ARG
+BEGIN_ARG: new_text
+const a = 2;
+END_ARG
+\`\`\`
+      `.trim();
+
+      const result = parsePhotonBlocks(text, specs);
+      assert.equal(result.calls.length, 1);
+      assert.equal(result.calls[0].name, "edit_file");
+      assert.equal(result.calls[0].args.path, "src/app.ts");
+      assert.equal(result.calls[0].args.old_str, "const a = 1;");
+      assert.equal(result.calls[0].args.new_str, "const a = 2;");
+    });
+
+    it("parses repeated tool calls in a single response in exact order", () => {
+      const text = `
+Let me inspect both files first.
+\`\`\`tool
+TOOL_NAME: read_file
+BEGIN_ARG: path
+src/first.ts
+END_ARG
+\`\`\`
+And now the second file:
+\`\`\`tool
+TOOL_NAME: read_file
+BEGIN_ARG: path
+src/second.ts
+END_ARG
+\`\`\`
+      `.trim();
+
+      const result = parsePhotonBlocks(text, specs);
+      assert.equal(result.calls.length, 2);
+      assert.equal(result.calls[0].args.path, "src/first.ts");
+      assert.equal(result.calls[1].args.path, "src/second.ts");
+    });
+
+    it("handles escaped \\END_ARG and \\BEGIN_ARG inside file content without premature termination", () => {
+      const text = `
+\`\`\`tool
+TOOL_NAME: write_file
+BEGIN_ARG: path
+src/parser-doc.md
+END_ARG
+BEGIN_ARG: content
+Here is how delimiters work:
+\\BEGIN_ARG: example
+Inside content
+\\END_ARG
+Final line of file.
+END_ARG
+\`\`\`
+      `.trim();
+
+      const result = parsePhotonBlocks(text, specs);
+      assert.equal(result.calls.length, 1);
+      assert.equal(result.calls[0].name, "write_file");
+      assert.equal(result.calls[0].args.path, "src/parser-doc.md");
+      const content = String(result.calls[0].args.content);
+      assert.ok(content.includes("BEGIN_ARG: example"));
+      assert.ok(content.includes("END_ARG"));
+      assert.ok(content.includes("Final line of file."));
+    });
+
+    it("does not prematurely trigger a truncated tool call on partial streaming output with unclosed BEGIN_ARG", () => {
+      const partialStream = `
+I will update the file now:
+\`\`\`tool
+TOOL_NAME: write_file
+BEGIN_ARG: path
+src/index.ts
+END_ARG
+BEGIN_ARG: content
+export function hello() {
+  return "still streaming...
+      `.trim();
+
+      const result = parsePhotonBlocks(partialStream, specs);
+      assert.equal(result.calls.length, 0, "Should wait until BEGIN_ARG is closed by END_ARG");
+    });
+
+    it("never triggers tool calls from arbitrary JSON, package.json snippets, or code fences in prose", () => {
+      const proseWithCodeAndJson = `
+Here is an example \`package.json\` file:
+
+\`\`\`json
+{
+  "name": "view",
+  "version": "1.0.0",
+  "path": "dist/index.js"
+}
+\`\`\`
+
+And here is a TypeScript example showing how Photon parses blocks:
+
+\`\`\`ts
+const example = \`
+TOOL_NAME: read_file
+BEGIN_ARG: path
+src/secret.ts
+END_ARG
+\`;
+\`\`\`
+
+Also in plain JSON prose: {"name": "read", "description": "just a normal object"}
+      `.trim();
+
+      const result = parsePhotonBlocks(proseWithCodeAndJson, specs);
+      assert.equal(result.calls.length, 0, "Arbitrary code fences and JSON objects must not trigger tools");
+    });
+  });
 });

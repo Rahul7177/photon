@@ -3,11 +3,17 @@ import type { ChatMessage, ToolCall } from "../../../src/shared/types";
 import type { Actions } from "../state/store";
 import { ToolCard } from "./ToolCard";
 import { ThinkingBlock } from "./ThinkingBlock";
-import { CheckCircleIcon, AlertTriangleIcon, SparkleIcon, ChevronRightIcon } from "./Icons";
+import {
+  CheckCircleIcon,
+  AlertTriangleIcon,
+  SparkleIcon,
+  ChevronRightIcon,
+  StopSquareIcon,
+} from "./Icons";
 
 export const TurnProcess = memo(function TurnProcess({
   messages,
-  pendingApproval,
+  pendingApproval: _pendingApproval,
   actions,
   isStreaming,
   hasContent,
@@ -21,12 +27,16 @@ export const TurnProcess = memo(function TurnProcess({
   const allToolCalls: ToolCall[] = [];
   const thinkingMessages: ChatMessage[] = [];
   let totalThinkingMs = 0;
+  let wasCancelled = false;
 
   for (const m of messages) {
     if (m.toolCalls?.length) allToolCalls.push(...m.toolCalls);
     if (hasVisibleText(m.thinking)) {
       thinkingMessages.push(m);
       if (m.thinkingElapsedMs) totalThinkingMs += m.thinkingElapsedMs;
+    }
+    if (m.notice && /stopped/i.test(m.notice)) {
+      wasCancelled = true;
     }
   }
 
@@ -36,23 +46,22 @@ export const TurnProcess = memo(function TurnProcess({
   // Nothing to abstract
   if (!hasToolCalls && !hasThinking) return null;
 
-  const hasPendingApproval = allToolCalls.some((c) => c.id === pendingApproval?.id);
-  const shouldBeOpenLive = (isStreaming && !hasContent) || hasPendingApproval;
+  // Only auto-expand while actively streaming initial thinking/tool steps before text output.
+  // Never auto-expand on tool approval — approval belongs solely in the dedicated bottom card.
+  const shouldBeOpenLive = isStreaming && !hasContent;
 
   const [open, setOpen] = useState(shouldBeOpenLive);
   const userToggled = useRef(false);
 
   useEffect(() => {
-    // If a tool requires user approval, always expand so the user sees Allow/Deny
-    if (hasPendingApproval && !open) {
+    // Auto-open only while streaming initial steps before content arrives
+    if (isStreaming && !hasContent && !userToggled.current && !open) {
       setOpen(true);
-      return;
-    }
-    // Once content starts streaming or turn finishes, auto-abstract into collapsed state
-    if ((hasContent || !isStreaming) && !userToggled.current && open) {
+    } else if ((hasContent || !isStreaming) && !userToggled.current && open) {
+      // Auto-collapse once content starts streaming or execution settles
       setOpen(false);
     }
-  }, [hasContent, isStreaming, hasPendingApproval, open]);
+  }, [hasContent, isStreaming, open]);
 
   // If there are NO tool calls and only 1 thinking message, use standard ThinkingBlock
   if (!hasToolCalls && thinkingMessages.length === 1) {
@@ -67,7 +76,13 @@ export const TurnProcess = memo(function TurnProcess({
     );
   }
 
-  const summary = computeSummary(allToolCalls, totalThinkingMs, isStreaming, hasContent);
+  const summary = computeSummary(
+    allToolCalls,
+    totalThinkingMs,
+    isStreaming,
+    hasContent,
+    wasCancelled
+  );
 
   const handleToggle = () => {
     userToggled.current = true;
@@ -87,25 +102,31 @@ export const TurnProcess = memo(function TurnProcess({
         onClick={handleToggle}
         title={open ? "Collapse execution details" : "Expand execution details"}
         aria-expanded={open}
+        aria-label={`Agent execution steps: ${summary.text}`}
       >
-        {summary.isRunning ? (
-          <span className="turn-process-spinner" />
-        ) : summary.isError ? (
-          <span className="turn-process-icon err">
+        {summary.state === "running" ? (
+          <span className="turn-process-spinner" aria-hidden="true" />
+        ) : summary.state === "error" ? (
+          <span className="turn-process-icon err" aria-hidden="true">
             <AlertTriangleIcon />
           </span>
+        ) : summary.state === "cancelled" ? (
+          <span className="turn-process-icon cancelled" aria-hidden="true">
+            <StopSquareIcon />
+          </span>
         ) : hasToolCalls ? (
-          <span className="turn-process-icon ok">
+          <span className="turn-process-icon ok" aria-hidden="true">
             <CheckCircleIcon />
           </span>
         ) : (
-          <span className="turn-process-icon brain">
+          <span className="turn-process-icon brain" aria-hidden="true">
             <SparkleIcon />
           </span>
         )}
 
+        <span className={`turn-process-badge ${summary.state}`}>{summary.badge}</span>
         <span className="turn-process-label">{summary.text}</span>
-        <span className={`turn-process-chevron${open ? " open" : ""}`}>
+        <span className={`turn-process-chevron${open ? " open" : ""}`} aria-hidden="true">
           <ChevronRightIcon />
         </span>
       </button>
@@ -142,7 +163,6 @@ export const TurnProcess = memo(function TurnProcess({
                       <ToolCard
                         key={call.id}
                         call={call}
-                        pendingApproval={pendingApproval}
                         actions={actions}
                       />
                     ))}
@@ -157,29 +177,59 @@ export const TurnProcess = memo(function TurnProcess({
   );
 });
 
-function computeSummary(
+export function computeSummary(
   toolCalls: ToolCall[],
   totalThinkingMs: number,
   isStreaming: boolean,
-  hasContent: boolean
-): { text: string; isRunning?: boolean; isError?: boolean } {
+  hasContent: boolean,
+  wasCancelled: boolean
+): {
+  text: string;
+  badge: string;
+  state: "running" | "error" | "cancelled" | "done";
+} {
   const toolCount = toolCalls.length;
   const errorCount = toolCalls.filter((c) => c.status === "error").length;
+  const deniedCount = toolCalls.filter((c) => c.status === "denied").length;
   const runningTool = toolCalls.find((c) => c.status === "running");
   const timeStr = totalThinkingMs > 0 ? `Thought for ${formatElapsed(totalThinkingMs)}` : "";
 
   if (isStreaming && !hasContent) {
     if (runningTool) {
       const doneCount = toolCalls.filter((c) => c.status === "done").length;
+      const isVerifying = runningTool.name === "get_diagnostics";
       return {
-        text: `Running ${runningTool.name}… (${doneCount}/${toolCount} tools)`,
-        isRunning: true,
+        text: isVerifying
+          ? `Verifying changes (${runningTool.name})… (${doneCount}/${toolCount})`
+          : `Running ${runningTool.name}… (${doneCount}/${toolCount} tools)`,
+        badge: isVerifying ? "Verifying" : "Running",
+        state: "running",
       };
     }
     if (toolCount > 0) {
-      return { text: `Running tools… (${toolCount} calls)`, isRunning: true };
+      return {
+        text: `Executing tools… (${toolCount} call${toolCount === 1 ? "" : "s"})`,
+        badge: "Running",
+        state: "running",
+      };
     }
-    return { text: "Thinking…", isRunning: true };
+    return {
+      text: "Understanding request & reasoning…",
+      badge: "Thinking",
+      state: "running",
+    };
+  }
+
+  if (wasCancelled || (deniedCount > 0 && deniedCount === toolCount)) {
+    const toolStr =
+      toolCount > 0
+        ? `${toolCount} tool${toolCount === 1 ? "" : "s"} (${deniedCount > 0 ? `${deniedCount} denied` : "stopped"})`
+        : "Stopped";
+    return {
+      text: timeStr ? `${toolStr} · ${timeStr}` : toolStr,
+      badge: deniedCount > 0 ? "Denied" : "Cancelled",
+      state: "cancelled",
+    };
   }
 
   // Done or answer is streaming
@@ -188,18 +238,24 @@ function computeSummary(
       const toolStr = `${toolCount} tool${toolCount === 1 ? "" : "s"} (${errorCount} failed)`;
       return {
         text: timeStr ? `${toolStr} · ${timeStr}` : toolStr,
-        isError: true,
+        badge: "Failed",
+        state: "error",
       };
     }
-    const toolStr = `${toolCount} tool${toolCount === 1 ? "" : "s"} used`;
+    const verified = toolCalls.some((c) => c.name === "get_diagnostics" && c.status === "done");
+    const toolStr = `${toolCount} tool${toolCount === 1 ? "" : "s"} used${verified ? " · verified" : ""}`;
     return {
       text: timeStr ? `${toolStr} · ${timeStr}` : toolStr,
+      badge: "Done",
+      state: "done",
     };
   }
 
   // Thinking only
   return {
     text: timeStr || "Thought process",
+    badge: "Reasoned",
+    state: "done",
   };
 }
 
@@ -215,4 +271,3 @@ function hasVisibleText(s?: string): boolean {
   if (!s) return false;
   return s.replace(NO_GLYPH, "").length > 0;
 }
-

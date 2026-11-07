@@ -7,11 +7,13 @@ import { Composer } from "./components/Composer";
 import { Hero } from "./components/Hero";
 import { LocalProviderHub } from "./components/LocalProviderHub";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { Approval } from "./components/Approval";
 import { StatusIndicator } from "./components/StatusIndicator";
 import { ProjectContextModal } from "./components/ProjectContextModal";
 import { HardwareMetricsModal } from "./components/HardwareMetricsModal";
 import { ContextWarningModal } from "./components/ContextWarningModal";
 import { RevertModal } from "./components/RevertModal";
+import { OnboardingModal } from "./components/OnboardingModal";
 import type { ContextOverflowCheck } from "./contextPresets";
 import type { Attachment } from "../../src/shared/types";
 import { readFileToAttachment } from "./attachments";
@@ -198,7 +200,15 @@ export function App() {
               <MessageList state={state} dispatch={dispatch} actions={actions} />
             </>
           )}
-          <StatusIndicator state={state} />
+          {state.pendingApproval && (
+            <div className="approval-dock">
+              <Approval
+                call={state.pendingApproval}
+                actions={actions}
+                onResolved={() => dispatch({ type: "_clearApproval" })}
+              />
+            </div>
+          )}
           <Composer
             state={state}
             actions={actions}
@@ -244,6 +254,12 @@ export function App() {
           state={state}
           actions={actions}
           onClose={actions.closeRevertModal}
+        />
+      )}
+      {state.showOnboarding && (
+        <OnboardingModal
+          state={state}
+          actions={actions}
         />
       )}
       {dragDepth > 0 && (

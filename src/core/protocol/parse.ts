@@ -41,7 +41,28 @@ export function canonicalToolName(rawName:string,specs:ToolSpec[]):string|undefi
 }
 
 export function parsePhotonBlocks(text:string,specs:ToolSpec[]):ParseResult{const specByName=new Map(specs.map(s=>[s.name.toLowerCase(),s]));const consumed:[number,number][]=[];const raws:RawMatch[]=[];const claim=(m:RawMatch)=>{if(overlaps(m.start,m.end,consumed))return;consumed.push([m.start,m.end]);raws.push(m);};const known=(name:string)=>!!canonicalToolName(name,specs);collectBlockTags(text,claim);collectXmlTags(text,known,claim);collectHybridTags(text,known,claim);collectPipeUnclosed(text,known,claim);collectToolNameBlocks(text,claim);collectJsonFences(text,known,claim);collectBareJson(text,known,claim);const calls=raws.sort((a,b)=>a.start-b.start).map(m=>finalizeCall(m.name,m.args,text.slice(m.start,m.end),specByName,specs,m.explicit)).filter((c):c is ParsedCall=>c!==null);return{calls,cleanedText:stripToolMarkup(stripRanges(text,consumed))};}
-function collectBlockTags(text:string,claim:(m:RawMatch)=>void):void{BLOCK_RE.lastIndex=0;let m:RegExpExecArray|null;let lastEnd=0;while((m=BLOCK_RE.exec(text))!==null){claim({name:m[1],args:parseBody(m[2]),start:m.index,end:m.index+m[0].length,explicit:true});lastEnd=m.index+m[0].length;}const tail=text.slice(lastEnd);if(!/\[\/TOOL\]/i.test(tail)){const um=OPEN_UNCLOSED_RE.exec(tail);if(um)claim({name:um[1],args:parseBody(um[2]),start:lastEnd+um.index,end:text.length,explicit:true});}}
+function hasUnclosedBeginArg(body:string):boolean{
+  const lines=body.replace(/\r\n/g,"\n").split("\n");
+  let open=false;
+  for(const line of lines){
+    if(/^[ \t]*BEGIN_ARG[ \t]*:/i.test(line))open=true;
+    else if(/^[ \t]*END_ARG[ \t]*:?[ \t]*$/i.test(line))open=false;
+  }
+  return open;
+}
+function findNonToolCodeFenceRanges(text:string):[number,number][]{
+  const ranges:[number,number][]=[];
+  const re=/```([a-zA-Z0-9_-]*)[ \t]*\r?\n[\s\S]*?```/g;
+  let m:RegExpExecArray|null;
+  while((m=re.exec(text))!==null){
+    const lang=(m[1]||"").toLowerCase();
+    if(lang&&lang!=="tool"&&lang!=="tool_code"&&lang!=="tool_call"&&lang!=="json"){
+      ranges.push([m.index,m.index+m[0].length]);
+    }
+  }
+  return ranges;
+}
+function collectBlockTags(text:string,claim:(m:RawMatch)=>void):void{BLOCK_RE.lastIndex=0;let m:RegExpExecArray|null;let lastEnd=0;while((m=BLOCK_RE.exec(text))!==null){claim({name:m[1],args:parseBody(m[2]),start:m.index,end:m.index+m[0].length,explicit:true});lastEnd=m.index+m[0].length;}const tail=text.slice(lastEnd);if(!/\[\/TOOL\]/i.test(tail)){const um=OPEN_UNCLOSED_RE.exec(tail);if(um&&!hasUnclosedBeginArg(um[2]))claim({name:um[1],args:parseBody(um[2]),start:lastEnd+um.index,end:text.length,explicit:true});}}
 /** Hybrid format: <|tool_call>...[/TOOL] or <|tool_call>call:name{json} — local models mix XML open with bracket close or inline JSON. */
 function collectHybridTags(text:string,known:(n:string)=>boolean,claim:(m:RawMatch)=>void):void{
   // Variant 1: <|tool_call>...[/TOOL] (bracket close)
@@ -97,6 +118,7 @@ function collectPipeUnclosed(text:string,known:(n:string)=>boolean,claim:(m:RawM
     const args=safeJson(inlineJson[2]);
     if(args&&typeof args==="object"&&!Array.isArray(args)){claim({name:inlineJson[1].toLowerCase(),args:args as Record<string,unknown>,start:m.index,end:text.length,explicit:true});return;}
   }
+  if(hasUnclosedBeginArg(inner))return;
   const body=parseBody(inner);const rawCall=(body.call as string)||(body.name as string);const cand=rawCall?rawCall.replace(/^call:/," ").trim().toLowerCase():"";if(cand&&known(cand)){claim({name:cand,args:{...body,call:undefined as any},start:m.index,end:text.length,explicit:true});return;}const found=inner.match(/\b(?:list_dir|list_files|read_file|write_file|write_to_file|edit_file|replace_in_file|find_files|find_file|search_code|search_files|get_diagnostics|code_outline|run_command|execute_command|move_path|todo_write|todo|think|web_search|web_fetch)\b/i);if(found&&known(found[0]))claim({name:found[0].toLowerCase(),args:parseBody(inner),start:m.index,end:text.length,explicit:true});}
 /** `TOOL_NAME:` blocks — the PRIMARY format renderToolInstructions teaches
  *  (```tool fence, BEGIN_ARG/END_ARG body). Also accepts the same body with a
@@ -111,9 +133,11 @@ function collectToolNameBlocks(text:string,claim:(m:RawMatch)=>void):void{
     if(!name)continue;
     claim({name,args:parseBody(m[1]),start:m.index,end:m.index+m[0].length,explicit:true});
   }
+  const nonToolFences=findNonToolCodeFenceRanges(text);
   const bare=/^[ \t]*TOOL_NAME[ \t]*:[ \t]*\S.*$/gim;
   while((m=bare.exec(text))!==null){
     const start=m.index;
+    if(overlaps(start,start+m[0].length,nonToolFences))continue;
     const end=bareToolBlockEnd(text,start);
     if(end<=start)continue;
     const name=toolNameIn(text.slice(start,end));
@@ -162,8 +186,8 @@ function bareToolBlockEnd(text:string,start:number):number{
   return finish(start+lastEnd);
 }
 function collectXmlTags(text:string,known:(name:string)=>boolean,claim:(m:RawMatch)=>void):void{const re=/<\|?(?:tool_call|function_call|tool)\|?>\s*([\s\S]*?)\s*<\|?\/(?:tool_call|function_call|tool)\|?>/gi;let m:RegExpExecArray|null;while((m=re.exec(text))!==null){const inner=m[1].trim();let call=jsonToCall(safeJson(inner));if(!call){const body=parseBody(inner);const rawCall=(body.call as string)||(body.name as string)||(body.tool as string);if(rawCall&&known(rawCall)){const name=rawCall.replace(/^call:/," ").trim().toLowerCase();const args={...body};delete(args as any).call;delete(args as any).name;delete(args as any).tool;call={name,args};}else{const found=inner.match(/\b(?:list_dir|list_files|read_file|write_file|write_to_file|edit_file|replace_in_file|find_files|find_file|search_code|search_files|get_diagnostics|code_outline|run_command|execute_command|move_path|todo_write|todo|think|web_search|web_fetch)\b/i);if(found&&known(found[0]))call={name:found[0].toLowerCase(),args:parseBody(inner)};}}if(call&&known(call.name))claim({...call,start:m.index,end:m.index+m[0].length,explicit:true});}}
-function collectJsonFences(text:string,known:(name:string)=>boolean,claim:(m:RawMatch)=>void):void{const re=/```(?:json|tool_call|tool|tool_code)?\s*\n?([\s\S]*?)```/gi;let m:RegExpExecArray|null;while((m=re.exec(text))!==null){const call=jsonToCall(safeJson(m[1]));if(call&&known(call.name))claim({...call,start:m.index,end:m.index+m[0].length,explicit:false});}}
-function collectBareJson(text:string,known:(name:string)=>boolean,claim:(m:RawMatch)=>void):void{scanBalancedJson(text,(obj,start,end)=>{const call=jsonToCall(obj);if(call&&known(call.name))claim({...call,start,end,explicit:false});});}
+function collectJsonFences(text:string,known:(name:string)=>boolean,claim:(m:RawMatch)=>void):void{const re=/```(json|tool_call|tool|tool_code)?[ \t]*\r?\n([\s\S]*?)```/gi;let m:RegExpExecArray|null;while((m=re.exec(text))!==null){const lang=(m[1]||"").toLowerCase();const isExplicitToolFence=lang==="tool"||lang==="tool_call"||lang==="tool_code";const call=jsonToCall(safeJson(m[2]),isExplicitToolFence);if(call&&known(call.name))claim({...call,start:m.index,end:m.index+m[0].length,explicit:isExplicitToolFence});}}
+function collectBareJson(text:string,known:(name:string)=>boolean,claim:(m:RawMatch)=>void):void{const nonToolFences=findNonToolCodeFenceRanges(text);scanBalancedJson(text,(obj,start,end)=>{if(overlaps(start,end,nonToolFences))return;const call=jsonToCall(obj,false);if(call&&known(call.name))claim({...call,start,end,explicit:false});});}
 function finalizeCall(rawName:string,args:Record<string,unknown>,raw:string,specByName:Map<string,ToolSpec>,specs:ToolSpec[],explicit:boolean):ParsedCall|null{const canonical=canonicalToolName(rawName,specs);if(!canonical)return explicit?{name:rawName.trim(),args,raw,errors:[`Unknown tool "${rawName.trim()}".`]}:null;const spec=specByName.get(canonical.toLowerCase());if(!spec)return null;
   // Resolve parameter aliases (e.g. q → query, old_text → find, old_str ↔ find)
   const aliases=PARAM_ALIASES[canonical]??{};const resolved:Record<string,unknown>={...args};for(const[alias,target]of Object.entries(aliases)){if(alias in resolved&&!(target in resolved)){resolved[target]=resolved[alias];delete resolved[alias];}}
@@ -196,7 +220,22 @@ export function validateAgainstSpec(name:string,rawArgs:Record<string,unknown>,s
   return coerceArgs(spec,resolved);}
 function coerceArgs(spec:ToolSpec,args:Record<string,unknown>):{args:Record<string,unknown>;errors:string[]}{const coerced:Record<string,unknown>={};const errors:string[]=[];for(const p of spec.params){if(!(p.name in args)||args[p.name]===undefined||args[p.name]===null){if(p.required)errors.push(`Missing required argument "${p.name}".`);continue;}const [value,error]=coerce(args[p.name],p.type);if(error)errors.push(`Argument "${p.name}": ${error}`);else coerced[p.name]=value;}return{args:coerced,errors};}
 function coerce(value:unknown,type:ToolSpec["params"][number]["type"]):[unknown,string|null]{if(type==="string")return[typeof value==="string"?value:String(value),null];if(type==="number"||type==="integer"){const n=typeof value==="number"?value:Number(String(value).trim());if(!Number.isFinite(n))return[undefined,`expected a number, got "${String(value)}"`];if(type==="integer"&&!Number.isInteger(n))return[undefined,`expected an integer, got "${String(value)}"`];return[n,null];}if(type==="boolean"){if(typeof value==="boolean")return[value,null];const s=String(value).trim();if(/^(true|yes|1)$/i.test(s))return[true,null];if(/^(false|no|0)$/i.test(s))return[false,null];return[undefined,`expected true/false, got "${s}"`];}if(type==="null")return value===null?[null,null]:[undefined,"expected null"];if(type==="array"){if(Array.isArray(value))return[value,null];if(typeof value!=="string")return[undefined,"expected a JSON array"];const parsed=safeJson(value);return Array.isArray(parsed)?[parsed,null]:[undefined,"expected a JSON array string"];}if(type==="object"){if(value&&typeof value==="object"&&!Array.isArray(value))return[value,null];if(typeof value!=="string")return[undefined,"expected a JSON object"];const parsed=safeJson(value);return parsed&&typeof parsed==="object"&&!Array.isArray(parsed)?[parsed,null]:[undefined,"expected a JSON object string"];}return[undefined,"unsupported argument type"];}
-function jsonToCall(obj:unknown):{name:string;args:Record<string,unknown>}|null{if(!obj||typeof obj!=="object")return null;const o=obj as Record<string,unknown>;const fn=(o.function??{}) as Record<string,unknown>;const name=o.name??o.tool??o.tool_name??o.action??fn.name;if(typeof name!=="string"||!name)return null;let args=o.arguments??o.args??o.parameters??o.input??fn.arguments??{};if(typeof args==="string")args=safeJson(args)??{};if(!args||typeof args!=="object")args={};return{name,args:args as Record<string,unknown>};}
+const AMBIGUOUS_CONVERSATIONAL_ALIASES=new Set(["read","view","show","move","todo","grep"]);
+function jsonToCall(obj:unknown,explicit=true):{name:string;args:Record<string,unknown>}|null{
+  if(!obj||typeof obj!=="object"||Array.isArray(obj))return null;
+  const o=obj as Record<string,unknown>;
+  const fn=(o.function&&typeof o.function==="object"?o.function:{}) as Record<string,unknown>;
+  const hasExplicitToolField=typeof o.tool==="string"||typeof o.tool_name==="string"||typeof fn.name==="string";
+  const hasArgsEnvelope="arguments" in o||"args" in o||"parameters" in o||"input" in o||"arguments" in fn;
+  if(!explicit&&!hasExplicitToolField&&!hasArgsEnvelope)return null;
+  const name=o.tool??o.tool_name??fn.name??o.name??(explicit?o.action:undefined);
+  if(typeof name!=="string"||!name)return null;
+  if(!explicit&&!hasExplicitToolField&&AMBIGUOUS_CONVERSATIONAL_ALIASES.has(name.trim().toLowerCase()))return null;
+  let args=o.arguments??o.args??o.parameters??o.input??fn.arguments??{};
+  if(typeof args==="string")args=safeJson(args)??{};
+  if(!args||typeof args!=="object"||Array.isArray(args))args={};
+  return{name,args:args as Record<string,unknown>};
+}
 function safeJson(s:string):unknown{
   try{return JSON.parse(s.trim());}catch{
     try{
@@ -254,7 +293,11 @@ function extractBeginArgArgs(body:string):{args:Record<string,string>;rest:strin
       if(i<lines.length&&!/^[ \t]*END_ARG/i.test(lines[i])){key=lines[i].trim();i++;}
     }
     const value:string[]=[];
-    while(i<lines.length&&!/^[ \t]*END_ARG[ \t]*:?[ \t]*$/i.test(lines[i])){value.push(lines[i]);i++;}
+    while(i<lines.length&&!/^[ \t]*END_ARG[ \t]*:?[ \t]*$/i.test(lines[i])){
+      const unescaped=lines[i].replace(/^([ \t]*)\\(END_ARG|BEGIN_ARG)\b/i,"$1$2");
+      value.push(unescaped);
+      i++;
+    }
     if(i<lines.length)i++;
     if(key)args[key]=sanitizeEditValue(key,value.join("\n").replace(/^\n+|\n+$/g,""));
   }

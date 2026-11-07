@@ -277,4 +277,121 @@ describe("Checkpoint & Rollback Manager", () => {
     const configExists = await fs.stat(path.join(tmpDir, "config.json")).then(() => true).catch(() => false);
     assert.strictEqual(configExists, false);
   });
+
+  it("does not delete or prune checkpoint records if file restoration fails, allowing retry", async () => {
+    const file1 = path.join(tmpDir, "file1.txt");
+    const file2 = path.join(tmpDir, "file2.txt");
+    await fs.writeFile(file1, "file1 v1", "utf8");
+    await fs.writeFile(file2, "file2 v1", "utf8");
+
+    mgr.beginTurn("session-1", "turn-fail", "Turn with partial failure");
+    await mgr.recordBeforeChange("file1.txt");
+    await mgr.recordBeforeChange("file2.txt");
+
+    await fs.writeFile(file1, "file1 v2", "utf8");
+    await fs.writeFile(file2, "file2 v2", "utf8");
+    const cp = await mgr.commitTurn("turn-fail");
+    assert.ok(cp);
+
+    // Make file2 unwritable by replacing it with a directory containing a locked structure or bad target
+    await fs.rm(file2);
+    await fs.mkdir(file2); // Now writing to file2 as a file will throw EISDIR
+    const sub = path.join(file2, "subfile");
+    await fs.writeFile(sub, "locked", "utf8");
+
+    // Attempt rollback
+    const res = await mgr.rollbackToCheckpoint(cp.id);
+    assert.strictEqual(res.success, false);
+    assert.ok(res.errors.length > 0);
+    assert.strictEqual(res.fileResults.find((r) => r.relativePath === "file2.txt")?.status, "failed");
+
+    // CRITICAL: Checkpoint must NOT be deleted/pruned when restoration fails!
+    assert.strictEqual(mgr.listCheckpoints().length, 1);
+    assert.strictEqual(mgr.getCheckpoint(cp.id)?.id, cp.id);
+
+    // Fix the condition (remove the directory blocking file2)
+    await fs.rm(file2, { recursive: true, force: true });
+
+    // Retry rollback: should succeed now!
+    const retryRes = await mgr.rollbackToCheckpoint(cp.id);
+    assert.strictEqual(retryRes.success, true);
+    assert.strictEqual(await fs.readFile(file1, "utf8"), "file1 v1");
+    assert.strictEqual(await fs.readFile(file2, "utf8"), "file2 v1");
+
+    // Checkpoint is now safely pruned after full success
+    assert.strictEqual(mgr.listCheckpoints().length, 0);
+  });
+
+  it("detects external modifications and prevents overwriting newer user work unless forced", async () => {
+    const userFile = path.join(tmpDir, "usercode.ts");
+    await fs.writeFile(userFile, "const baseline = true;", "utf8");
+
+    mgr.beginTurn("session-1", "turn-ext", "Agent refactor");
+    await mgr.recordBeforeChange("usercode.ts");
+    await fs.writeFile(userFile, "const baseline = false; // agent edited", "utf8");
+    const cp = await mgr.commitTurn("turn-ext");
+    assert.ok(cp);
+
+    // Simulate external edit by user after the checkpoint turn ended
+    // Explicitly set disk mtime to 5 seconds in the future
+    const futureTime = new Date(Date.now() + 5000);
+    await fs.writeFile(userFile, "const userManualEdit = 42;", "utf8");
+    await fs.utimes(userFile, futureTime, futureTime);
+
+    // Normal rollback without force: MUST detect conflict and preserve user work
+    const res = await mgr.rollbackToCheckpoint(cp.id);
+    assert.strictEqual(res.success, false);
+    const conflictResult = res.fileResults.find((r) => r.relativePath === "usercode.ts");
+    assert.strictEqual(conflictResult?.status, "conflict");
+    assert.ok(conflictResult?.reason?.includes("modified externally"));
+
+    // User work was NOT overwritten
+    assert.strictEqual(await fs.readFile(userFile, "utf8"), "const userManualEdit = 42;");
+
+    // Checkpoint was preserved
+    assert.strictEqual(mgr.listCheckpoints().length, 1);
+
+    // Forced rollback: overwrites external edits intentionally
+    const forceRes = await mgr.rollbackToCheckpoint(cp.id, { force: true });
+    assert.strictEqual(forceRes.success, true);
+    assert.strictEqual(await fs.readFile(userFile, "utf8"), "const baseline = true;");
+    assert.strictEqual(mgr.listCheckpoints().length, 0);
+  });
+
+  it("handles oversized files (>2MB) safely with explicit unrestorable warnings", async () => {
+    const bigFile = path.join(tmpDir, "large_dataset.bin");
+    // Write 2.1 MB file
+    const bigBuffer = Buffer.alloc(2.1 * 1024 * 1024, 0x41);
+    await fs.writeFile(bigFile, bigBuffer);
+
+    mgr.beginTurn("session-1", "turn-big", "Touch large file and small file");
+    await mgr.recordBeforeChange("large_dataset.bin");
+
+    const smallFile = path.join(tmpDir, "small.txt");
+    await fs.writeFile(smallFile, "small v1", "utf8");
+    await mgr.recordBeforeChange("small.txt");
+
+    // Mutate files
+    await fs.writeFile(bigFile, Buffer.alloc(100, 0x42));
+    await fs.writeFile(smallFile, "small v2", "utf8");
+
+    const cp = await mgr.commitTurn("turn-big");
+    assert.ok(cp);
+    assert.strictEqual(cp.hasUnrestorableFiles, true);
+    assert.deepStrictEqual(cp.unrestorableFiles, ["large_dataset.bin"]);
+
+    const summaries = mgr.getSessionCheckpointSummaries("session-1");
+    assert.strictEqual(summaries[0].hasUnrestorableFiles, true);
+    assert.deepStrictEqual(summaries[0].unrestorableFiles, ["large_dataset.bin"]);
+
+    // Attempt rollback: should explicitly fail for the oversized file and preserve checkpoint
+    const res = await mgr.rollbackToCheckpoint(cp.id);
+    assert.strictEqual(res.success, false);
+    const bigResult = res.fileResults.find((r) => r.relativePath === "large_dataset.bin");
+    assert.strictEqual(bigResult?.status, "failed");
+    assert.ok(bigResult?.reason?.includes("2 MB"));
+
+    // Checkpoint preserved
+    assert.strictEqual(mgr.listCheckpoints().length, 1);
+  });
 });

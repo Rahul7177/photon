@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
   MODEL_CATALOG,
   assessFit,
+  evaluateInstalledLocalModels,
   hardwareFromProfile,
   hardwareTier,
   memoryRequiredGb,
   recommendModels,
 } from "../../src/core/adaptive/modelAdvisor";
-import type { MachineProfile } from "../../src/shared/types";
+import { scanDiskOllamaModels } from "../../src/core/adaptive/runtimeDetector";
+import { matchInstalledModelName, type MachineProfile } from "../../src/shared/types";
 
 const GB = 1024 ** 3;
 function machine(o: { ram: number; vram?: number; gpu?: string; vendor?: string; cores?: number; platform?: string; arch?: string }): MachineProfile {
@@ -137,5 +142,68 @@ describe("recommendations", () => {
     const r = rec(machine({ ram: 8, vram: 4 }));
     assert.equal(r.models[0].recommended, true);
     assert.equal(r.models[r.models.length - 1].fit.mode, "exceeds");
+  });
+  it("matches :latest and quantized installed tags so present models are never marked uninstalled", () => {
+    assert.equal(
+      matchInstalledModelName("qwen2.5-coder:7b", ["qwen2.5-coder:latest"]),
+      "qwen2.5-coder:latest"
+    );
+    assert.equal(
+      matchInstalledModelName("qwen2.5-coder:7b", ["qwen2.5-coder:7b-instruct-q4_K_M"]),
+      "qwen2.5-coder:7b-instruct-q4_K_M"
+    );
+    const r = rec(machine({ ram: 16, vram: 8 }), {
+      installed: ["qwen2.5-coder:latest", "deepseek-r1:8b-llama-distill-q4_K_M"],
+    });
+    const qwen7b = r.models.find((m) => m.name === "qwen2.5-coder:7b")!;
+    assert.equal(qwen7b.installed, true);
+    assert.equal(qwen7b.installedName, "qwen2.5-coder:latest");
+    const r1 = r.models.find((m) => m.name === "deepseek-r1:8b")!;
+    assert.equal(r1.installed, true);
+  });
+  it("evaluates arbitrary installed local models and recommends the best hardware & capability fit", () => {
+    const evals = evaluateInstalledLocalModels(
+      [
+        { name: "llama3.2:1b", provider: "ollama" },
+        { name: "qwen2.5-coder:7b", provider: "ollama" },
+        { name: "qwen2.5-coder:32b", provider: "ollama" },
+      ],
+      machine({ ram: 16, vram: 8 }),
+      "coding"
+    );
+    assert.equal(evals.length, 3);
+    assert.equal(evals[0].name, "qwen2.5-coder:7b");
+    assert.equal(evals[0].recommended, true);
+    assert.equal(evals[0].fit.mode, "gpu");
+  });
+  it("scans disk Ollama manifests when daemon is stopped", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "photon-ollama-test-"));
+    try {
+      const manifestDir = path.join(
+        tmp,
+        ".ollama",
+        "models",
+        "manifests",
+        "registry.ollama.ai",
+        "library",
+        "qwen2.5-coder"
+      );
+      fs.mkdirSync(manifestDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(manifestDir, "7b"),
+        JSON.stringify({
+          layers: [
+            { mediaType: "application/vnd.ollama.image.model", size: 4_700_000_000 },
+          ],
+        }),
+        "utf8"
+      );
+      const found = scanDiskOllamaModels(tmp, {});
+      assert.equal(found.length, 1);
+      assert.equal(found[0].name, "qwen2.5-coder:7b");
+      assert.equal(found[0].sizeBytes, 4_700_000_000);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });

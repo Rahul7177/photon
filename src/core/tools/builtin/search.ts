@@ -87,7 +87,7 @@ export const searchCodeTool: Tool = {
     try {
       re = new RegExp(useRegex ? rawQuery : escapeRegExp(rawQuery), caseSensitive ? "" : "i");
     } catch (e) {
-      return toolError("invalid_args", `Could not parse JSON: unexpected token at position 14 — re-emit using double-quoted keys and values. Invalid regular expression: ${(e as Error).message}. Set regex: false to search for literal text instead.`);
+      return toolError("invalid_args", `Invalid regular expression: ${(e as Error).message}. Set regex: false to search for literal text instead.`);
     }
 
     const rel = (args.path as string) || ".";

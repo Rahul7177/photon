@@ -1,5 +1,6 @@
 import type { ToolCall } from "../../../src/shared/types";
 import type { Actions } from "../state/store";
+import { FileCodeIcon } from "./Icons";
 
 export function Approval({
   call,
@@ -11,27 +12,133 @@ export function Approval({
   onResolved: () => void;
 }) {
   const decide = (approved: boolean, remember?: boolean) => {
-    actions.approve(call.id, approved, remember);
+    actions.approve(call.id, approved, remember, call.name);
     onResolved();
   };
+
+  const args = call.args ?? {};
+  const toolName = call.name || "tool";
+
+  // Identify special tool types for tailored, readable previews
+  const isFileWrite = /write|create/i.test(toolName);
+  const isFileEdit = /edit|replace|patch/i.test(toolName);
+  const isCommand = /exec|command|bash|terminal|shell/i.test(toolName);
+
+  const filePath = (args.path || args.file || args.filepath || args.target_file || args.file_path) as string | undefined;
+  const content = (args.content || args.file_text || args.text) as string | undefined;
+  const oldStr = (args.old_str || args.old_string || args.find) as string | undefined;
+  const newStr = (args.new_str || args.new_string || args.replace) as string | undefined;
+  const command = (args.command || args.cmd) as string | undefined;
+
   return (
-    <div className="approval">
-      <div className="approval-title">Allow {call.name}?</div>
-      <div style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--text-dim)" }}>
-        {Object.entries(call.args ?? {}).map(([k, v]) => (
-          <div key={k}>
-            {k}: {truncate(String(v))}
+    <div className="approval" role="region" aria-label={`Tool approval required for ${toolName}`}>
+      <div className="approval-header">
+        <div className="approval-title-wrap">
+          <span className="approval-badge" aria-hidden="true">!</span>
+          <span className="approval-title-text">
+            Allow <strong>{toolName}</strong>?
+          </span>
+        </div>
+        {filePath && (
+          <div className="approval-file-pill" title={filePath}>
+            <span className="approval-file-icon"><FileCodeIcon /></span>
+            <span className="approval-file-name">{filePath}</span>
           </div>
-        ))}
+        )}
       </div>
+
+      <div className="approval-body">
+        {/* Case 1: File Write (e.g. write_to_file) */}
+        {isFileWrite && content !== undefined && (
+          <div className="approval-section">
+            <div className="approval-section-label">File Content Preview:</div>
+            <pre className="approval-code-block">{previewText(content)}</pre>
+          </div>
+        )}
+
+        {/* Case 2: File Edit / Replace (e.g. replace_in_file) */}
+        {isFileEdit && (oldStr !== undefined || newStr !== undefined) && (
+          <div className="approval-section">
+            {oldStr !== undefined && (
+              <div className="approval-diff-block diff-old">
+                <div className="approval-diff-label">Replace:</div>
+                <pre className="approval-code-block old">{previewText(oldStr)}</pre>
+              </div>
+            )}
+            {newStr !== undefined && (
+              <div className="approval-diff-block diff-new">
+                <div className="approval-diff-label">With:</div>
+                <pre className="approval-code-block new">{previewText(newStr)}</pre>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Case 3: Command execution */}
+        {isCommand && command !== undefined && (
+          <div className="approval-section">
+            <div className="approval-section-label">Command to execute:</div>
+            <div className="approval-command-block">
+              <span className="approval-prompt-symbol">$</span>
+              <code>{command}</code>
+            </div>
+          </div>
+        )}
+
+        {/* Case 4: General arguments for any other tools or extra args */}
+        {(() => {
+          const skipKeys = new Set<string>();
+          if (isFileWrite) { skipKeys.add("path"); skipKeys.add("file"); skipKeys.add("content"); skipKeys.add("file_text"); }
+          if (isFileEdit) { skipKeys.add("path"); skipKeys.add("file"); skipKeys.add("old_str"); skipKeys.add("new_str"); skipKeys.add("find"); skipKeys.add("replace"); }
+          if (isCommand) { skipKeys.add("command"); skipKeys.add("cmd"); }
+
+          const remaining = Object.entries(args).filter(([k]) => !skipKeys.has(k));
+          if (!remaining.length && (isFileWrite || isFileEdit || isCommand)) return null;
+
+          return (
+            <div className="approval-args-grid">
+              {remaining.map(([k, v]) => {
+                const strVal = typeof v === "object" ? JSON.stringify(v, null, 2) : String(v);
+                const isLong = strVal.length > 70 || strVal.includes("\n");
+                return (
+                  <div key={k} className={`approval-arg-entry${isLong ? " long" : ""}`}>
+                    <span className="approval-arg-key">{k}:</span>
+                    {isLong ? (
+                      <pre className="approval-code-block compact">{previewText(strVal)}</pre>
+                    ) : (
+                      <span className="approval-arg-val">{strVal}</span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })()}
+      </div>
+
       <div className="approval-actions">
-        <button className="btn primary" onClick={() => decide(true)}>
+        <button
+          type="button"
+          className="btn primary approval-btn-allow"
+          aria-label={`Allow ${toolName} once`}
+          onClick={() => decide(true, false)}
+        >
           Allow
         </button>
-        <button className="btn" onClick={() => decide(true, true)}>
-          Always allow
+        <button
+          type="button"
+          className="btn approval-btn-always"
+          aria-label="Always allow tools in this session"
+          onClick={() => decide(true, true)}
+        >
+          Always allow in session
         </button>
-        <button className="btn ghost" onClick={() => decide(false)}>
+        <button
+          type="button"
+          className="btn ghost approval-btn-deny"
+          aria-label={`Deny ${toolName}`}
+          onClick={() => decide(false, false)}
+        >
           Deny
         </button>
       </div>
@@ -39,6 +146,8 @@ export function Approval({
   );
 }
 
-function truncate(s: string, n = 200): string {
-  return s.length > n ? s.slice(0, n) + "…" : s;
+function previewText(s: string, maxLen = 4000): string {
+  if (!s) return "";
+  if (s.length <= maxLen) return s;
+  return s.slice(0, maxLen) + `\n… [${s.length - maxLen} more characters]`;
 }

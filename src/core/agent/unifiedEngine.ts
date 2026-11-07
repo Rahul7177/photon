@@ -9,6 +9,7 @@ import { parsePhotonBlocks, validateAgainstSpec, canonicalToolName, stripToolMar
 import { renderToolResult } from "../protocol/serialize";
 import { renderToolInstructions, toNativeTools } from "../protocol/serialize";
 import { executionFingerprint, recoveryDirective, buildVerificationPlan, isFreshInfoRequest, looksLikeNarration, selectToolSpecs, stripFencedCode, suggestFirstTool } from "../intelligence/policy";
+import { classifyRuntimeError, formatNativeToolOutcome, sanitizeToolPairing } from "./errorRecovery";
 import { ToolPipeline } from "../../photon-core/tools/pipeline";
 import type { LLMProvider } from "../llm/types";
 import type { TodoItem } from "../tools/types";
@@ -30,6 +31,9 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
   // to tool selection (guarantees web_search/web_fetch are in the list)
   // and to the system prompt (injects explicit web-search directive).
   const freshInfo = isFreshInfoRequest(lastUserText);
+  if(plan.mode!=="chat"&&(deps.workspaceMap||deps.retrieveContext)){
+    emitter.onPhase("thinking","Retrieving project context");
+  }
   const workspaceMap=plan.mode!=="chat"&&deps.workspaceMap?await deps.workspaceMap().catch(()=>undefined):undefined;
   const retrieved=plan.mode!=="chat"&&deps.retrieveContext?await deps.retrieveContext(lastUserText,signal).catch(()=>undefined):undefined;
   const verificationPlan:VerificationPlan=plan.verification??buildVerificationPlan(task);
@@ -101,6 +105,8 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
   // the turn used to die silently. We now retry a bounded number of times.
   let truncationRetries = 0;
   const MAX_TRUNCATION_RETRIES = 2;
+  let streamRetries = 0;
+  const MAX_STREAM_RETRIES = 1;
   // Turn-scoped output tally: raw is declared per step, but the closing stats
   // are emitted after the loop — sum here so the average is per turn, not per step.
   let generatedChars = 0;
@@ -182,7 +188,7 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
         executedTools.push({ name: queued.name, args: queued.args, ok: qResult.ok });
         emitter.onToolUpdate(qId,{...queued,status:qResult.ok?"done":"error",statusDetail:undefined,result:qResult.ok?qResult.output:undefined,error:qResult.ok?undefined:qResult.output});
         if(plan.toolProtocol==="native"){
-          session.messages.push({id:randomUUID(),role:"tool",content:qResult.output,toolCallId:queued.id,name:queued.name,createdAt:Date.now(),hidden:true} as ChatMessage);
+          session.messages.push({id:randomUUID(),role:"tool",content:formatNativeToolOutcome(queued.name,qResult.output,qResult.ok),toolCallId:queued.id,name:queued.name,createdAt:Date.now(),hidden:true} as ChatMessage);
         }else{
           session.messages.push({id:randomUUID(),role:"user",content:renderToolResult(queued.name,qResult.output,qResult.ok),createdAt:Date.now(),hidden:true});
         }
@@ -288,7 +294,25 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
           ],
         });
       }
-    }catch(e){stopSlowTimer();if(thinkingStep)emitter.onThinkingEnd?.(id,Date.now()-thinkingStart);if(signal.aborted){emitter.onDone(id,raw.trim()?"Stopped.":"Stopped before the model replied.");return;}emitter.onAssistantCancel(id);emitter.onError(`Model error: ${(e as Error).message}`);return;}
+    }catch(e){
+      stopSlowTimer();
+      if(thinkingStep)emitter.onThinkingEnd?.(id,Date.now()-thinkingStart);
+      const classified=classifyRuntimeError(e,signal);
+      if(classified.category==="cancelled"||signal.aborted){
+        emitter.onDone(id,raw.trim()?"Stopped.":"Stopped before the model replied.");
+        return;
+      }
+      if(classified.retryable&&streamRetries<MAX_STREAM_RETRIES&&!raw.trim()&&nativeCalls.length===0){
+        streamRetries++;
+        sharedLog(`[engine] transient ${classified.category} error (${classified.rawMessage}) — retrying step (${streamRetries}/${MAX_STREAM_RETRIES}).`);
+        emitter.onAssistantCancel(id);
+        step--;
+        continue;
+      }
+      emitter.onAssistantCancel(id);
+      emitter.onError(classified.userMessage);
+      return;
+    }
     if(thinkingStep)emitter.onThinkingEnd?.(id,Date.now()-thinkingStart);
     generatedChars+=raw.length;
 
@@ -367,22 +391,25 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
       // without this the turn ends on an invisible bubble and looks stalled.
       if(!visible.trim()){
         if(toolsRunThisTurn > 0){
+          const prevToolOk = lastToolSucceeded(session.messages);
           if(finalAnswerNudges < MAX_FINAL_ANSWER_NUDGES){
             finalAnswerNudges++;
             session.messages.push({
               id:randomUUID(),
               role:"user",
-              content:"The tool completed successfully. Now give the user a concise final answer based on the tool result. Do not call another tool unless it is necessary. Reply in plain text.",
+              content: prevToolOk
+                ? "The tool completed successfully. Now give the user a concise final answer based on the tool result. Do not call another tool unless it is necessary. Reply in plain text."
+                : "The previous tool call failed and the action was NOT completed. Explain the failure clearly or call a corrective tool to resolve the issue. Do NOT claim the action succeeded.",
               createdAt:Date.now(),
               hidden:true,
             });
             continue;
           }
           // Do not leave the user with a silent completed turn if a weak model
-          // keeps returning empty/markup-only completions after the tool worked.
-          const fallback = lastToolSucceeded(session.messages)
+          // keeps returning empty/markup-only completions after the tool step.
+          const fallback = prevToolOk
             ? "Done. The requested operation completed successfully."
-            : "The tool step finished, but the model did not provide a final explanation.";
+            : "The tool step failed, and the model did not provide a follow-up explanation.";
           emitter.onContent(id,fallback);
           emitter.onDone(id);
           return;
@@ -538,7 +565,8 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
     const toolCtx=toolCtxFor(call.id);
     // FIX: emit "running" before execution so the UI shows progress instead of
     // staying stuck on "queued" for the entire duration of long-running tools.
-    emitter.onPhase("working",call.name);
+    const isVerification = call.name === "get_diagnostics" || (call.name === "run_command" && mutationEpoch > 0);
+    emitter.onPhase("working", isVerification ? `Verifying changes (${call.name})` : call.name);
     emitter.onToolCall(id,call);
     emitter.onToolUpdate(id,{...call,status:"running"});
     const results=await pipeline.executeMany([call],toolCtx,1);
@@ -565,7 +593,7 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
     // Spec §3.1: result envelope <tool_result tool="..." status="ok|error">
     const resultText=renderToolResult(call.name, result.output, result.ok);
     if(plan.toolProtocol==="native"){
-      session.messages.push({id:randomUUID(),role:"tool",content:result.output,toolCallId:call.id,name:call.name,createdAt:Date.now(),hidden:true} as ChatMessage);
+      session.messages.push({id:randomUUID(),role:"tool",content:formatNativeToolOutcome(call.name,result.output,result.ok),toolCallId:call.id,name:call.name,createdAt:Date.now(),hidden:true} as ChatMessage);
     }else{
       session.messages.push({id:randomUUID(),role:"user",content:resultText,createdAt:Date.now(),hidden:true});
     }
@@ -686,12 +714,15 @@ function resolveCalls(raw:string,native:{id?:string;name:string;args:Record<stri
   const calls:ToolCall[]=parsed.calls.map(p=>({id:randomUUID(),name:p.name,args:p.args,status:(p.errors.length?"error":"proposed") as ToolCall["status"],error:p.errors.join(" "),sideEffecting:specs.find(s=>s.name===p.name)?.sideEffecting}));
   return{calls,cleanedText:parsed.cleanedText};
 }
-function historyToLLM(messages:ChatMessage[],plan:AdaptivePlan):LLMMessage[]{const out:LLMMessage[]=[];for(const m of messages){if(m.role==="user")out.push({role:"user",content:m.content,images:m.attachments?.filter(a=>a.kind==="image"&&a.dataBase64).map(a=>a.dataBase64 as string)});else if(m.role==="assistant"){const calls=(m.toolCalls??[]).filter(c=>c.status!=="error");if(m.content.trim()||calls.length)out.push({role:"assistant",content:m.content,tool_calls:plan.toolProtocol==="native"&&calls.length?calls.map(c=>({id:c.id,function:{name:c.name,arguments:c.args},thoughtSignature:c.thoughtSignature})):undefined});}else if(m.role==="tool")out.push({role:"tool",content:m.content,tool_call_id:m.toolCallId,name:(m as any).name});}return out;}
+function historyToLLM(messages:ChatMessage[],plan:AdaptivePlan):LLMMessage[]{const out:LLMMessage[]=[];for(const m of messages){if(m.role==="user")out.push({role:"user",content:m.content,images:m.attachments?.filter(a=>a.kind==="image"&&a.dataBase64).map(a=>a.dataBase64 as string)});else if(m.role==="assistant"){const calls=m.toolCalls??[];if(m.content.trim()||calls.length)out.push({role:"assistant",content:m.content,tool_calls:plan.toolProtocol==="native"&&calls.length?calls.map(c=>({id:c.id,function:{name:c.name,arguments:c.args},thoughtSignature:c.thoughtSignature})):undefined});}else if(m.role==="tool")out.push({role:"tool",content:m.content,tool_call_id:m.toolCallId,name:(m as any).name});}return sanitizeToolPairing(out);}
 function lastUser(messages:ChatMessage[]):string|undefined{for(let i=messages.length-1;i>=0;i--)if(messages[i].role==="user")return messages[i].content;return undefined;}
 function lastToolSucceeded(messages:ChatMessage[]):boolean{
   for(let i=messages.length-1;i>=0;i--){
     const message=messages[i];
-    if(message.role==="tool")return !/^error:/i.test(message.content.trim());
+    if(message.role==="tool"){
+      const trimmed=message.content.trim();
+      return !/^error:/i.test(trimmed)&&!trimmed.startsWith("[TOOL_ERROR");
+    }
     if(message.role!=="user"||!message.hidden||!message.content.includes("<tool_result"))continue;
     return /<tool_result\b[^>]*status="ok"/i.test(message.content);
   }

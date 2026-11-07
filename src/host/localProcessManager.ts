@@ -106,6 +106,28 @@ export function buildLaunchPlans(
     plans.push(serve(bin ?? "ollama"));
     return plans;
   }
+  if (platform === "win32") {
+    const plans: LaunchPlan[] = [];
+    const cliBin = bin && !bin.toLowerCase().endsWith("ollama app.exe") ? bin : "ollama.exe";
+    plans.push(serve(cliBin));
+
+    // Also look for ollama app.exe (the native Windows desktop app)
+    const candidates = [
+      bin ? bin.replace(/ollama\.exe$/i, "ollama app.exe") : "",
+      process.env.LOCALAPPDATA ? `${process.env.LOCALAPPDATA}\\Programs\\Ollama\\ollama app.exe` : "",
+    ].filter(Boolean);
+    for (const appPath of candidates) {
+      plans.push({
+        kind: "spawn",
+        command: appPath,
+        args: [],
+        env,
+        description: "ollama app.exe",
+      });
+      break;
+    }
+    return plans;
+  }
   return [serve(bin ?? "ollama.exe")];
 }
 
@@ -342,12 +364,20 @@ export class LocalProcessManager {
         this.pushLog(id, String(d));
       });
 
+      let resolved = false;
+      const doResolve = (res: { ok: true } | { ok: false; error: string }) => {
+        if (!resolved) {
+          resolved = true;
+          resolve(res);
+        }
+      };
+
       if (plan.kind === "exec") {
         child.once("error", (err) =>
-          resolve({ ok: false, error: explainLaunchFailure(this.deps.platform, err as NodeJS.ErrnoException, stderr, null) })
+          doResolve({ ok: false, error: explainLaunchFailure(this.deps.platform, err as NodeJS.ErrnoException, stderr, null) })
         );
         child.once("exit", (code) =>
-          resolve(code === 0 ? { ok: true } : { ok: false, error: explainLaunchFailure(this.deps.platform, undefined, stderr, code) })
+          doResolve(code === 0 ? { ok: true } : { ok: false, error: explainLaunchFailure(this.deps.platform, undefined, stderr, code) })
         );
         return;
       }
@@ -357,7 +387,7 @@ export class LocalProcessManager {
       child.once("error", (err) => {
         entry.exited = true;
         this.managed.delete(id);
-        resolve({ ok: false, error: explainLaunchFailure(this.deps.platform, err as NodeJS.ErrnoException, stderr, null) });
+        doResolve({ ok: false, error: explainLaunchFailure(this.deps.platform, err as NodeJS.ErrnoException, stderr, null) });
       });
       child.once("exit", (code) => {
         entry.exitCode = code;
@@ -372,9 +402,13 @@ export class LocalProcessManager {
       });
       if (this.deps.platform !== "win32") child.unref?.();
       // Spawned: readiness watchdog decides success.
-      child.once("spawn", () => resolve({ ok: true }));
-      // Some stubs/old runtimes never emit "spawn"; fall back to pid presence.
-      if (child.pid) resolve({ ok: true });
+      child.once("spawn", () => doResolve({ ok: true }));
+      // Defer fallback check to allow immediate spawn error events (e.g. ENOENT) to fire first.
+      setImmediate(() => {
+        if (!entry.exited && child.pid) {
+          doResolve({ ok: true });
+        }
+      });
     });
   }
 
@@ -391,6 +425,10 @@ export class LocalProcessManager {
       if (probe.kind === "match") return { ok: true };
       const m = this.managed.get(id);
       if (m?.exited) {
+        // Quick grace check in case a launcher helper (e.g. ollama app.exe) exited while the daemon is binding
+        await this.deps.sleep(400);
+        const secondProbe = await probeRuntime(spec, dd);
+        if (secondProbe.kind === "match") return { ok: true };
         return { ok: false, error: explainLaunchFailure(this.deps.platform, undefined, (this.logs.get(id) ?? []).join("\n"), m.exitCode) };
       }
       if (waited >= timeoutMs) {

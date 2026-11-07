@@ -305,7 +305,7 @@
     "watch": "node esbuild.mjs --watch",
     "watch:webview": "vite build --watch",
     "dev": "concurrently -k -n ext,web \"npm:watch\" \"npm:watch:webview\"",
-    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p webview-ui/tsconfig.json",
+    "typecheck": "node --max-old-space-size=4096 ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node --max-old-space-size=4096 ./node_modules/typescript/bin/tsc --noEmit -p webview-ui/tsconfig.json",
     "package": "npm run build && vsce package --no-dependencies"
   },
   "devDependencies": {

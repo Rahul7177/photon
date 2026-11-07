@@ -1,10 +1,14 @@
-import type {
-  FitAssessment,
-  HardwareSummary,
-  MachineProfile,
-  ModelCapability,
-  ModelRecommendation,
-  RecommendationSet,
+import {
+  isLocalModel,
+  matchInstalledModelName,
+  type FitAssessment,
+  type HardwareSummary,
+  type InstalledModelEvaluation,
+  type MachineProfile,
+  type ModelCapability,
+  type ModelInfo,
+  type ModelRecommendation,
+  type RecommendationSet,
 } from "../../shared/types";
 
 /** Fraction of total RAM kept free for the OS / editor. */
@@ -202,6 +206,146 @@ export interface RecommendOptions {
   goal?: ModelCapability;
   /** Names already installed locally, flagged in the result. */
   installed?: string[];
+  /** Full ModelInfo list for installed models to evaluate arbitrary local models. */
+  installedModels?: ModelInfo[];
+}
+
+function inferModelMetadata(m: ModelInfo): {
+  label: string;
+  sizeGb: number;
+  kvGbPer1k: number;
+  capabilities: ModelCapability[];
+  rank: Record<ModelCapability, number>;
+} {
+  const catalogMatch = MODEL_CATALOG.find((c) => matchInstalledModelName(c.name, [m.name]) !== undefined);
+  const actualSizeGb =
+    m.sizeBytes && m.sizeBytes > 0
+      ? round1(m.sizeBytes / GB)
+      : undefined;
+
+  if (catalogMatch) {
+    const sizeGb = actualSizeGb ?? catalogMatch.sizeGb;
+    return {
+      label: catalogMatch.label,
+      sizeGb,
+      kvGbPer1k: catalogMatch.kvGbPer1k,
+      capabilities: catalogMatch.capabilities,
+      rank: {
+        coding: catalogMatch.rank.coding ?? 50,
+        reasoning: catalogMatch.rank.reasoning ?? 45,
+        multimodal: catalogMatch.rank.multimodal ?? 30,
+        autocomplete: catalogMatch.rank.autocomplete ?? 40,
+      },
+    };
+  }
+
+  const lower = m.name.toLowerCase();
+  const paramMatch = lower.match(/[:\-_]([a-z]?\d+(?:\.\d+)?)b\b/i) ?? lower.match(/(\d+(?:\.\d+)?)b/i);
+  const paramB = paramMatch ? parseFloat(paramMatch[1].replace(/^[a-z]/i, "")) : 7;
+  const sizeGb = actualSizeGb ?? round1(Math.max(0.8, paramB * 0.65));
+  const kvGbPer1k = round1(Math.max(0.03, sizeGb * 0.013));
+
+  const isCoder = /coder|codellama|starcoder|codestral|devstral|qwen2\.5-coder/i.test(lower);
+  const isReasoning = /deepseek-r1|qwq|reason|think|o1|r1/i.test(lower);
+  const isVision = Boolean(m.vision) || /vl|vision|llava|moondream|minicpm-v|gemma3|gemma4|pixtral/i.test(lower);
+  const isSmallFast = paramB <= 3.5;
+
+  const capabilities: ModelCapability[] = ["coding"];
+  if (isReasoning || !isCoder) capabilities.push("reasoning");
+  if (isVision) capabilities.push("multimodal");
+  if (isCoder || isSmallFast) capabilities.push("autocomplete");
+
+  const baseQuality = Math.min(92, Math.round(35 + Math.log2(Math.max(1, paramB)) * 14));
+  const rank: Record<ModelCapability, number> = {
+    coding: isCoder ? Math.min(95, baseQuality + 12) : baseQuality,
+    reasoning: isReasoning ? Math.min(95, baseQuality + 15) : baseQuality - 4,
+    multimodal: isVision ? Math.min(90, baseQuality + 10) : 10,
+    autocomplete: isSmallFast ? 82 : isCoder ? 65 : 45,
+  };
+
+  return {
+    label: m.name.replace(/^(ollama|llamacpp):/i, ""),
+    sizeGb,
+    kvGbPer1k,
+    capabilities,
+    rank,
+  };
+}
+
+/**
+ * Evaluate all currently installed local models on the machine (whether in MODEL_CATALOG or not)
+ * and identify the best suitable installed model for the user's hardware and target capability.
+ */
+export function evaluateInstalledLocalModels(
+  models: ModelInfo[],
+  machine: MachineProfile | null | undefined,
+  goal: ModelCapability = "coding",
+  ctxTokens = DEFAULT_CONTEXT_TOKENS
+): InstalledModelEvaluation[] {
+  const hw = hardwareFromProfile(machine);
+  const localModels = models.filter((m) => isLocalModel(m));
+  if (localModels.length === 0) return [];
+
+  const evals: InstalledModelEvaluation[] = localModels.map((m) => {
+    const meta = inferModelMetadata(m);
+    const fit = assessFit({ sizeGb: meta.sizeGb, kvGbPer1k: meta.kvGbPer1k }, hw, ctxTokens);
+    const quality = meta.rank[goal] ?? 50;
+    return {
+      name: m.name,
+      label: meta.label,
+      sizeGb: meta.sizeGb,
+      capabilities: meta.capabilities,
+      fit,
+      recommended: false,
+      quality,
+      reason: fit.label,
+    };
+  });
+
+  const headroomOk = (r: InstalledModelEvaluation) =>
+    r.fit.mode !== "gpu" || hw.vramGb - VRAM_RESERVE_GB - r.fit.memRequiredGb >= 0.2;
+
+  let pick: InstalledModelEvaluation | undefined;
+  for (const mode of ["gpu", "hybrid", "cpu"] as const) {
+    const pool = evals
+      .filter((r) => r.fit.mode === mode && headroomOk(r))
+      .filter((r) => mode === "gpu" || (r.fit.tokPerSec ?? 0) >= 5)
+      .sort(
+        (a, b) =>
+          Number(b.capabilities.includes(goal)) - Number(a.capabilities.includes(goal)) ||
+          b.quality - a.quality
+      );
+    if (pool.length) {
+      pick = pool[0];
+      break;
+    }
+  }
+  if (!pick && evals.length > 0) {
+    pick = [...evals].sort((a, b) => MODE_SCORE[b.fit.mode] - MODE_SCORE[a.fit.mode] || b.quality - a.quality)[0];
+  }
+
+  if (pick) {
+    pick.recommended = true;
+    const capLabel =
+      goal === "coding"
+        ? "coding & tool use"
+        : goal === "reasoning"
+          ? "deep reasoning"
+          : goal === "multimodal"
+            ? "vision & multimodal"
+            : "fast autocomplete";
+    pick.reason = `Best installed model for ${capLabel} on your hardware (${pick.fit.label})`;
+  }
+
+  evals.sort(
+    (a, b) =>
+      Number(b.recommended) - Number(a.recommended) ||
+      Number(b.capabilities.includes(goal)) - Number(a.capabilities.includes(goal)) ||
+      MODE_SCORE[b.fit.mode] - MODE_SCORE[a.fit.mode] ||
+      b.quality - a.quality
+  );
+
+  return evals;
 }
 
 /**
@@ -216,10 +360,11 @@ export function recommendModels(
   const hw = hardwareFromProfile(machine);
   const ctx = opts.ctxTokens ?? DEFAULT_CONTEXT_TOKENS;
   const goal = opts.goal ?? "coding";
-  const installed = new Set((opts.installed ?? []).map((n) => n.toLowerCase()));
+  const installedList = opts.installed ?? (opts.installedModels ? opts.installedModels.map((m) => m.name) : []);
 
   const rows: ModelRecommendation[] = MODEL_CATALOG.map((m) => {
     const fit = assessFit(m, hw, ctx);
+    const matchedName = matchInstalledModelName(m.name, installedList);
     return {
       name: m.name,
       label: m.label,
@@ -228,7 +373,8 @@ export function recommendModels(
       capabilities: m.capabilities,
       tier: m.tier,
       fit,
-      installed: installed.has(m.name.toLowerCase()),
+      installed: matchedName !== undefined,
+      installedName: matchedName,
       recommended: false,
       quality: m.rank[goal] ?? 0,
     };
@@ -259,6 +405,11 @@ export function recommendModels(
       b.quality - a.quality
   );
 
+  const syntheticModels: ModelInfo[] =
+    opts.installedModels ?? installedList.map((name) => ({ name, provider: "ollama" }));
+  const evaluatedInstalled = evaluateInstalledLocalModels(syntheticModels, machine, goal, ctx);
+  const bestInstalled = evaluatedInstalled.find((e) => e.recommended);
+
   const best = pick;
   return {
     hardware: summarizeHardware(hw),
@@ -269,5 +420,7 @@ export function recommendModels(
     headline: best
       ? `${best.name} — Recommended for your ${summarizeHardware(hw).label}`
       : "No catalog model fits safely; try a smaller model or free up memory.",
+    evaluatedInstalled,
+    bestInstalledName: bestInstalled?.name,
   };
 }
