@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { ToolCall } from "../../../shared/types";
 import { clampLines, clampToolResult, ok, toolError, type Tool } from "../types";
 import { analyzeCommandSecurity, isUnattendedCommandAllowed } from "../security";
+import { resolveInWorkspace } from "../paths";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_TIMEOUT_MS = 300_000;
@@ -90,7 +91,6 @@ export const runCommandTool: Tool = {
     const cwdRel = (args.cwd as string)?.trim();
     let cwd = ctx.workspaceRoot;
     if (cwdRel) {
-      const { resolveInWorkspace } = await import("../paths.js");
       const r = resolveInWorkspace(ctx.workspaceRoot, cwdRel);
       if ("error" in r) return toolError("not_found", r.error);
       cwd = r.abs;
