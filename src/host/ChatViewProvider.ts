@@ -31,8 +31,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // Drop the previous binding so listeners never stack across re-resolves.
     // Ensure any previous listener is cleaned up before attaching a new one.
     this.messageSub?.dispose();
-    this.messageSub = view.webview.onDidReceiveMessage((msg: ViewMessage) => {
-      void this.controller.handleMessage(msg);
+    this.messageSub = view.webview.onDidReceiveMessage((msg: unknown) => {
+      if (msg && typeof msg === "object" && typeof (msg as Record<string, unknown>).type === "string") {
+        void this.controller.handleMessage(msg as ViewMessage);
+      }
     });
     view.onDidDispose(() => {
       this.messageSub?.dispose();

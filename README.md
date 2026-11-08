@@ -1,11 +1,11 @@
 # 🚀 Photon
 
-**Agentic coding with small local LLMs — tuned so low-end models actually cope, with frontier cloud models as seamless overflow.**
+**Agentic coding with small local LLMs — tuned so low-end models actually cope, with frontier cloud models available as user-selected BYOK.**
 
 [![Version](https://img.shields.io/badge/version-0.1.0-orange.svg)](https://github.com/Rahul7177/photon)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![VS Code](https://img.shields.io/badge/VS%20Code-^1.90.0-blue.svg)](https://code.visualstudio.com/)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)](https://github.com/Rahul7177/photon/actions)
+[![Build Status](https://github.com/Rahul7177/photon/actions/workflows/ci.yml/badge.svg)](https://github.com/Rahul7177/photon/actions/workflows/ci.yml)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Rahul7177/photon/pulls)
 
 ---
@@ -209,14 +209,38 @@ Access settings in VS Code (`Ctrl+,` / `Cmd+,` → search **Photon**):
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `photon.ollama.baseUrl` | `http://localhost:11434` | Ollama server URL |
-| `photon.ollama.keepAlive` | `"30m"` | Model residency duration in VRAM after completion |
+| `photon.ollama.keepAlive` | `"-1"` | Model residency in VRAM (-1 = keep resident indefinitely; "30m", "2h", or "" for server 5m default) |
 | `photon.llamacpp.baseUrl` | `http://localhost:8080` | llama.cpp server URL |
 | `photon.defaultMode` | `"chat"` | Default active mode (`chat`, `plan`, `agent`) |
+| `photon.interfaceMode` | `"local"` | Engine stack: `local` (Ollama/llama.cpp) or `cloud` (direct provider APIs) |
 | `photon.intelligence.level` | `"auto"` | Intelligence preset (`auto`, `low`, `medium`, `high`, `max`) |
 | `photon.adaptive.enabled` | `true` | Enable hardware-aware dynamic context and parameter tuning |
 | `photon.tools.autoApprove` | `false` | Bypass confirmation prompts for file edits and terminal commands |
 | `photon.webSearch.provider` | `"duckduckgo"` | Web search provider (`duckduckgo`, `google`, `none`) |
 | `photon.index.enabled` | `false` | Enable local vector embedding and offline codebase RAG |
+| `photon.index.embeddingModel`| `"nomic-embed-text"` | Ollama embedding model for offline codebase indexing |
+
+---
+
+## 🔒 Privacy, Security & Data Isolation
+
+Photon adheres to strict data boundary invariants:
+
+* **Local Mode (Default):**
+  * When using Ollama or llama.cpp, 100% of reasoning, prompts, workspace inspection, and code edits execute on your machine.
+  * Vector embeddings for local RAG are computed entirely offline via local embedding models (e.g. `nomic-embed-text`).
+  * Zero code or prompts leave your machine.
+* **Cloud Mode (BYOK):**
+  * Local and Cloud runtimes are independent operational stacks. There is **no silent background overflow** or fallback across stacks.
+  * When Cloud Mode is selected, prompts and necessary file snippets are transmitted exclusively to your configured provider endpoint (Gemini, Claude, OpenAI, NVIDIA NIM, OpenRouter, OpenCode Zen, or custom endpoints).
+  * API keys are stored exclusively in VS Code `SecretStorage` and are never written to `settings.json`, workspace files, or logs.
+* **External Tools:**
+  * `web_search`: Queries public search engines (DuckDuckGo or Google).
+  * `web_fetch`: Retrieves public web documents. SSRF protection validates DNS resolution and blocks loopback, private, and internal networks.
+  * **Model Context Protocol (MCP):** Connects external tools configured in `.vscode/mcp.json`. Stdio processes run in sanitized environments using an environment variable allowlist; SSE/HTTP transports pin connections to pre-validated IP destinations.
+* **Telemetry & Diagnostics:**
+  * All performance metrics, hardware profiling, and cost tracking are computed locally and rendered in real-time in the user-visible UI.
+  * Diagnostics redaction sanitizes API keys, auth headers, tokens, and home directory prefixes before any diagnostic summary can be viewed or exported.
 
 ---
 
@@ -229,11 +253,14 @@ npm install
 # Typecheck root and webview
 npm run typecheck
 
-# Run unit tests (244 tests passing)
+# Run unit tests (502 tests passing across 161 test suites)
 npm test
 
 # Build production bundles
 npm run build
+
+# Package production VSIX
+npm run package
 
 # Start live dev watchers
 npm run dev

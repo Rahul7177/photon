@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as vscode from "vscode";
 import type { IntelligenceSetting, PerModelConfig } from "../shared/types";
 
@@ -45,7 +46,6 @@ export interface LoadResult {
 export function loadProjectConfig(): LoadResult {
   const root = vscode.workspace.workspaceFolders?.[0]?.uri;
   if (!root) return { config: null };
-  const fs = require("node:fs") as typeof import("node:fs");
 
   for (const file of ["config.json", "config.yaml", "config.yml"]) {
     const path = vscode.Uri.joinPath(root, ".photon", file).fsPath;

@@ -1,6 +1,14 @@
 // Typed message protocol between the extension host and the webview.
 // `Host*` messages flow host -> webview; `View*` messages flow webview -> host.
 
+export const PROTOCOL_VERSION = "1.0.0";
+
+export interface ProtocolMetadata {
+  version?: string;
+  requestId?: string;
+  timestamp?: number;
+}
+
 import type {
   AdaptivePlan,
   Attachment,
@@ -182,7 +190,14 @@ export type ViewMessage =
   | { type: "runBench"; payload: { model?: string } }
   | { type: "setIndexingEnabled"; payload: { enabled: boolean } }
   | { type: "reindex" }
-  | { type: "approveMcpServer"; payload: { id: string } }
+  | {
+      type: "approveMcpServer";
+      payload: {
+        id: string;
+        expectedFingerprint?: string;
+        scope?: "persistent" | "session" | "one_time";
+      };
+    }
   | { type: "revokeMcpServer"; payload: { id: string } }
   | { type: "fetchProviderModels"; payload: { id: string } }
   | { type: "testModel"; payload: { providerId: string; model: ModelInfo } }

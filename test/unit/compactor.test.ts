@@ -532,4 +532,143 @@ describe("Context Compaction Engine (P1 Item 4)", () => {
       assert.ok(summaryMsg.notice?.includes("Retained task"));
     });
   });
+
+  describe("Phase 4.1: Compactor Fidelity, Fact Separation & Boundary Invariants", () => {
+    it("accurately records source and destination for moves and prefers result metadata over model args", () => {
+      const msgs: ChatMessage[] = [
+        makeUserMsg("u1", "Reorganize the file tree"),
+        makeAssistantMsg("a1", "Moving components and editing with metadata", [
+          {
+            id: "tc-move",
+            name: "move_path",
+            args: { from: "src/components/OldButton.tsx", to: "src/ui/Button.tsx" },
+            status: "done",
+            result: "Moved successfully",
+          },
+          {
+            id: "tc-meta",
+            name: "edit_file",
+            args: { path: "typo_in_model_args.ts" },
+            status: "done",
+            result: "Replaced content",
+            metadata: {
+              path: "src/real/ResolvedPath.ts",
+              changedLines: { start: 10, end: 25 },
+            },
+          } as any,
+        ]),
+      ];
+
+      const data = extractStructuredCompactionData(msgs);
+
+      // Verify move source and destination
+      assert.ok(data.filesModified.has("src/components/OldButton.tsx"));
+      assert.ok(data.filesModified.get("src/components/OldButton.tsx")?.some((d) => d.includes("Moved to `src/ui/Button.tsx`")));
+      assert.ok(data.filesModified.has("src/ui/Button.tsx"));
+      assert.ok(data.filesModified.get("src/ui/Button.tsx")?.some((d) => d.includes("Created by moving from `src/components/OldButton.tsx`")));
+
+      // Verify metadata path preference
+      assert.ok(data.filesModified.has("src/real/ResolvedPath.ts"), "Must use metadata path over model args");
+      assert.equal(data.filesModified.has("typo_in_model_args.ts"), false, "Model typo path must not be recorded");
+      assert.ok(data.filesModified.get("src/real/ResolvedPath.ts")?.some((d) => d.includes("lines 10-25")));
+    });
+
+    it("distinguishes inspected, attempted, modified, verified, and negative findings", () => {
+      const msgs: ChatMessage[] = [
+        makeUserMsg("u1", "Do not modify the database schema under any circumstances!"),
+        makeAssistantMsg("a1", "Inspecting and trying operations", [
+          // 1. Inspected file
+          {
+            id: "tc1",
+            name: "read_file",
+            args: { path: "src/config.ts" },
+            status: "done",
+            result: "export const port = 3000;",
+          },
+          // 2. Negative finding: file not found
+          {
+            id: "tc2",
+            name: "read_file",
+            args: { path: "src/legacy_db.ts" },
+            status: "error",
+            error: "ENOENT: no such file or directory",
+          },
+          // 3. Attempted/denied operation
+          {
+            id: "tc3",
+            name: "write_file",
+            args: { path: "prisma/schema.prisma", content: "new table" },
+            status: "denied",
+          },
+          // 4. Proposed/not-executed operation
+          {
+            id: "tc4",
+            name: "append_file",
+            args: { path: "src/audit.log", content: "log entry" },
+            status: "proposed",
+          },
+          // 5. Confirmed modified file
+          {
+            id: "tc5",
+            name: "write_file",
+            args: { path: "src/clean.ts", content: "export const ok = true;" },
+            status: "done",
+            result: "Wrote file",
+          },
+        ]),
+      ];
+
+      const data = extractStructuredCompactionData(msgs);
+
+      // User constraints preserved
+      assert.ok(data.userConstraints.some((c) => c.includes("Do not modify the database schema")));
+
+      // Inspected files
+      assert.ok(data.filesInspected.has("src/config.ts"));
+
+      // Negative findings
+      assert.ok(data.negativeFindings.some((n) => n.includes("legacy_db.ts")));
+
+      // Only clean.ts is in filesModified
+      assert.ok(data.filesModified.has("src/clean.ts"));
+      assert.equal(data.filesModified.has("prisma/schema.prisma"), false, "Denied schema modification must NOT be marked modified");
+      assert.equal(data.filesModified.has("src/audit.log"), false, "Proposed append must NOT be marked modified");
+
+      // Attempted/denied/proposed are in unresolved
+      const unresolved = data.unresolvedItems.join(" ");
+      assert.ok(unresolved.includes("schema.prisma") && unresolved.includes("denied"));
+      assert.ok(unresolved.includes("audit.log") && unresolved.includes("not executed"));
+
+      // Native summary renders dedicated sections
+      const summary = buildNativeCompactionSummary(msgs);
+      assert.ok(summary.includes("### 🚫 Negative & Preservation Constraints"));
+      assert.ok(summary.includes("### ✅ Verified Repository Facts"));
+      assert.ok(summary.includes("### ⚠️ Unresolved Issues & Pending Items"));
+    });
+
+    it("redacts secrets and credentials from user directives and tool findings", () => {
+      const msgs: ChatMessage[] = [
+        makeUserMsg("u1", "Connect with key sk-proj-123456789012345678 and Bearer mySecretToken123456"),
+        makeAssistantMsg("a1", "Connecting...", [
+          {
+            id: "tc1",
+            name: "execute_command",
+            args: { command: "curl -H 'Authorization: Bearer mySecretToken123456' https://api.internal.com" },
+            status: "error",
+            error: "Authentication failed for token: superSecretPass12345",
+          },
+        ]),
+      ];
+
+      const data = extractStructuredCompactionData(msgs);
+      const summary = buildNativeCompactionSummary(msgs);
+
+      // Verify no raw keys leaked in directives or commands
+      assert.ok(!data.userDirectives.join(" ").includes("sk-proj-123456789012345678"));
+      assert.ok(!data.commandsRun[0].command.includes("mySecretToken123456"));
+      assert.ok(!summary.includes("sk-proj-123456789012345678"));
+      assert.ok(!summary.includes("superSecretPass12345"));
+      assert.ok(summary.includes("[REDACTED_KEY]") || summary.includes("[REDACTED]"));
+    });
+  });
 });

@@ -313,7 +313,7 @@ Photon/
   - Slash command autocomplete menu (`/revert`, `/rewind`, `/compact`, `/clear`).
   - Pure SVG icon set replacing all emojis.
 - **Context Compaction Engine:**
-  - Automated threshold compaction triggering at 85% context window capacity.
+  - Automated threshold compaction triggering at 75% context window capacity (`DEFAULT_AUTO_COMPACT_THRESHOLD`).
   - Preserves goals, active files, pending todos, key decisions, and latest turns while condensing older turns.
   - Interactive visual status pill in chat displaying tokens saved and compaction metrics.
   - Dedicated `/compact [focus]` command.

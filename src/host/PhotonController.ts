@@ -1,4 +1,5 @@
 import * as os from "node:os";
+import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import {
@@ -8,6 +9,7 @@ import {
   type AutoDecision,
   type ChatMessage,
   type CloudUsageSummary,
+  type ExecutionPolicy,
   type HardwareMetrics,
   type IndexStatus,
   type IntelligenceSetting,
@@ -18,6 +20,7 @@ import {
   type OllamaRuntimeModel,
   type SessionState,
   type ThinkingLevel,
+  type ThinkingSetting,
   type ToolCall,
 } from "../shared/types";
 import type { HostMessage, PhotonConfig, ToolSummary, ViewMessage } from "../shared/protocol";
@@ -26,6 +29,7 @@ import { profileMachine, sampleHardwareMetrics } from "../core/adaptive/machineP
 import { CloudUsageTracker } from "../core/telemetry/cloudUsage";
 import { buildPlan } from "../core/adaptive/orchestrator";
 import { planRequest } from "../core/adaptive/autoMode";
+import { analyzeTask, buildExecutionPolicy, capabilityForModel } from "../core/intelligence/policy";
 import { runBench } from "../core/bench/bench";
 import { ToolRegistry } from "../core/tools/registry";
 import { builtinTools } from "../core/tools/builtin";
@@ -42,9 +46,9 @@ import { ProviderManager } from "../core/llm/providerManager";
 import { OllamaProvider } from "../core/llm/providers/ollamaProvider";
 import type { OpenAICompatConfig } from "../core/llm/providers/openaiCompatProvider";
 import type { LLMProvider } from "../core/llm/types";
-import { SessionStore } from "./sessionStore";
+import { SessionStore, redactSecrets } from "./sessionStore";
 import { BenchStore } from "./benchStore";
-import { ProjectStore } from "./projectStore";
+import { ProjectStore, computeMcpConfigFingerprint, type McpTrustScope } from "./projectStore";
 import { IndexService } from "./indexService";
 import { ModelConfigStore } from "./modelConfigStore";
 import { getProjectContextManager, ProjectContextManager } from "../core/context/projectContext";
@@ -65,6 +69,11 @@ import {
   pruneInlineImages,
   rewindMessagesToCheckpoint,
 } from "./sessionCoordinator";
+import { CheckpointCoordinator } from "./checkpointCoordinator";
+import { McpCoordinator } from "./mcpCoordinator";
+import { ProviderService } from "./providerService";
+import { TurnCoordinator } from "./turnCoordinator";
+import { getCloudToolPolicy, setCloudToolPolicy } from "../core/tools/cloud/cloudTools";
 
 const DEFAULT_EMBEDDING_MODEL = "nomic-embed-text";
 
@@ -90,7 +99,6 @@ export class PhotonController {
   private modelConfigs: ModelConfigStore;
 
   private machine: MachineProfile | null = null;
-  private models: ModelInfo[] = [];
   private selectedModel = "";
   /** Auto Mode: when true, Photon picks the model per request (M8). */
   private autoSelect = false;
@@ -102,12 +110,29 @@ export class PhotonController {
    *  (direct provider APIs, native tool calling, no adaptive limits). */
   private interfaceMode: "local" | "cloud" = "local";
   /** Extended thinking level for supported models. */
-  private thinkingLevel: ThinkingLevel = "off";
+  private thinkingLevel: ThinkingSetting = "auto";
+  /** Track deleted sessions so late persistence never recreates them as zombies */
+  private deletedSessionIds = new Set<string>();
   private plan: AdaptivePlan | null = null;
   private userNumCtx: number | undefined;
   private session: SessionState;
 
-  private turnAbort?: AbortController;
+  /** Turn coordinator manages turn abort signals and sequential prompt queueing. */
+  private readonly turnCoord: TurnCoordinator;
+  /** Provider service manages provider lifecycle, live models, and provider statuses. */
+  private readonly providerService: ProviderService;
+  /** Checkpoint coordinator isolates turn-level checkpointing, rollback, and revert modals. */
+  private readonly checkpointCoord: CheckpointCoordinator;
+  /** MCP coordinator manages server discovery, trust fingerprints, and lifecycle. */
+  private readonly mcpCoord: McpCoordinator;
+
+  private get models(): ModelInfo[] {
+    return this.providerService.getModels();
+  }
+  private set models(val: ModelInfo[]) {
+    this.providerService.setModels(val);
+  }
+
   /** Cancels an in-flight benchmark run. */
   private benchAbort?: AbortController;
   private reachable = false;
@@ -196,6 +221,18 @@ export class PhotonController {
       },
     });
     this.sessionStore = new SessionStore(context);
+    this.sessionStore.onDidTrim = (count, titles) => {
+      this.output.appendLine(
+        `[sessionStore] Trimmed ${count} older session(s) from storage: ${titles.join(", ")}`
+      );
+      this.safePost({
+        type: "status",
+        payload: {
+          kind: "idle",
+          detail: `Storage trimmed: ${count} old session(s) removed to stay within size limit.`,
+        },
+      });
+    };
     this.benchStore = new BenchStore(context);
     this.projectStore = new ProjectStore(context);
     this.modelConfigs = new ModelConfigStore(context);
@@ -215,9 +252,43 @@ export class PhotonController {
         buildWorkspaceMap(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath),
       retrieveContext: (query, signal) => this.index.retrieveContext(query, signal),
       reserveOutputTokens: cfg.get<number>("context.reserveOutputTokens", 1024),
-      toolContext: (signal) => this.buildToolContext(signal),
+      toolContext: (signal, turnContext) => this.buildToolContext(signal, turnContext),
     });
     this.session = this.freshSession();
+
+    this.turnCoord = new TurnCoordinator({
+      post: (msg) => this.safePost(msg),
+      output: this.output,
+    });
+    this.providerService = new ProviderService({
+      providers: this.providers,
+      ollamaProvider: this.ollamaProvider,
+      catalog: this.providerCatalog,
+      post: (msg) => this.safePost(msg),
+      output: this.output,
+      onProvidersRebuilt: async () => {
+        await this.rebuildProviders();
+        await this.refresh();
+        this.pushConfig();
+      },
+    });
+    this.checkpointCoord = new CheckpointCoordinator({
+      getCheckpointManager: () => this.checkpointMgr,
+      getContextManager: () => this.ctxMgr,
+      getSession: () => this.session,
+      post: (msg) => this.safePost(msg),
+      persistSession: (s) => this.persistActiveSession(s),
+      output: this.output,
+      showInfo: (msg) => vscode.window.showInformationMessage(msg),
+    });
+    this.mcpCoord = new McpCoordinator({
+      mcpManager: this.mcp,
+      projectStore: this.projectStore,
+      getWorkspaceRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+      post: (msg) => this.safePost(msg),
+      pushTools: () => this.pushTools(),
+      output: this.output,
+    });
 
     // Wire up Project Context Manager: maintains symbol index, smart paths, and cross-model memory
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -258,7 +329,7 @@ export class PhotonController {
     // MCP connection, dispose the index watcher. Prevents process/connection leaks.
     this.context.subscriptions.push({
       dispose: () => {
-        this.turnAbort?.abort();
+        this.turnCoord.abortTurn();
         this.benchAbort?.abort();
         this.index.dispose();
         this.installer.cancel();
@@ -386,6 +457,18 @@ export class PhotonController {
 
     // Restore cached provider models from globalState so they are instantly visible on startup
     this.providerCatalog.restoreLiveModelCache();
+
+    const storedThinking = this.context.globalState.get<ThinkingSetting>("photon.thinkingSetting") ?? "auto";
+    let level: ThinkingSetting = storedThinking;
+    try {
+      if (!this.context.globalState.get("photon.thinkingAutoDefaultV1")) {
+        if (level === "off") level = "auto";
+        await this.context.globalState.update("photon.thinkingSetting", level);
+        await this.context.globalState.update("photon.thinkingAutoDefaultV1", true);
+      }
+    } catch {}
+    this.thinkingLevel = level;
+    this.providers.setThinkingLevel((level ?? "auto") as any);
 
     this.machine = await profileMachine().catch(() => null);
     void this.pushHardwareMetrics();
@@ -543,7 +626,13 @@ export class PhotonController {
     const installed = this.models.map((m) => m.name);
     this.safePost({
       type: "modelRecommendations",
-      payload: recommendModels(this.machine, { goal, ctxTokens, installed, installedModels: this.models }),
+      payload: recommendModels(this.machine, {
+        goal,
+        ctxTokens,
+        installed,
+        installedModels: this.models,
+        benchmarks: this.benchStore.byModel(),
+      }),
     });
   }
 
@@ -683,139 +772,63 @@ export class PhotonController {
   }
 
   async loadModels(): Promise<void> {
-    try {
-      // Cloud providers only report models the user explicitly added after a
-      // successful test; Ollama reports everything installed locally.
-      const all = await this.providers.listModels();
-
-      // Also sense local Ollama models on disk so installed models are visible
-      // even when the Ollama server daemon is stopped or starting up.
-      const diskModels = scanDiskOllamaModels();
-      const existingNames = all.map((m) => m.name);
-      for (const dm of diskModels) {
-        if (!matchInstalledModelName(dm.name, existingNames)) {
-          all.push(dm);
-          existingNames.push(dm.name);
-        }
-      }
-
-      this.models = all;
-      const preferred = vscode.workspace
-        .getConfiguration("photon")
-        .get<string>("defaultModel", "");
-      const stillExists = this.models.some((m) => m.name === this.selectedModel);
-      if (!stillExists) {
-        this.selectedModel =
-          this.models.find((m) => m.name === preferred)?.name ??
-          this.models[0]?.name ??
-          "";
-      }
-      this.output.appendLine(`[models] loaded ${this.models.length} model(s) across ${this.providers.active().length} provider(s).`);
-    } catch (e) {
-      this.models = scanDiskOllamaModels();
-      this.output.appendLine(`[models] ${(e as Error).message}`);
-    }
+    const preferred = vscode.workspace
+      .getConfiguration("photon")
+      .get<string>("defaultModel", "");
+    const res = await this.providerService.loadModels(this.selectedModel, preferred);
+    this.selectedModel = res.selectedModel;
   }
 
   /* --------------------------- cloud providers ---------------------------- */
 
-  /** Fetch the models a provider's API exposes for THIS account's key and push
-   *  them to the webview. A failed fetch (bad key, no quota, network) is
-   *  reported through the providerModels error field so the settings card can
-   *  show exactly why the connection didn't validate. */
   private async pushLiveModels(id: string): Promise<void> {
-    const p = this.providers.all().find((x) => x.id === id);
-    if (!p || !p.fetchLiveModels || !p.isConfigured()) return;
-    try {
-      const { models, autoAddedCount } = await this.providerCatalog.fetchAndCacheLiveModels(p);
-      this.safePost({ type: "providerModels", payload: { id, models } });
-      this.output.appendLine(`[providers] ${id}: ${models.length} model(s) available to this key.`);
-
-      if (autoAddedCount > 0) {
-        await this.rebuildProviders();
-        await this.refresh();
-        this.pushConfig();
-        this.output.appendLine(`[providers] ${id}: Auto-added ${autoAddedCount} top model(s) to picker.`);
-      }
-    } catch (e) {
-      this.safePost({
-        type: "providerModels",
-        payload: { id, models: [], error: (e as Error).message },
-      });
-      this.output.appendLine(`[providers] ${id} live model list failed: ${(e as Error).message}`);
-    }
+    await this.providerService.pushLiveModels(id);
   }
 
   /** Background-refresh models for every configured and enabled cloud provider. */
   private async autoRefreshConfiguredProviders(): Promise<void> {
-    for (const p of this.providers.all()) {
-      if (p.id !== "ollama" && p.isConfigured() && p.fetchLiveModels) {
-        void this.pushLiveModels(p.id);
-      }
-    }
+    await this.providerService.autoRefreshConfiguredProviders();
   }
 
   /** Rebuild the provider set from settings + stored API keys. Keeps the same
    *  ProviderManager instance so the engine's reference stays valid. */
   private async rebuildProviders(): Promise<void> {
-    const cloud = await this.providerCatalog.buildCloudProviders();
-    const llamacpp = await this.providerCatalog.buildLlamaCppProvider();
-    const locals: LLMProvider[] = [this.ollamaProvider];
-    if (llamacpp) locals.push(llamacpp);
-    this.providers.setProviders([...locals, ...cloud]);
-    this.output.appendLine(
-      `[providers] active: ${this.providers.active().map((p) => p.id).join(", ") || "none"}`
-    );
+    await this.providerService.rebuildProviders();
   }
 
   /** Status of every provider for the settings UI. */
   private providerStatuses() {
-    return this.providerCatalog.providerStatuses(this.providers.all(), this.models);
+    return this.providerService.providerStatuses();
   }
 
   /* --------------------------------- MCP (M11) -------------------------------- */
 
   /** Register configured MCP servers, connecting only those matching previously approved trust fingerprints. */
   private async setupMcp(): Promise<void> {
-    const servers = this.readMcpConfig();
-    await this.mcp.setConfigs(servers);
-    for (const s of servers) {
-      if (this.projectStore.isMcpConfigApproved(s)) {
-        await this.mcp.connect(s.id);
-      }
-    }
-    this.pushMcpServers();
-    this.pushTools();
+    await this.mcpCoord.setupMcp();
   }
 
   private pushMcpServers(): void {
-    this.safePost({ type: "mcpServers", payload: this.mcp.list() });
+    this.mcpCoord.pushMcpServers();
   }
 
-  private async approveMcpServer(id: string): Promise<void> {
-    const server = this.readMcpConfig().find((s) => s.id === id);
-    if (server) {
-      await this.projectStore.approveMcpConfig(server);
-    } else {
-      await this.projectStore.approveMcp(id);
-    }
-    await this.mcp.connect(id);
-    this.pushMcpServers();
-    this.pushTools();
+  private async approveMcpServer(
+    id: string,
+    expectedFingerprint?: string,
+    scope: McpTrustScope = "persistent"
+  ): Promise<void> {
+    await this.mcpCoord.approveMcpServer(id, expectedFingerprint, scope);
   }
 
   private async revokeMcpServer(id: string): Promise<void> {
-    await this.projectStore.revokeMcpConfig(id);
-    await this.mcp.disconnect(id);
-    this.pushMcpServers();
-    this.pushTools();
+    await this.mcpCoord.revokeMcpServer(id);
   }
 
   /* --------------------------- Photon Bench (M7) ------------------------------ */
 
   /** True while a chat turn is running — bench must not compete for the model. */
   private turnActive(): boolean {
-    return !!this.turnAbort && !this.turnAbort.signal.aborted;
+    return this.turnCoord.isTurnActive();
   }
 
   /** Benchmark any detected LOCAL model that has no stored result. Background + abortable. */
@@ -944,7 +957,11 @@ export class PhotonController {
         await this.index.reindex();
         return;
       case "approveMcpServer":
-        return this.approveMcpServer(msg.payload.id);
+        return this.approveMcpServer(
+          msg.payload.id,
+          msg.payload.expectedFingerprint,
+          msg.payload.scope
+        );
       case "revokeMcpServer":
         return this.revokeMcpServer(msg.payload.id);
       case "setMode":
@@ -1031,14 +1048,27 @@ export class PhotonController {
       case "setInterfaceMode":
         await this.setInterfaceMode(msg.payload.mode);
         return;
-      case "setThinkingEnabled":
-        this.thinkingLevel = msg.payload.enabled ? "medium" : "off";
+      case "setThinkingSetting":
+      case "setThinkingLevel": {
+        const level = msg.payload.level as ThinkingLevel;
+        this.thinkingLevel = level;
+        await this.context.globalState.update("photon.thinkingSetting", level);
+        this.providers.setThinkingLevel((level ?? "auto") as any);
+        this.recomputePlan();
+        this.pushPlan();
         this.pushConfig();
         return;
-      case "setThinkingLevel":
-        this.thinkingLevel = msg.payload.level;
+      }
+      case "setThinkingEnabled": {
+        const level: ThinkingLevel = msg.payload.enabled ? "medium" : "off";
+        this.thinkingLevel = level;
+        await this.context.globalState.update("photon.thinkingSetting", level);
+        this.providers.setThinkingLevel((level ?? "auto") as any);
+        this.recomputePlan();
+        this.pushPlan();
         this.pushConfig();
         return;
+      }
       case "newSession": {
         // Swap the session SYNCHRONOUSLY, before any await. Message handlers
         // run fire-and-forget and interleave at their await points, so awaiting
@@ -1293,12 +1323,11 @@ export class PhotonController {
     if (!targetPath || !targetPath.trim()) return;
     const rootUri = vscode.workspace.workspaceFolders?.[0]?.uri;
     if (!rootUri) return;
-    const pathMod = require("node:path") as typeof import("node:path");
-    const rootFs = pathMod.resolve(rootUri.fsPath);
+    const rootFs = path.resolve(rootUri.fsPath);
     const cleaned = targetPath.trim().replace(/^[/\\]+/, "");
-    const absPath = pathMod.resolve(rootFs, cleaned);
-    const rel = pathMod.relative(rootFs, absPath);
-    if (rel.startsWith("..") || pathMod.isAbsolute(rel)) {
+    const absPath = path.resolve(rootFs, cleaned);
+    const rel = path.relative(rootFs, absPath);
+    if (rel.startsWith("..") || path.isAbsolute(rel)) {
       this.output.appendLine(`[openFile] Refused path outside workspace: ${targetPath}`);
       return;
     }
@@ -1320,42 +1349,23 @@ export class PhotonController {
 
   /** Abort the in-flight turn and release any awaited approval promises. */
   private cancelActiveTurn(): void {
-    this.turnAbort?.abort();
+    this.turnCoord.abortTurn();
     // Resolve any pending approval prompts as "denied" so the tool call that is
     // awaiting them unwinds instead of hanging forever.
     this.approvals.cancelAllPending();
+    if (this.session) {
+      this.checkpointCoord.cancelTurn(undefined, this.session.id);
+    } else {
+      this.checkpointCoord.cancelTurn();
+    }
   }
 
-  private promptQueue: Array<{ text: string; attachments?: Attachment[] }> = [];
-  private drainingQueue = false;
   private async onPrompt(text: string, attachments?: Attachment[]): Promise<void> {
-    // Inbox-style queue (audit) — instead of erroring, enqueue and drain sequentially.
-    if (this.turnAbort && !this.turnAbort.signal.aborted) {
-      this.promptQueue.push({ text, attachments });
-      this.safePost({ type: "status", payload: { kind: "running", detail: `Queued (${this.promptQueue.length}) — will run after current turn.` } });
-      return;
-    }
-    try {
-      await this.runPrompt(text, attachments);
-    } finally {
-      // Drain queued prompts (preserves order, like harness Inbox.claim)
-      if (this.promptQueue.length && !this.drainingQueue) {
-        this.drainingQueue = true;
-        try {
-          while (this.promptQueue.length) {
-            const next = this.promptQueue.shift()!;
-            try {
-              await this.runPrompt(next.text, next.attachments);
-            } catch (err) {
-              this.output.appendLine(`[queue] Prompt failed: ${(err as Error).message}`);
-            }
-          }
-        } finally {
-          this.drainingQueue = false;
-        }
-      }
-    }
+    await this.turnCoord.enqueueOrRun({ text, attachments }, async (t, a) => {
+      await this.runPrompt(t, a);
+    });
   }
+
   private async runPrompt(text: string, attachments?: Attachment[]): Promise<void> {
     const trimmed = text.trim();
     if (trimmed === "/compact" || trimmed.startsWith("/compact ")) {
@@ -1368,8 +1378,7 @@ export class PhotonController {
       return;
     }
     if (trimmed === "/revert") {
-      const summaries = this.checkpointMgr?.getSessionCheckpointSummaries(this.session.id) ?? [];
-      this.safePost({ type: "openRevertModal", payload: { checkpoints: summaries } });
+      this.checkpointCoord.openRevertModal(this.session.id);
       return;
     }
     if (trimmed.startsWith("/revert ")) {
@@ -1377,8 +1386,7 @@ export class PhotonController {
       if (arg) {
         await this.handleRevertToNumber(arg);
       } else {
-        const summaries = this.checkpointMgr?.getSessionCheckpointSummaries(this.session.id) ?? [];
-        this.safePost({ type: "openRevertModal", payload: { checkpoints: summaries } });
+        this.checkpointCoord.openRevertModal(this.session.id);
       }
       return;
     }
@@ -1457,7 +1465,7 @@ export class PhotonController {
       const targetModelName = plan.model;
       const m = this.models.find((x) => x.name === targetModelName) ?? this.modelsForUi()[0];
       if (m) {
-        const cPlan = this.cloudPlan(m, this.mode);
+        const cPlan = this.cloudPlan(m, this.mode, text);
         const pCtx = this.modelConfigs.get(m.name)?.numCtx ?? this.modelConfigs.get(m.name)?.llamacpp?.ctx;
         if (pCtx && pCtx > 0) { cPlan.numCtx = pCtx; cPlan.contextWindow = pCtx; }
         plan = cPlan;
@@ -1498,24 +1506,22 @@ export class PhotonController {
       session.title = text.slice(0, 40);
     }
     await this.persistActiveSession(session);
-    this.checkpointMgr?.beginTurn(session.id, userMsg.id, text);
+    this.checkpointCoord.beginTurn(session.id, userMsg.id, text);
+    this.providers.setThinkingLevel((this.thinkingLevel ?? "auto") as any);
 
-    const abort = new AbortController();
-    this.turnAbort = abort;
+    const signal = this.turnCoord.createTurnSignal();
     this.safePost({ type: "status", payload: { kind: "thinking" } });
 
     const emitter = this.makeEmitter(session);
     try {
       if (this.interfaceMode === "cloud") {
-        await this.runCloudTurn(session, plan, emitter, abort.signal);
+        await this.runCloudTurn(session, plan, emitter, signal);
       } else {
-        await this.engine.runTurn(session, plan, emitter, abort.signal);
+        await this.engine.runTurn(session, plan, emitter, signal);
       }
     } catch (e) {
       this.safePost({ type: "error", payload: { message: (e as Error).message } });
     } finally {
-      // Only clear the shared reference if this turn still owns it.
-      if (this.turnAbort === abort) this.turnAbort = undefined;
       this.safePost({ type: "status", payload: { kind: "idle" } });
       this.safePost({ type: "generationStats", payload: null });
       // Finalize messages left mid-stream by an abort/error: without this a
@@ -1547,21 +1553,19 @@ export class PhotonController {
         }
       }
 
-      if (this.checkpointMgr) {
-        const cp = await this.checkpointMgr.commitTurn(userMsg.id);
-        if (cp && cp.modifiedFilesCount > 0) {
-          userMsg.checkpointId = cp.id;
-          userMsg.checkpointFiles = Object.keys(cp.files);
-          userMsg.checkpointNumber = cp.checkpointNumber;
-          const lastAsst = [...session.messages].reverse().find((m) => m.role === "assistant");
-          if (lastAsst) {
-            lastAsst.checkpointId = cp.id;
-            lastAsst.checkpointFiles = Object.keys(cp.files);
-            lastAsst.checkpointNumber = cp.checkpointNumber;
-          }
-          touched = true;
-          this.pushSessionCheckpoints();
+      const cp = await this.checkpointCoord.commitTurn(userMsg.id);
+      if (cp && cp.modifiedFilesCount > 0) {
+        userMsg.checkpointId = cp.id;
+        userMsg.checkpointFiles = Object.keys(cp.files);
+        userMsg.checkpointNumber = cp.checkpointNumber;
+        const lastAsst = [...session.messages].reverse().find((m) => m.role === "assistant");
+        if (lastAsst) {
+          lastAsst.checkpointId = cp.id;
+          lastAsst.checkpointFiles = Object.keys(cp.files);
+          lastAsst.checkpointNumber = cp.checkpointNumber;
         }
+        touched = true;
+        this.pushSessionCheckpoints();
       }
 
       await this.persistActiveSession(session);
@@ -1582,7 +1586,7 @@ export class PhotonController {
       const cfgCtx = cfg?.numCtx ?? cfg?.llamacpp?.ctx;
       if (cfgCtx && cfgCtx > 0) return cfgCtx;
     }
-    const planCtx = (this.plan as any)?.contextWindow || this.plan?.numCtx;
+    const planCtx = this.plan?.contextWindow || this.plan?.numCtx;
     if (planCtx && planCtx > 0) return planCtx;
     if (mName) {
       const m = this.models.find((x) => x.name === mName);
@@ -1688,123 +1692,19 @@ export class PhotonController {
    * Mirrors GitHub Copilot & Claude Code checkpoint restoration.
    */
   private async handleRollbackCheckpoint(checkpointId: string, rewindChat = true): Promise<void> {
-    if (!this.checkpointMgr) return;
-    this.output.appendLine(
-      `[checkpoint] Rolling back to checkpoint "${checkpointId}" (rewindChat=${rewindChat})`
-    );
-
-    const targetCp = this.checkpointMgr.getCheckpoint(checkpointId);
-    const cpNum = targetCp?.checkpointNumber;
-    const cpNumLabel = cpNum ? `Checkpoint #${cpNum}` : `checkpoint`;
-
-    const result = await this.checkpointMgr.rollbackToCheckpoint(checkpointId);
-    if (!result.success && result.revertedFiles.length === 0 && result.deletedFiles.length === 0) {
-      this.safePost({
-        type: "error",
-        payload: { message: `Rollback aborted (checkpoint preserved): ${result.errors.join("; ")}` },
-      });
-      return;
-    } else if (!result.success) {
-      const failedOrConflict = result.fileResults.filter(
-        (f) => f.status === "failed" || f.status === "conflict"
-      );
-      const detail = failedOrConflict
-        .map((f) => `${f.relativePath} (${f.status}: ${f.reason || "unknown"})`)
-        .join("; ");
-      this.safePost({
-        type: "error",
-        payload: {
-          message: `Rollback partially completed: ${detail}. Checkpoint preserved for retry.`,
-        },
-      });
-    }
-
-    // Refresh symbol index for reverted/deleted files
-    if (this.ctxMgr) {
-      for (const f of result.revertedFiles) void this.ctxMgr.indexSingleFile(f);
-      for (const f of result.deletedFiles) this.ctxMgr.removeFile(f);
-    }
-
-    let restoredPrompt: string | undefined;
-
-    if (rewindChat) {
-      const session = this.session;
-      const rewound = rewindMessagesToCheckpoint(
-        session.messages,
-        checkpointId,
-        result.targetTurnMessageId,
-        result.label || ""
-      );
-      restoredPrompt = rewound.restoredPrompt;
-      session.messages = rewound.rewoundMessages;
-      session.updatedAt = Date.now();
-      await this.persistActiveSession(session);
-      this.safePost({ type: "sessionLoaded", payload: session });
-    }
-
-    const summaries = this.checkpointMgr.getSessionCheckpointSummaries(this.session.id);
-
-    this.safePost({
-      type: "checkpointRollbackDone",
-      payload: {
-        checkpointId: result.checkpointId,
-        revertedFiles: result.revertedFiles,
-        deletedFiles: result.deletedFiles,
-        rewindChat,
-        restoredPrompt,
-        messages: this.session.messages,
-        checkpoints: summaries,
-      },
-    });
-
-    const fileSummary =
-      result.revertedFiles.length > 0
-        ? `Reverted ${result.revertedFiles.length} file(s)`
-        : `Restored workspace`;
-    const rewindSuffix = rewindChat ? " and rewound chat" : "";
-    vscode.window.showInformationMessage(`Photon: ${fileSummary}${rewindSuffix} to ${cpNumLabel}.`);
+    await this.checkpointCoord.rollbackToCheckpoint(checkpointId, rewindChat);
   }
 
   private async handleRevertToNumber(arg: string): Promise<void> {
-    if (!this.checkpointMgr) return;
-    const clean = arg.replace(/#/g, "").trim();
-    const num = parseInt(clean, 10);
-    if (isNaN(num)) {
-      this.safePost({
-        type: "error",
-        payload: { message: `Invalid checkpoint number: "${arg}". Use /revert or e.g. /revert 1.` },
-      });
-      return;
-    }
-    const cp = this.checkpointMgr.getCheckpointByNumber(this.session.id, num);
-    if (!cp) {
-      this.safePost({
-        type: "error",
-        payload: { message: `Checkpoint #${num} not found in this chat session.` },
-      });
-      return;
-    }
-    await this.handleRollbackCheckpoint(cp.id, true);
+    await this.checkpointCoord.revertToNumber(arg);
   }
 
   private async handleRewindLatest(): Promise<void> {
-    if (!this.checkpointMgr) return;
-    const latest = this.checkpointMgr.getLatestCheckpoint(this.session.id);
-    if (!latest) {
-      this.safePost({
-        type: "error",
-        payload: { message: "No checkpoints recorded in this conversation yet." },
-      });
-      return;
-    }
-    await this.handleRollbackCheckpoint(latest.id, true);
+    await this.checkpointCoord.rewindLatest();
   }
 
   private pushSessionCheckpoints(): void {
-    if (this.checkpointMgr) {
-      const summaries = this.checkpointMgr.getSessionCheckpointSummaries(this.session.id);
-      this.safePost({ type: "checkpointsList", payload: { checkpoints: summaries } });
-    }
+    this.checkpointCoord.pushSessionCheckpoints(this.session.id);
   }
 
   /** Bridge engine events to webview messages and record them in the given session.
@@ -1814,7 +1714,8 @@ export class PhotonController {
    *  into the conversation that replaced it. */
   private makeEmitter(session: SessionState): TurnEmitter {
     let current: ChatMessage | null = null;
-    const isLive = (): boolean => this.session === session;
+    const isLive = (): boolean =>
+      this.session === session && !this.deletedSessionIds.has(session.id);
     const ensure = (id: string): ChatMessage => {
       if (!current || current.id !== id) {
         current = {
@@ -1922,9 +1823,14 @@ export class PhotonController {
   /* ------------------------------ cloud mode ------------------------------ */
 
   /** A permissive plan for cloud models: the model's own context window,
-   *  native tool calling, no tool caps, no adaptive tuning. */
-  private cloudPlan(model: ModelInfo, mode: Mode): AdaptivePlan {
+   *  native tool calling, no tool caps, but enforcing mode-governed step caps. */
+  private cloudPlan(model: ModelInfo, mode: Mode, prompt?: string): AdaptivePlan {
     const contextWindow = model.contextLength ?? 128_000;
+    const task = analyzeTask(prompt ?? "", mode);
+    const MODE_CAPS: Record<Mode, number> = { chat: 6, plan: 10, agent: 25 };
+    const hardCap = MODE_CAPS[mode] ?? 25;
+    const capabilities = capabilityForModel(model);
+    const policy = buildExecutionPolicy(task, capabilities, hardCap, 100);
     return {
       model: model.name,
       mode,
@@ -1938,7 +1844,10 @@ export class PhotonController {
       allowParallelTools: false,
       intelligence: "max",
       intelligenceAuto: false,
-      rationale: ["Cloud mode: direct native tool calling — no adaptive limits."],
+      rationale: ["Cloud mode: direct native tool calling with mode-governed step caps."],
+      task,
+      modelCapabilities: capabilities,
+      executionPolicy: policy,
     };
   }
 
@@ -1960,7 +1869,8 @@ export class PhotonController {
     // Classify tool policy here too so the system prompt matches the actual
     // tool surface. The unifiedRuntime monkey-patch also sets it, but the
     // system prompt is built before that patch runs.
-    const lastUser = [...session.messages].reverse().find((m) => m.role === "user")?.content ?? "";
+    const lastUserMsg = [...session.messages].reverse().find((m) => m.role === "user");
+    const lastUser = lastUserMsg?.content ?? "";
     const toolPolicy = classifyCloudToolPolicyForPrompt(plan.mode, String(lastUser));
     const projectContextDigest = this.ctxMgr?.buildPromptDigest({
       userQuery: String(lastUser),
@@ -1974,33 +1884,47 @@ export class PhotonController {
       toolPolicy,
       projectContextDigest,
     });
-    await runCloudTurn({
-      provider: this.providers,
-      model: plan.model,
-      system,
-      history: cloudHistoryFromSession(session.messages),
-      tools: cloudTools(plan.mode),
-      contextWindow: model.contextLength ?? 128_000,
-      ctx: this.buildToolContext(signal),
-      emitter,
-      signal,
-      onStepUsage: (usage) => {
-        this.cloudUsageTracker.recordStep(usage);
-        void this.context.globalState.update(
-          "photon.cloudUsage.total",
-          this.cloudUsageTracker.getSummary()
-        );
-        this.pushCloudUsage();
-      },
-    });
+    const MODE_CAPS: Record<Mode, number> = { chat: 6, plan: 10, agent: 25 };
+    const prevPolicy = getCloudToolPolicy();
+    setCloudToolPolicy(toolPolicy);
+    try {
+      await runCloudTurn({
+        provider: this.providers,
+        model: plan.model,
+        system,
+        history: cloudHistoryFromSession(session.messages),
+        tools: cloudTools(plan.mode),
+        contextWindow: model.contextLength ?? 128_000,
+        ctx: this.buildToolContext(signal, { sessionId: session.id, messageId: lastUserMsg?.id || "" }, plan.executionPolicy),
+        emitter,
+        signal,
+        mode: plan.mode,
+        maxSteps: plan.executionPolicy?.stepBudget ?? (MODE_CAPS[plan.mode] ?? 25),
+        onStepUsage: (usage) => {
+          this.cloudUsageTracker.recordStep(usage);
+          void this.context.globalState.update(
+            "photon.cloudUsage.total",
+            this.cloudUsageTracker.getSummary()
+          );
+          this.pushCloudUsage();
+        },
+      });
+    } finally {
+      setCloudToolPolicy(prevPolicy);
+    }
   }
 
   /* ------------------------------ tool context ---------------------------- */
 
-  private buildToolContext(signal: AbortSignal): ToolContext {
+  private buildToolContext(
+    signal: AbortSignal,
+    turnContext?: { sessionId?: string; messageId?: string },
+    executionPolicy?: ExecutionPolicy
+  ): ToolContext {
     return {
       workspaceRoot: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
       signal,
+      executionPolicy: executionPolicy ?? this.plan?.executionPolicy,
       log: (m) => this.output.appendLine(`[tool] ${m}`),
       webSearchProvider: vscode.workspace
         .getConfiguration("photon")
@@ -2014,7 +1938,8 @@ export class PhotonController {
       getDiagnostics: (absPath) => this.collectDiagnostics(absPath),
       todos: [],
       checkpointTracker: {
-        recordBeforeChange: (relPath: string) => this.checkpointMgr?.recordBeforeChange(relPath) ?? Promise.resolve(),
+        recordBeforeChange: (relPath: string) =>
+          this.checkpointCoord.recordBeforeChange(relPath, turnContext),
       },
     };
   }
@@ -2245,9 +2170,10 @@ export class PhotonController {
     if (id === this.session.id) return;
     this.cancelActiveTurn();
     const { autoApproveChanged } = this.approvals.clearSessionApprovals();
+    const previous = this.session;
+    this.checkpointMgr?.cancelTurn(undefined, previous.id);
     const target = this.sessionStore.get(id);
     if (!target) return;
-    const previous = this.session;
     // Reassign synchronously (same rule as newSession): a prompt sent while we
     // persist must land in the TARGET session, not the one switched away from.
     this.loadSession(target);
@@ -2259,6 +2185,10 @@ export class PhotonController {
   }
 
   private async deleteSession(id: string): Promise<void> {
+    // Mark as deleted immediately so late persistence or delayed callbacks cannot revive it
+    this.deletedSessionIds.add(id);
+    this.checkpointMgr?.cancelTurn(undefined, id);
+
     // Move off the doomed session BEFORE awaiting its removal — otherwise a
     // prompt arriving during the await would target (and re-persist) a deleted
     // session as a zombie.
@@ -2284,6 +2214,8 @@ export class PhotonController {
   private loadSession(target: SessionState): void {
     this.session = target;
     this.mode = target.mode;
+    this.cloudUsageTracker.resetSession();
+    this.pushCloudUsage();
     if (this.modelsForUi().some((m) => m.name === target.model)) {
       this.selectedModel = target.model;
     }
@@ -2298,7 +2230,7 @@ export class PhotonController {
   }
 
   private async persistActiveSession(session: SessionState = this.session): Promise<void> {
-    if (session.messages.length === 0) return;
+    if (session.messages.length === 0 || this.deletedSessionIds.has(session.id)) return;
     // Bound in-memory + on-disk growth for very long-running sessions by archiving older messages into a compact digest.
     enforceSessionMessageCap(session, MAX_SESSION_MESSAGES);
     session.updatedAt = Date.now();
@@ -2313,16 +2245,7 @@ export class PhotonController {
   }
 
   private readMcpConfig(): McpServerConfig[] {
-    try {
-      const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-      if (!root) return [];
-      const mcpPath = vscode.Uri.joinPath(root, ".vscode", "mcp.json");
-      const fs = require("node:fs") as typeof import("node:fs");
-      const raw = fs.readFileSync(mcpPath.fsPath, "utf8");
-      return parseMcpConfigJson(raw);
-    } catch {
-      return [];
-    }
+    return this.mcpCoord.readMcpConfig();
   }
 
   async runDiagnostics(): Promise<void> {
@@ -2349,7 +2272,7 @@ export class PhotonController {
       );
     }
     if (this.plan) {
-      this.output.appendLine(`Active plan: ${JSON.stringify(this.plan, null, 2)}`);
+      this.output.appendLine(`Active plan: ${redactSecrets(JSON.stringify(this.plan, null, 2))}`);
     }
     this.output.show(true);
   }

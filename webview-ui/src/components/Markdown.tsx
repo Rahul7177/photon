@@ -77,7 +77,12 @@ function CodeBlock({ lang, code }: { lang?: string; code: string }) {
   return (
     <div className="code-block">
       {lang && <span className="lang">{lang}</span>}
-      <button className="copy-btn" onClick={copy}>
+      <button
+        type="button"
+        className="copy-btn"
+        aria-label={copied ? "Copied code to clipboard" : "Copy code to clipboard"}
+        onClick={copy}
+      >
         {copied ? "copied" : "copy"}
       </button>
       <pre>

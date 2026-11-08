@@ -3,11 +3,14 @@ name: CI
 on:
   push:
     branches: [main, photon-agent-core-2]
+    tags:
+      - 'v*'
   pull_request:
     branches: [main]
 
 jobs:
   typecheck-and-build:
+    name: Typecheck & Production Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +23,12 @@ jobs:
       - run: npm run build
 
   unit-tests:
-    runs-on: ubuntu-latest
+    name: Unit Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -29,3 +37,29 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+
+  security-and-package:
+    name: Security Audit & VSIX Packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Verify zero uncommitted secrets
+        run: |
+          # Ensure no hardcoded secret keys in tracked codebase
+          ! git grep -i -E "(sk-[a-zA-Z0-9]{20,}|AIza[-_0-9A-Za-z]{35}|xox[baprs]-[-0-9a-zA-Z]{10,}|BEGIN PRIVATE KEY)" -- ':!test/unit/cloudModelOptimization.test.ts'
+      - name: Build & Package VSIX
+        run: npm run package
+      - name: Inspect VSIX Contents
+        run: |
+          npx @vscode/vsce ls
+      - name: Upload VSIX Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: photon-vsix
+          path: "*.vsix"
+          if-no-files-found: error

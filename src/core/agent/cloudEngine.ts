@@ -1,11 +1,18 @@
 import { randomUUID } from "node:crypto";
-import type { ChatMessage, ToolCall, TokenUsage } from "../../shared/types";
+import type { ChatMessage, Mode, ToolCall, TokenUsage } from "../../shared/types";
 import type { LLMMessage, LLMProvider } from "../llm/types";
 import { toNativeTools } from "../protocol/serialize";
-import { estimateTokens } from "../adaptive/tokens";
+import { estimateTokens, estimateToolSchemasTokens } from "../adaptive/tokens";
+import { fitToWindow } from "./contextManager";
 import { clamp } from "../tools/types";
 import type { Tool, ToolContext } from "../tools/types";
-import { classifyRuntimeError, formatNativeToolOutcome, sanitizeToolPairing } from "./errorRecovery";
+import {
+  classifyRuntimeError,
+  formatNativeToolOutcome,
+  sanitizeToolPairing,
+  shouldRetryStep,
+  waitWithBackoff,
+} from "./errorRecovery";
 
 /**
  * CLOUD ENGINE — token-economical native tool-calling loop for frontier cloud models.
@@ -72,6 +79,8 @@ export interface CloudTurnInput {
   emitter: CloudEmitter;
   signal: AbortSignal;
   onStepUsage?: (usage: CloudStepUsageEvent) => void;
+  mode?: Mode;
+  maxSteps?: number;
 }
 
 export interface PendingCall {
@@ -397,6 +406,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
   const nativeTools = tools.length > 0 ? toNativeTools(tools.map((t) => t.spec)) : undefined;
   const history = [...input.history];
   const systemTokens = estimateTokens(system);
+  const toolSchemasTokens = nativeTools && nativeTools.length > 0 ? estimateToolSchemasTokens(nativeTools, model) : 0;
   const schemaSavedTokens = Math.max(0, (FULL_CLOUD_TOOL_COUNT - tools.length) * TOKENS_PER_TOOL_SCHEMA);
 
   let emptyStreak = 0;
@@ -404,21 +414,21 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
   let continuations = 0;
   let toolsRun = 0;
 
-  for (let step = 0; step < MAX_STEPS; step++) {
+  const MODE_CAPS: Record<Mode, number> = { chat: 6, plan: 10, agent: 25 };
+  const modeCap = input.mode ? (MODE_CAPS[input.mode] ?? 25) : 25;
+  const effectiveMaxSteps = Math.min(input.maxSteps ?? modeCap, modeCap);
+
+  for (let step = 0; step < effectiveMaxSteps; step++) {
     if (signal.aborted) return;
 
     const { compacted, savedTokens: compactionSavedTokens } = compactCloudHistory(history);
-    const messages = fitToWindow(system, compacted, contextWindow, model);
-
-    const historyTokens = messages.slice(1).reduce((sum, m) => sum + estimateTokens(m.content) + 8, 0);
-    emitter.onUsage({
-      used: systemTokens + historyTokens,
-      window: contextWindow,
-      breakdown: [
-        { label: "System", tokens: systemTokens },
-        { label: "Conversation", tokens: historyTokens },
-      ],
+    const fit = fitToWindow(system, compacted, 0, contextWindow, model, {
+      preserveFirstUser: true,
+      toolSchemasTokens,
     });
+    const messages = fit.messages;
+    const historyTokens = fit.usage.breakdown.find((b) => b.label === "Conversation")?.tokens ?? 0;
+    emitter.onUsage(fit.usage);
 
     const assistantId = randomUUID();
     emitter.onAssistantStart(assistantId);
@@ -470,12 +480,33 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
             thinkingDoneEmitted = true;
             emitter.onThinkingEnd?.(assistantId, Math.max(1, Date.now() - thinkingStart));
           }
-          calls.push({
-            id: tc.id ?? randomUUID(),
-            name: tc.function.name,
-            args: tc.function.arguments ?? {},
-            ...(tc.thoughtSignature ? { thoughtSignature: tc.thoughtSignature } : {}),
-          });
+          const callId = tc.id || randomUUID();
+          const fn = tc.function ?? (tc as unknown as { name?: string; args?: unknown });
+          const rawArgs = fn && "arguments" in fn ? (fn as { arguments: unknown }).arguments : (fn as { args?: unknown })?.args;
+          const fnName = fn && "name" in fn ? fn.name ?? "" : "";
+          let parsedArgs: Record<string, unknown> = {};
+          if (typeof rawArgs === "string") {
+            try {
+              parsedArgs = JSON.parse(rawArgs);
+            } catch {
+              parsedArgs = {};
+            }
+          } else if (rawArgs && typeof rawArgs === "object") {
+            parsedArgs = rawArgs as Record<string, unknown>;
+          }
+
+          const existing = calls.find((c) => c.id === callId);
+          if (existing) {
+            if (fnName) existing.name = fnName;
+            existing.args = { ...existing.args, ...parsedArgs };
+          } else {
+            calls.push({
+              id: callId,
+              name: fnName,
+              args: parsedArgs,
+              ...(tc.thoughtSignature ? { thoughtSignature: tc.thoughtSignature } : {}),
+            });
+          }
         }
         if (chunk.done_reason) doneReason = chunk.done_reason;
         if (typeof chunk.prompt_eval_count === "number" && chunk.prompt_eval_count > 0) {
@@ -501,7 +532,53 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
     }
     emitStats(true);
 
-    // Record step token usage (exact provider usage when available, else estimated)
+    if (signal.aborted) {
+      emitter.onGenerationStats(null);
+      emitter.onDone(
+        assistantId,
+        !content.trim() && calls.length === 0 ? "Stopped before the model replied." : "Stopped."
+      );
+      return;
+    }
+    if (streamError) {
+      const classified = classifyRuntimeError(streamError, signal);
+      if (classified.category === "cancelled" || signal.aborted) {
+        emitter.onGenerationStats(null);
+        emitter.onDone(
+          assistantId,
+          !content.trim() && calls.length === 0 ? "Stopped before the model replied." : "Stopped."
+        );
+        return;
+      }
+      const canRetry = shouldRetryStep(classified, {
+        sideEffectsOccurred: toolsRun > 0,
+        streamRetries,
+        maxRetries: MAX_STREAM_RETRIES,
+        hasContent: Boolean(content.trim()),
+        toolCallsCount: calls.length,
+      });
+      if (canRetry.shouldRetry) {
+        streamRetries++;
+        ctx.log(
+          `[cloud] transient ${classified.category} error (${classified.rawMessage}) — retrying (${streamRetries}/${MAX_STREAM_RETRIES}) after ${classified.backoffMs}ms backoff.`
+        );
+        emitter.onAssistantCancel(assistantId);
+        step--;
+        const okToContinue = await waitWithBackoff(classified.backoffMs, signal);
+        if (!okToContinue || signal.aborted) {
+          emitter.onGenerationStats(null);
+          emitter.onDone(assistantId, "Stopped.");
+          return;
+        }
+        continue;
+      }
+      emitter.onGenerationStats(null);
+      emitter.onError(classified.userMessage);
+      emitter.onDone(assistantId);
+      return;
+    }
+
+    // Record step token usage exactly once on successful/settled generation (never phantom-counted on retries)
     const stepInputTokens = exactPromptTokens > 0 ? exactPromptTokens : systemTokens + historyTokens;
     const stepOutputTokens = exactOutputTokens > 0 ? exactOutputTokens : Math.ceil(accChars / 4);
     if (exactPromptTokens > 0 || exactOutputTokens > 0) {
@@ -523,42 +600,6 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
         cachedTokens: exactCachedTokens,
         savedTokens: schemaSavedTokens + compactionSavedTokens + exactCachedTokens,
       });
-    }
-
-    if (signal.aborted) {
-      emitter.onGenerationStats(null);
-      emitter.onDone(
-        assistantId,
-        !content.trim() && calls.length === 0 ? "Stopped before the model replied." : "Stopped."
-      );
-      return;
-    }
-    if (streamError) {
-      const classified = classifyRuntimeError(streamError, signal);
-      if (classified.category === "cancelled" || signal.aborted) {
-        emitter.onGenerationStats(null);
-        emitter.onDone(
-          assistantId,
-          !content.trim() && calls.length === 0 ? "Stopped before the model replied." : "Stopped."
-        );
-        return;
-      }
-      if (
-        classified.retryable &&
-        streamRetries < MAX_STREAM_RETRIES &&
-        !content.trim() &&
-        calls.length === 0
-      ) {
-        streamRetries++;
-        ctx.log(`[cloud] transient ${classified.category} error (${classified.rawMessage}) — retrying (${streamRetries}/${MAX_STREAM_RETRIES}).`);
-        emitter.onAssistantCancel(assistantId);
-        step--;
-        continue;
-      }
-      emitter.onGenerationStats(null);
-      emitter.onError(classified.userMessage);
-      emitter.onDone(assistantId);
-      return;
     }
 
     if (calls.length === 0 && !content.trim()) {
@@ -627,10 +668,22 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
     for (const c of normalizedCalls) {
       if (c.name === "attempt_completion") {
         completion = typeof c.args.result === "string" ? c.args.result : "";
+        history.push({
+          role: "tool",
+          tool_call_id: c.id,
+          name: c.name,
+          content: "Task completion recorded.",
+        });
         continue;
       }
       if (c.name === "ask_followup_question") {
         followup = typeof c.args.question === "string" ? c.args.question : "I have a question.";
+        history.push({
+          role: "tool",
+          tool_call_id: c.id,
+          name: c.name,
+          content: "Followup question recorded.",
+        });
         continue;
       }
       const tool = tools.find((t) => t.spec.name === c.name);
@@ -660,6 +713,12 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
       if (!tool) {
         output = `Unknown tool "${c.name}". Available: ${tools.map((t) => t.spec.name).join(", ")}.`;
         okResult = false;
+      } else if ((input.mode === "chat" || input.mode === "plan") && tool.spec.sideEffecting) {
+        output = `Side-effecting tool "${c.name}" is forbidden in "${input.mode}" mode.`;
+        okResult = false;
+      } else if (ctx.executionPolicy?.blockTerminalCommands && (c.name === "run_command" || tool.spec.risk === "execute")) {
+        output = `Terminal command execution is disabled by current execution policy.`;
+        okResult = false;
       } else {
         try {
           const r = await tool.execute(c.args, { ...ctx, pendingCallId: c.id });
@@ -687,10 +746,21 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
 
     if (allReadOnly) {
       const results = await Promise.all(executableCalls.map(runOneCall));
+      if (signal.aborted) {
+        for (const ec of executableCalls) {
+          emitter.onToolUpdate(assistantId, { ...ec.callObj, status: "error", error: "Operation cancelled." });
+        }
+        emitter.onDone(assistantId, "Stopped.");
+        return;
+      }
       for (const r of results) history.push(r);
     } else {
-      for (const ec of executableCalls) {
+      for (let i = 0; i < executableCalls.length; i++) {
+        const ec = executableCalls[i];
         if (signal.aborted) {
+          for (let j = i; j < executableCalls.length; j++) {
+            emitter.onToolUpdate(assistantId, { ...executableCalls[j].callObj, status: "error", error: "Operation cancelled." });
+          }
           emitter.onDone(assistantId, "Stopped.");
           return;
         }
@@ -718,60 +788,20 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
   if (!signal.aborted) {
     emitter.onGenerationStats(null);
     emitter.onError(
-      `Reached the ${MAX_STEPS}-step safety limit in cloud mode. Ask me to continue if more work is needed.`
+      `Reached the ${effectiveMaxSteps}-step safety limit in ${input.mode ?? "cloud"} mode. Ask me to continue if more work is needed.`
     );
   }
 }
 
-function fitToWindow(system: string, history: LLMMessage[], window: number, _model?: string): LLMMessage[] {
-  const budget =
-    Math.max(2048, Math.floor(window * (1 - OUTPUT_RESERVE))) - estimateTokens(system);
-  const tokens = history.map((m) => {
-    let t = estimateTokens(m.content) + 8;
-    for (const tc of m.tool_calls ?? []) {
-      t += estimateTokens(tc.function.name) + estimateTokens(JSON.stringify(tc.function.arguments));
-    }
-    if (m.tool_call_id) t += 4;
-    if (m.name) t += estimateTokens(m.name);
-    return t;
-  });
-  let total = tokens.reduce((s, t) => s + t, 0);
-  if (total <= budget) return [systemMsg(system), ...history];
-  const keepFirst = history.length > 0 && history[0].role === "user" ? 1 : 0;
-  let cut = keepFirst;
-  while (total > budget && cut < history.length) {
-    let k = cut;
-    while (k < history.length && history[k].role !== "user") {
-      total -= tokens[k];
-      k++;
-    }
-    if (k >= history.length) break;
-    if (k === 0 && keepFirst) {
-      k = 1;
-      while (k < history.length && history[k].role !== "user") {
-        total -= tokens[k];
-        k++;
-      }
-      if (k >= history.length) break;
-    }
-    cut = k;
-    if (total <= budget) break;
-    total -= tokens[cut];
-    cut++;
-    if (keepFirst && cut === 1) cut = 2;
-  }
-  const rawFitted = keepFirst
-    ? [systemMsg(system), history[0], ...history.slice(Math.max(cut, 1))]
-    : [systemMsg(system), ...history.slice(cut)];
-  return sanitizeToolPairing(rawFitted);
-}
-
-function systemMsg(content: string): LLMMessage {
-  return { role: "system", content };
-}
-
 export function cloudHistoryFromSession(messages: ChatMessage[]): LLMMessage[] {
   const out: LLMMessage[] = [];
+  const existingToolIds = new Set<string>();
+  for (const m of messages) {
+    if (m.role === "tool" && (m as any).toolCallId) {
+      existingToolIds.add((m as any).toolCallId);
+    }
+  }
+
   for (const m of messages) {
     if (m.role === "user") {
       const docs = (m.attachments ?? []).filter((a) => a.kind === "text" && a.text);
@@ -798,20 +828,22 @@ export function cloudHistoryFromSession(messages: ChatMessage[]): LLMMessage[] {
           })),
         });
         for (const c of calls) {
-          const outcome =
-            c.result !== undefined
-              ? c.result
-              : c.error !== undefined
-              ? c.error
-              : c.status === "denied"
-              ? "Tool execution declined by user."
-              : "Tool execution was cancelled.";
-          out.push({
-            role: "tool",
-            tool_call_id: c.id,
-            name: c.name,
-            content: outcome,
-          });
+          if (!existingToolIds.has(c.id)) {
+            const outcome =
+              c.result !== undefined
+                ? c.result
+                : c.error !== undefined
+                ? c.error
+                : c.status === "denied"
+                ? "Tool execution declined by user."
+                : "Tool execution was cancelled.";
+            out.push({
+              role: "tool",
+              tool_call_id: c.id,
+              name: c.name,
+              content: formatNativeToolOutcome(c.name, outcome, c.status === "done"),
+            });
+          }
         }
       } else if (m.content.trim()) {
         out.push({ role: "assistant", content: m.content });

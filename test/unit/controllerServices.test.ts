@@ -18,6 +18,12 @@ import { computeStatusInfo } from "../../webview-ui/src/components/StatusIndicat
 import { computeSummary } from "../../webview-ui/src/components/TurnProcess";
 import type { ModelInfo, SessionState, ToolCall } from "../../src/shared/types";
 import type { LLMProvider } from "../../src/core/llm/types";
+import { CheckpointCoordinator } from "../../src/host/checkpointCoordinator";
+import { McpCoordinator } from "../../src/host/mcpCoordinator";
+import { TurnCoordinator } from "../../src/host/turnCoordinator";
+import { ProviderService } from "../../src/host/providerService";
+import { ProviderManager } from "../../src/core/llm/providerManager";
+import type { HostMessage } from "../../src/shared/protocol";
 
 function makeInMemoryCatalogStorage(): ProviderCatalogStorage & {
   added: ModelInfo[];
@@ -351,17 +357,37 @@ describe("SessionCoordinator (Item 12)", () => {
       messages,
     };
 
-    // Cap at 10 messages (excess 11 messages archived into digest)
+    // Cap at 10 messages (1 archive digest message + 9 retained messages = 10 messages)
     const compacted = enforceSessionMessageCap(session, 10);
     assert.equal(compacted, true);
-    // 1 archive message + 10 retained messages = 11 messages
-    assert.equal(session.messages.length, 11);
+    assert.equal(session.messages.length, 10, "Post-cap total messages must not exceed maxMessages");
     const archiveMsg = session.messages[0];
     assert.equal(archiveMsg.role, "assistant");
     assert.equal(archiveMsg.isCompacted, true);
     assert.ok(archiveMsg.content.includes("[Context Compaction Summary]"));
     assert.ok(archiveMsg.content.includes("Initial task: build the auth and billing systems"));
     assert.ok(archiveMsg.notice?.includes("Context archived"));
+
+    // Repeated archive cycle: add 5 new messages and re-cap at 10
+    for (let i = 21; i <= 25; i++) {
+      session.messages.push({
+        id: `msg-${i}`,
+        role: i % 2 === 1 ? "user" : "assistant",
+        content: `Follow-up message ${i}`,
+        createdAt: 3000 + i,
+      });
+    }
+    assert.equal(session.messages.length, 15);
+    const recap = enforceSessionMessageCap(session, 10);
+    assert.equal(recap, true);
+    assert.equal(session.messages.length, 10, "Total messages after second archive cycle must still be exactly 10");
+    const secondArchive = session.messages[0];
+    assert.ok(secondArchive.isCompacted);
+    // Verify no double-nested headers
+    const bannerMatches = secondArchive.content.match(/⚡ \*\*\[Context Compaction Summary\]\*\*/g);
+    assert.equal(bannerMatches?.length, 1, "Compaction summary banner must not be nested");
+    // Verify initial task objective is still preserved!
+    assert.ok(secondArchive.content.includes("Initial task: build the auth and billing systems"));
   });
 });
 
@@ -453,5 +479,216 @@ describe("Agent Activity Visibility & TurnProcess Summary (Item 13)", () => {
     assert.equal(errSummary.badge, "Failed");
   });
 });
+
+describe("Phase 9: Architecture & Focused Services", () => {
+  describe("TurnCoordinator", () => {
+    it("manages active turn lifecycle, aborts, and sequential prompt queueing", async () => {
+      const posted: HostMessage[] = [];
+      const turnCoord = new TurnCoordinator({
+        post: (msg) => posted.push(msg),
+        output: { appendLine: () => {} },
+      });
+
+      assert.equal(turnCoord.isTurnActive(), false);
+
+      const executedPrompts: string[] = [];
+      let finishTurn1!: () => void;
+      const turn1Promise = new Promise<void>((r) => (finishTurn1 = r));
+
+      // Launch turn 1 which sets active signal and stays running until finishTurn1 is called
+      const p1 = turnCoord.enqueueOrRun({ text: "turn 1" }, async (t) => {
+        turnCoord.createTurnSignal();
+        executedPrompts.push(t);
+        await turn1Promise;
+      });
+
+      // Allow microtask to run so turn 1 starts
+      await new Promise((r) => setImmediate(r));
+      assert.equal(turnCoord.isTurnActive(), true);
+
+      // Queue turn 2 and turn 3 while turn 1 is active
+      const p2 = turnCoord.enqueueOrRun({ text: "turn 2" }, async (t) => {
+        executedPrompts.push(t);
+      });
+      const p3 = turnCoord.enqueueOrRun({ text: "turn 3" }, async (t) => {
+        executedPrompts.push(t);
+      });
+
+      assert.equal(turnCoord.getQueueLength(), 2);
+      assert.deepEqual(executedPrompts, ["turn 1"]);
+      assert.ok(posted.some((m) => m.type === "status" && (m.payload as any).detail?.includes("Queued (1)")));
+      assert.ok(posted.some((m) => m.type === "status" && (m.payload as any).detail?.includes("Queued (2)")));
+
+      // Resolve turn 1, allowing queue to drain
+      turnCoord.abortTurn(); // frees turn active flag
+      finishTurn1();
+      await Promise.all([p1, p2, p3]);
+
+      assert.deepEqual(executedPrompts, ["turn 1", "turn 2", "turn 3"]);
+      assert.equal(turnCoord.getQueueLength(), 0);
+    });
+
+    it("clears queued prompts when requested", () => {
+      const turnCoord = new TurnCoordinator({
+        post: () => {},
+        output: { appendLine: () => {} },
+      });
+      turnCoord.createTurnSignal();
+      void turnCoord.enqueueOrRun({ text: "q1" }, async () => {});
+      void turnCoord.enqueueOrRun({ text: "q2" }, async () => {});
+      assert.equal(turnCoord.getQueueLength(), 2);
+      turnCoord.clearQueue();
+      assert.equal(turnCoord.getQueueLength(), 0);
+    });
+  });
+
+  describe("CheckpointCoordinator", () => {
+    it("handles rollback execution, updates session, and posts checkpointRollbackDone", async () => {
+      const posted: HostMessage[] = [];
+      let savedSession: SessionState | null = null;
+      const mockSession: SessionState = {
+        id: "sess_cp1",
+        title: "Test Session",
+        mode: "chat",
+        model: "test-model",
+        createdAt: 1000,
+        updatedAt: 1000,
+        messages: [
+          { id: "u1", role: "user", content: "Prompt 1", createdAt: 1001 },
+          { id: "a1", role: "assistant", content: "Response 1", checkpointId: "cp_1", createdAt: 1002 },
+          { id: "u2", role: "user", content: "Prompt 2", createdAt: 1003 },
+        ],
+      };
+
+      const indexedFiles: string[] = [];
+      const removedFiles: string[] = [];
+      const mockCtxMgr = {
+        indexSingleFile: async (f: string) => { indexedFiles.push(f); },
+        removeFile: (f: string) => { removedFiles.push(f); },
+      };
+
+      const mockCheckpointMgr = {
+        beginTurn: () => {},
+        recordBeforeChange: async () => {},
+        commitTurn: async () => ({ id: "cp_1", checkpointNumber: 1, modifiedFilesCount: 1, files: { "file.ts": "hash" } }),
+        cancelTurn: () => {},
+        getCheckpoint: (id: string) => ({ id, checkpointNumber: 1 }),
+        getCheckpointByNumber: (sessId: string, num: number) => (num === 1 ? { id: "cp_1", checkpointNumber: 1 } : undefined),
+        getLatestCheckpoint: () => ({ id: "cp_1", checkpointNumber: 1 }),
+        getSessionCheckpointSummaries: () => [{ id: "cp_1", checkpointNumber: 1, modifiedFilesCount: 1 }],
+        rollbackToCheckpoint: async (id: string) => ({
+          success: true,
+          checkpointId: id,
+          targetTurnMessageId: "u2",
+          label: "Rollback to #1",
+          revertedFiles: ["src/app.ts"],
+          deletedFiles: ["temp.ts"],
+          fileResults: [],
+          errors: [],
+        }),
+      };
+
+      const coord = new CheckpointCoordinator({
+        getCheckpointManager: () => mockCheckpointMgr as any,
+        getContextManager: () => mockCtxMgr as any,
+        getSession: () => mockSession,
+        post: (msg) => posted.push(msg),
+        persistSession: async (s) => { savedSession = s; },
+        output: { appendLine: () => {} },
+        showInfo: () => {},
+      });
+
+      const success = await coord.rollbackToCheckpoint("cp_1", true);
+      assert.equal(success, true);
+      assert.deepEqual(indexedFiles, ["src/app.ts"]);
+      assert.deepEqual(removedFiles, ["temp.ts"]);
+      assert.ok(posted.some((m) => m.type === "checkpointRollbackDone"));
+      assert.ok(posted.some((m) => m.type === "sessionLoaded"));
+      assert.ok(savedSession !== null);
+
+      // Revert to number with invalid argument
+      const invalidRes = await coord.revertToNumber("abc");
+      assert.equal(invalidRes, false);
+      assert.ok(posted.some((m) => m.type === "error" && (m.payload as any).message?.includes("Invalid checkpoint number")));
+    });
+  });
+
+  describe("McpCoordinator", () => {
+    it("handles setup, fingerprint verification, and trust revocation", async () => {
+      const posted: HostMessage[] = [];
+      let toolsPushed = false;
+      const connectedServers: string[] = [];
+      const disconnectedServers: string[] = [];
+      const serverMessages: Record<string, string> = {};
+
+      const mockMcpManager = {
+        setConfigs: async () => {},
+        connect: async (id: string) => { connectedServers.push(id); },
+        disconnect: async (id: string) => { disconnectedServers.push(id); },
+        setServerMessage: (id: string, msg: string) => { serverMessages[id] = msg; },
+        list: () => [{ id: "git", status: "connected" }],
+      };
+
+      const approvedFingerprints: Record<string, string> = { git: "fp_old" };
+      const mockProjectStore = {
+        pruneStaleMcpApprovals: async () => {},
+        isMcpConfigApproved: (server: any) => server.id === "git_approved",
+        approvedMcpFingerprints: () => approvedFingerprints,
+        approveMcpConfig: async () => {},
+        revokeMcpConfig: async () => {},
+      };
+
+      const mcpCoord = new McpCoordinator({
+        mcpManager: mockMcpManager as any,
+        projectStore: mockProjectStore as any,
+        getWorkspaceRoot: () => undefined,
+        post: (msg) => posted.push(msg),
+        pushTools: () => { toolsPushed = true; },
+        output: { appendLine: () => {} },
+      });
+
+      // Revoking server trust
+      await mcpCoord.revokeMcpServer("git");
+      assert.deepEqual(disconnectedServers, ["git"]);
+      assert.ok(serverMessages["git"]?.includes("Server trust revoked"));
+      assert.equal(toolsPushed, true);
+      assert.ok(posted.some((m) => m.type === "mcpServers"));
+    });
+  });
+
+  describe("ProviderService", () => {
+    it("preserves active providers when rebuilding fails and reports status cleanly", async () => {
+      const posted: HostMessage[] = [];
+      const outputLines: string[] = [];
+      const mockOllama = { id: "ollama", label: "Ollama", enabled: true, isConfigured: () => true, listModels: async () => [] };
+      const manager = new ProviderManager([mockOllama as any]);
+
+      const mockCatalog = {
+        buildCloudProviders: async () => { throw new Error("Network failure during provider catalog build"); },
+        buildLlamaCppProvider: async () => null,
+        providerStatuses: () => [{ id: "ollama", label: "Ollama", configured: true, enabled: true }],
+      };
+
+      const service = new ProviderService({
+        providers: manager,
+        ollamaProvider: mockOllama as any,
+        catalog: mockCatalog as any,
+        post: (msg) => posted.push(msg),
+        output: { appendLine: (l) => outputLines.push(l) },
+      });
+
+      await service.rebuildProviders();
+      // Should preserve active provider without throwing
+      assert.equal(manager.all().length, 1);
+      assert.equal(manager.all()[0].id, "ollama");
+      assert.ok(outputLines.some((l) => l.includes("Provider refresh failed")));
+
+      const statuses = service.providerStatuses();
+      assert.equal(statuses.length, 1);
+      assert.equal(statuses[0].id, "ollama");
+    });
+  });
+});
+
 
 

@@ -1,12 +1,15 @@
 import type { CloudModelUsage, CloudUsageSummary } from "../../shared/types";
 
+export type PricingSource = "current" | "estimated" | "user-configured";
+
 export interface CloudPricing {
   inputPerMillion: number;
   outputPerMillion: number;
   cachedInputPerMillion?: number;
+  source: PricingSource;
 }
 
-const MODEL_PRICING: Record<string, CloudPricing> = {
+const MODEL_PRICING: Record<string, Omit<CloudPricing, "source">> = {
   // Anthropic
   "claude-3-7-sonnet": { inputPerMillion: 3.0, outputPerMillion: 15.0, cachedInputPerMillion: 0.3 },
   "claude-3-5-sonnet": { inputPerMillion: 3.0, outputPerMillion: 15.0, cachedInputPerMillion: 0.3 },
@@ -26,13 +29,33 @@ const MODEL_PRICING: Record<string, CloudPricing> = {
   "deepseek-reasoner": { inputPerMillion: 0.55, outputPerMillion: 2.19, cachedInputPerMillion: 0.14 },
 };
 
+const USER_PRICING_OVERRIDES = new Map<string, CloudPricing>();
+
+export function setUserModelPricing(modelName: string, pricing: Omit<CloudPricing, "source">): void {
+  const norm = (modelName ?? "").toLowerCase().replace(/^(openai|anthropic|gemini|openrouter|custom):/, "");
+  USER_PRICING_OVERRIDES.set(norm, { ...pricing, source: "user-configured" });
+}
+
+export function clearUserModelPricing(modelName?: string): void {
+  if (modelName) {
+    const norm = (modelName ?? "").toLowerCase().replace(/^(openai|anthropic|gemini|openrouter|custom):/, "");
+    USER_PRICING_OVERRIDES.delete(norm);
+  } else {
+    USER_PRICING_OVERRIDES.clear();
+  }
+}
+
 export function getModelPricing(modelName: string): CloudPricing {
   const norm = (modelName ?? "").toLowerCase().replace(/^(openai|anthropic|gemini|openrouter|custom):/, "");
+
+  const userOverride = USER_PRICING_OVERRIDES.get(norm);
+  if (userOverride) return userOverride;
+
   for (const [key, pricing] of Object.entries(MODEL_PRICING)) {
-    if (norm.includes(key)) return pricing;
+    if (norm.includes(key)) return { ...pricing, source: "current" };
   }
-  // Default cloud pricing fallback: $2.00/M in, $8.00/M out, $0.50/M cached
-  return { inputPerMillion: 2.0, outputPerMillion: 8.0, cachedInputPerMillion: 0.5 };
+  // Default cloud pricing fallback: $2.00/M in, $8.00/M out, $0.50/M cached (estimated)
+  return { inputPerMillion: 2.0, outputPerMillion: 8.0, cachedInputPerMillion: 0.5, source: "estimated" };
 }
 
 export function estimateCloudCost(
@@ -137,6 +160,14 @@ export class CloudUsageTracker {
       totalEstimatedCostUsd: Math.round(this.totalCost * 1_000_000) / 1_000_000,
       byModel: Array.from(this.modelUsage.values()).sort((a, b) => b.estimatedCostUsd - a.estimatedCostUsd),
     };
+  }
+
+  resetSession(): void {
+    this.sessionInput = 0;
+    this.sessionOutput = 0;
+    this.sessionCached = 0;
+    this.sessionSaved = 0;
+    this.sessionCost = 0;
   }
 
   reset(): void {

@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { normalizeCloudToolCall, type PendingCall } from "../../src/core/agent/cloudEngine";
+import { runCloudTurn, cloudHistoryFromSession, normalizeCloudToolCall, type PendingCall, type CloudEmitter } from "../../src/core/agent/cloudEngine";
 import { cloudTools } from "../../src/core/tools/cloud/cloudTools";
 import { buildCloudSystemPrompt } from "../../src/core/prompts/cloudSystem";
+import { CloudUsageTracker } from "../../src/core/telemetry/cloudUsage";
+import { redactSecretsFromError, classifyRuntimeError } from "../../src/core/agent/errorRecovery";
+import type { Tool } from "../../src/core/tools/types";
+import type { LLMChatChunk, LLMChatRequest, LLMProvider } from "../../src/core/llm/types";
+import type { ChatMessage } from "../../src/shared/types";
 
 describe("Cloud Model Optimization & Native Speed", () => {
   describe("normalizeCloudToolCall transparent aliasing & argument normalization", () => {
@@ -223,6 +228,274 @@ describe("Cloud Model Optimization & Native Speed", () => {
       });
       assert.ok(!planPrompt.includes("attempt_completion"), "Plan prompt should not mandate attempt_completion");
       assert.ok(planPrompt.includes("present a clear, structured implementation plan directly in Markdown"));
+    });
+  });
+
+  describe("Phase 3.2: Cloud Engine Execution Integrity & Secret Hygiene", () => {
+    it("redacts secret tokens, API keys, and Authorization headers in runtime errors", () => {
+      const errorWithSecret = "Invalid request to https://api.anthropic.com: apiKey=sk-ant-api03-abcdef1234567890abcdef and Bearer sk-proj-1234567890abcdef";
+      const sanitized = redactSecretsFromError(errorWithSecret);
+      assert.ok(!sanitized.includes("sk-ant-api03-abcdef1234567890abcdef"));
+      assert.ok(!sanitized.includes("sk-proj-1234567890abcdef"));
+      assert.ok(sanitized.includes("[REDACTED"));
+
+      const classified = classifyRuntimeError(new Error("Unauthorized: incorrect api key sk-1234567890abcdef1234"));
+      assert.ok(!classified.userMessage.includes("sk-1234567890abcdef1234"));
+      assert.ok(!classified.rawMessage.includes("sk-1234567890abcdef1234"));
+    });
+
+    it("cloudHistoryFromSession pairs tool calls and eliminates duplicates", () => {
+      const messages: ChatMessage[] = [
+        { id: "u1", role: "user", content: "read file", createdAt: Date.now() },
+        {
+          id: "a1",
+          role: "assistant",
+          content: "reading...",
+          toolCalls: [
+            { id: "call_1", name: "read_file", args: { path: "a.ts" }, status: "done", result: "file A content" },
+            { id: "call_2", name: "read_file", args: { path: "b.ts" }, status: "error", error: "not found" },
+          ],
+          createdAt: Date.now(),
+        },
+        // Explicit tool message already in session for call_1
+        {
+          id: "t1",
+          role: "tool",
+          content: "file A content",
+          toolCallId: "call_1",
+          name: "read_file",
+          createdAt: Date.now(),
+        } as any,
+      ];
+
+      const history = cloudHistoryFromSession(messages);
+      // Verify tool call 1 has exactly one tool response, not two
+      const call1Responses = history.filter((m) => m.role === "tool" && m.tool_call_id === "call_1");
+      assert.equal(call1Responses.length, 1, "call_1 should have exactly one response");
+      // Verify tool call 2 has its synthesized failure response
+      const call2Responses = history.filter((m) => m.role === "tool" && m.tool_call_id === "call_2");
+      assert.equal(call2Responses.length, 1, "call_2 should have exactly one response");
+      assert.ok(call2Responses[0].content.includes("not found"));
+    });
+
+    it("CloudUsageTracker resetSession resets session counters while preserving historical totals", () => {
+      const tracker = new CloudUsageTracker();
+      tracker.recordStep({
+        model: "claude-3-5-sonnet",
+        inputTokens: 1000,
+        outputTokens: 500,
+      });
+
+      const before = tracker.getSummary();
+      assert.equal(before.sessionInputTokens, 1000);
+      assert.equal(before.totalInputTokens, 1000);
+
+      tracker.resetSession();
+
+      const after = tracker.getSummary();
+      assert.equal(after.sessionInputTokens, 0, "session tokens must reset");
+      assert.equal(after.sessionOutputTokens, 0);
+      assert.equal(after.sessionEstimatedCostUsd, 0);
+      assert.equal(after.totalInputTokens, 1000, "total tokens must be preserved");
+    });
+
+    it("runCloudTurn safely assembles partial tool calls and executes them", async () => {
+      let callCount = 0;
+      const mockRead: Tool = {
+        spec: {
+          name: "read_file",
+          summary: "read",
+          params: [{ name: "path", type: "string", required: true, description: "" }],
+          sideEffecting: false,
+          priority: 1,
+        },
+        execute: async () => {
+          callCount++;
+          return { ok: true, output: "file content" };
+        },
+      };
+
+      // Mock streaming chunks with partial tool call assembly (string JSON args)
+      const mockProvider: LLMProvider = {
+        id: "mock-cloud",
+        label: "Mock Cloud",
+        enabled: true,
+        isConfigured: () => true,
+        ping: async () => true,
+        listModels: async () => [],
+        async *chatStream(req: LLMChatRequest): AsyncGenerator<LLMChatChunk> {
+          if (callCount === 0) {
+            yield {
+              message: {
+                role: "assistant",
+                content: "",
+                tool_calls: [
+                  {
+                    id: "call_part_1",
+                    function: { name: "read_file", arguments: '{"path": "test.' as any },
+                  },
+                ],
+              },
+              done: false,
+            };
+            yield {
+              message: {
+                role: "assistant",
+                content: "",
+                tool_calls: [
+                  {
+                    id: "call_part_1",
+                    function: { name: "read_file", arguments: 'ts"}' as any },
+                  },
+                ],
+              },
+              done: false,
+            };
+            yield {
+              message: { role: "assistant", content: "" },
+              done: true,
+              done_reason: "tool_calls",
+              prompt_eval_count: 50,
+              eval_count: 30,
+            };
+          } else {
+            yield {
+              message: { role: "assistant", content: "File read successfully." },
+              done: true,
+              done_reason: "stop",
+              prompt_eval_count: 80,
+              eval_count: 10,
+            };
+          }
+        },
+      };
+
+      const events: any[] = [];
+      const emitter: CloudEmitter = {
+        onAssistantStart: (id) => events.push({ type: "start", id }),
+        onDelta: () => {},
+        onContent: () => {},
+        onAssistantCancel: () => {},
+        onToolCall: (id, call) => events.push({ type: "call", call }),
+        onToolUpdate: (id, call) => events.push({ type: "update", call }),
+        onPhase: () => {},
+        onUsage: () => {},
+        onGenerationStats: () => {},
+        onDone: (id) => events.push({ type: "done", id }),
+        onError: (err) => events.push({ type: "error", err }),
+      };
+
+      const usageRecorded: any[] = [];
+      await runCloudTurn({
+        provider: mockProvider,
+        model: "claude-3-5-sonnet",
+        system: "You are an assistant.",
+        history: [{ role: "user", content: "Read test.ts" }],
+        tools: [mockRead],
+        contextWindow: 128_000,
+        ctx: { capability: "high", todos: [], signal: new AbortController().signal, log: () => {} } as any,
+        emitter,
+        signal: new AbortController().signal,
+        onStepUsage: (u) => usageRecorded.push(u),
+      });
+
+      assert.equal(callCount, 1, "Tool should have executed once");
+      assert.equal(usageRecorded.length, 2, "Exact usage recorded for each step");
+      assert.equal(usageRecorded[0].inputTokens, 50);
+      assert.equal(usageRecorded[0].outputTokens, 30);
+    });
+
+    it("runCloudTurn cancels safely and marks remaining calls as cancelled", async () => {
+      const abortCtrl = new AbortController();
+      let firstExecuted = false;
+
+      const mockTool1: Tool = {
+        spec: {
+          name: "write_1",
+          summary: "write 1",
+          params: [],
+          sideEffecting: true,
+          priority: 1,
+        },
+        execute: async () => {
+          firstExecuted = true;
+          abortCtrl.abort();
+          return { ok: true, output: "done 1" };
+        },
+      };
+
+      let secondExecuted = false;
+      const mockTool2: Tool = {
+        spec: {
+          name: "write_2",
+          summary: "write 2",
+          params: [],
+          sideEffecting: true,
+          priority: 2,
+        },
+        execute: async () => {
+          secondExecuted = true;
+          return { ok: true, output: "done 2" };
+        },
+      };
+
+      const mockProvider: LLMProvider = {
+        id: "mock-cloud",
+        label: "Mock Cloud",
+        enabled: true,
+        isConfigured: () => true,
+        ping: async () => true,
+        listModels: async () => [],
+        async *chatStream(): AsyncGenerator<LLMChatChunk> {
+          yield {
+            message: {
+              role: "assistant",
+              content: "",
+              tool_calls: [
+                { id: "call_w1", function: { name: "write_1", arguments: {} } },
+                { id: "call_w2", function: { name: "write_2", arguments: {} } },
+              ],
+            },
+            done: true,
+          };
+        },
+      };
+
+      const events: any[] = [];
+      const emitter: CloudEmitter = {
+        onAssistantStart: () => {},
+        onDelta: () => {},
+        onContent: () => {},
+        onAssistantCancel: () => {},
+        onToolCall: (id, call) => events.push({ type: "call", call }),
+        onToolUpdate: (id, call) => events.push({ type: "update", call }),
+        onPhase: () => {},
+        onUsage: () => {},
+        onGenerationStats: () => {},
+        onDone: (id, notice) => events.push({ type: "done", notice }),
+        onError: () => {},
+      };
+
+      await runCloudTurn({
+        provider: mockProvider,
+        model: "gpt-4o",
+        system: "You are an assistant.",
+        history: [{ role: "user", content: "Run writes" }],
+        tools: [mockTool1, mockTool2],
+        contextWindow: 128_000,
+        ctx: { capability: "high", todos: [], signal: abortCtrl.signal, log: () => {} } as any,
+        emitter,
+        signal: abortCtrl.signal,
+      });
+
+      assert.ok(firstExecuted, "First tool executed");
+      assert.ok(!secondExecuted, "Second tool must NOT execute after abort");
+      const doneEvent = events.find((e) => e.type === "done");
+      assert.ok(doneEvent);
+      assert.equal(doneEvent.notice, "Stopped.");
+      // Second tool must be marked as error/cancelled
+      const call2Updates = events.filter((e) => e.type === "update" && e.call.id === "call_w2");
+      assert.ok(call2Updates.some((u) => u.call.status === "error" && u.call.error === "Operation cancelled."));
     });
   });
 });

@@ -15,77 +15,121 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>;
 }
 
+// OS-essential allowlists by platform to guarantee strict child process isolation
+const WINDOWS_ESSENTIAL_KEYS = new Set([
+  "SYSTEMROOT",
+  "SYSTEMDRIVE",
+  "WINDIR",
+  "PATH",
+  "PATHEXT",
+  "TEMP",
+  "TMP",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "PROGRAMDATA",
+  "USERPROFILE",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "COMSPEC",
+  "NUMBER_OF_PROCESSORS",
+  "PROCESSOR_ARCHITECTURE",
+  "PROCESSOR_IDENTIFIER",
+  "PROCESSOR_LEVEL",
+  "PROCESSOR_REVISION",
+  "OS",
+  "PROGRAMFILES",
+  "PROGRAMFILES(X86)",
+  "COMMONPROGRAMFILES",
+  "COMMONPROGRAMFILES(X86)",
+]);
+
+const MACOS_ESSENTIAL_KEYS = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TMPDIR",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LC_MESSAGES",
+  "TERM",
+  "TZ",
+  "HOSTNAME",
+  "XPC_FLAGS",
+  "XPC_SERVICE_NAME",
+]);
+
+const LINUX_ESSENTIAL_KEYS = new Set([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TMPDIR",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LC_MESSAGES",
+  "TERM",
+  "TZ",
+  "HOSTNAME",
+  "XDG_RUNTIME_DIR",
+]);
+
+function getAllowlistForPlatform(platform: NodeJS.Platform): Set<string> {
+  if (platform === "win32") return WINDOWS_ESSENTIAL_KEYS;
+  if (platform === "darwin") return MACOS_ESSENTIAL_KEYS;
+  return LINUX_ESSENTIAL_KEYS;
+}
+
+/**
+ * Validates environment variable key.
+ * Disallows empty keys, '=' (POSIX/Windows separator), and NUL bytes.
+ */
+function isValidEnvKey(key: string): boolean {
+  if (!key || key.includes("\0") || key.includes("=")) return false;
+  return /^[A-Za-z_][A-Za-z0-9_()]*$/.test(key);
+}
+
 /**
  * Constructs an isolated, sanitized environment for MCP child processes.
- * Prevents untrusted or third-party MCP servers from inspecting sensitive credentials
- * (API keys, GitHub tokens, cloud credentials) present in the extension host's process.env.
+ * Uses a strict platform-specific allowlist for OS essentials only.
+ * Disallows inheritance of NODE_OPTIONS, NODE_PATH, PYTHONPATH, PYTHONHOME,
+ * package-manager/cloud configs, and arbitrary user variables.
  */
 export function buildSafeMcpEnv(
   parentEnv: NodeJS.ProcessEnv = process.env,
-  customEnv?: Record<string, string>
+  customEnv?: Record<string, string>,
+  platform: NodeJS.Platform = process.platform
 ): NodeJS.ProcessEnv {
-  const allowedKeys = new Set([
-    // Windows system variables
-    "SYSTEMROOT",
-    "SYSTEMDRIVE",
-    "WINDIR",
-    "PATH",
-    "PATHEXT",
-    "TEMP",
-    "TMP",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "COMSPEC",
-    "NUMBER_OF_PROCESSORS",
-    "PROCESSOR_ARCHITECTURE",
-    "PROCESSOR_IDENTIFIER",
-    "OS",
-    "PROGRAMFILES",
-    "PROGRAMFILES(X86)",
-    "COMMONPROGRAMFILES",
-    "COMMONPROGRAMFILES(X86)",
-    // Unix/macOS environment variables
-    "HOME",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "TMPDIR",
-    "LANG",
-    "LC_ALL",
-    "TERM",
-    "HOSTNAME",
-    // Runtime essentials
-    "NODE_PATH",
-    "NODE_OPTIONS",
-    "NVM_BIN",
-    "VIRTUAL_ENV",
-    "PYTHONPATH",
-    "PYTHONHOME",
-  ]);
-
-  const sensitivePattern = /(key|secret|token|auth|pass|cred|private|bearer|jwt|gh_|github_|aws_|azure_|openai|anthropic|gemini|nvidia|groq|mistral|deepseek|together|cohere|voyage|ssh_)/i;
-
+  const allowlist = getAllowlistForPlatform(platform);
+  const isWindows = platform === "win32";
   const safeEnv: NodeJS.ProcessEnv = {};
 
   for (const [key, val] of Object.entries(parentEnv)) {
-    if (!val) continue;
-    const upper = key.toUpperCase();
-    if (allowedKeys.has(upper)) {
-      safeEnv[key] = val;
-    } else if (!sensitivePattern.test(upper)) {
+    if (typeof val !== "string" || val.includes("\0")) continue;
+    if (!isValidEnvKey(key)) continue;
+
+    const lookupKey = isWindows ? key.toUpperCase() : key;
+    if (allowlist.has(lookupKey)) {
       safeEnv[key] = val;
     }
   }
 
-  // Explicit user-specified environment variables for this server take precedence
+  // Explicit approved environment variables for this specific server take precedence
   if (customEnv) {
     for (const [k, v] of Object.entries(customEnv)) {
-      if (typeof v === "string") {
-        safeEnv[k] = v;
+      if (!isValidEnvKey(k)) {
+        throw new Error(`Invalid MCP environment variable name: "${k}"`);
       }
+      if (typeof v !== "string" || v.includes("\0")) {
+        throw new Error(
+          `Invalid MCP environment variable value for "${k}": contains NUL bytes or is not a string.`
+        );
+      }
+      safeEnv[k] = v;
     }
   }
 

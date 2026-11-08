@@ -150,6 +150,15 @@ export function RevertModal({
                     ))}
                   </div>
 
+                  {cp.hasUnrestorableFiles && cp.unrestorableFiles && cp.unrestorableFiles.length > 0 && (
+                    <div className="revert-unrestorable-notice" role="alert">
+                      <span className="unrestorable-icon">⚠️</span>
+                      <span>
+                        <strong>Partial rollback notice:</strong> {cp.unrestorableFiles.join(", ")} exceeded 2MB and cannot be reverted. Other files will be restored.
+                      </span>
+                    </div>
+                  )}
+
                   <div className="revert-checkpoint-actions">
                     <button
                       type="button"

@@ -5,8 +5,19 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { AgentEngine, type TurnEmitter } from "../../src/core/agent/engine";
 import { runCloudTurn, type CloudEmitter } from "../../src/core/agent/cloudEngine";
-import { classifyRuntimeError, formatNativeToolOutcome, sanitizeToolPairing } from "../../src/core/agent/errorRecovery";
-import { compactSessionMessages, shouldAutoCompact } from "../../src/core/agent/compactor";
+import {
+  classifyRuntimeError,
+  formatNativeToolOutcome,
+  sanitizeToolPairing,
+  extractRetryAfter,
+  shouldRetryStep,
+  waitWithBackoff,
+} from "../../src/core/agent/errorRecovery";
+import {
+  compactSessionMessages,
+  shouldAutoCompact,
+  extractStructuredCompactionData,
+} from "../../src/core/agent/compactor";
 import { ToolRegistry } from "../../src/core/tools/registry";
 import { builtinTools } from "../../src/core/tools/builtin";
 import { runCommandTool } from "../../src/core/tools/builtin/terminal";
@@ -779,6 +790,252 @@ describe("Consolidated Agent Runtime, Failure Recovery & Long Sessions (P1 Items
       assert.equal(state.selectedModel, "deepseek-coder:14b");
       assert.equal(state.config.autoSelectModel, false);
       assert.equal((state as any).autoSelectModel, undefined, "Root AppState must not have autoSelectModel");
+    });
+  });
+
+  describe("Phase 3.4: Error Recovery, Idempotency, Quota & Stream Invariants", () => {
+    it("never retries permanent quota, billing, or balance exhaustion failures", () => {
+      const quotaErrors = [
+        "You exceeded your current quota, please check your plan and billing details.",
+        "HTTP 429: insufficient_quota for this organization",
+        "HTTP 402 Payment Required: your balance is too low to complete this request",
+        "credit_balance_too_low: purchase additional credits to continue",
+        "spending limit reached for project",
+      ];
+
+      for (const errText of quotaErrors) {
+        const classified = classifyRuntimeError(errText);
+        assert.equal(
+          classified.retryable,
+          false,
+          `Quota error "${errText}" should not be retryable`
+        );
+        assert.equal(classified.backoffMs, 0);
+        assert.ok(
+          classified.userMessage.toLowerCase().includes("quota") ||
+            classified.userMessage.toLowerCase().includes("billing"),
+          `User message should explain quota failure: ${classified.userMessage}`
+        );
+      }
+    });
+
+    it("extracts Retry-After header and message text with bounded backoff", () => {
+      // 1. Header extraction (seconds)
+      const errWithHeader = {
+        message: "rate limit exceeded",
+        headers: { "retry-after": "5" },
+      };
+      const delayMs = extractRetryAfter(errWithHeader, errWithHeader.message);
+      assert.equal(delayMs, 5000);
+
+      // 2. Message extraction
+      const msgDelay = extractRetryAfter(null, "Rate limit reached. Please wait 12s before retrying.");
+      assert.equal(msgDelay, 12000);
+
+      // 3. Classification with Retry-After computes bounded backoff
+      const classified = classifyRuntimeError("Rate limit reached. Retry-After: 8");
+      assert.equal(classified.retryable, true);
+      assert.equal(classified.backoffMs, 8000);
+
+      // 4. Classification bounds excessive delay to 30,000ms max
+      const excessive = classifyRuntimeError("Rate limit reached. Retry-After: 3600");
+      assert.equal(excessive.backoffMs, 30000);
+    });
+
+    it("shouldRetryStep prohibits retries when side-effects occurred, content was emitted, or tools were queued", () => {
+      const transientError = classifyRuntimeError("HTTP 503 Service Unavailable");
+      assert.equal(transientError.retryable, true);
+
+      // Safe clean retry
+      const clean = shouldRetryStep(transientError, {
+        sideEffectsOccurred: false,
+        streamRetries: 0,
+        maxRetries: 2,
+        hasContent: false,
+        toolCallsCount: 0,
+      });
+      assert.equal(clean.shouldRetry, true);
+
+      // Prohibited: side effect occurred
+      const sideEffectRetry = shouldRetryStep(transientError, {
+        sideEffectsOccurred: true,
+        streamRetries: 0,
+        maxRetries: 2,
+        hasContent: false,
+        toolCallsCount: 0,
+      });
+      assert.equal(sideEffectRetry.shouldRetry, false);
+      assert.ok(sideEffectRetry.reason?.includes("Side effects"));
+
+      // Prohibited: content was emitted
+      const contentRetry = shouldRetryStep(transientError, {
+        sideEffectsOccurred: false,
+        streamRetries: 0,
+        maxRetries: 2,
+        hasContent: true,
+        toolCallsCount: 0,
+      });
+      assert.equal(contentRetry.shouldRetry, false);
+
+      // Prohibited: tool calls exist
+      const toolsRetry = shouldRetryStep(transientError, {
+        sideEffectsOccurred: false,
+        streamRetries: 0,
+        maxRetries: 2,
+        hasContent: false,
+        toolCallsCount: 1,
+      });
+      assert.equal(toolsRetry.shouldRetry, false);
+
+      // Prohibited: max retries reached
+      const maxRetried = shouldRetryStep(transientError, {
+        sideEffectsOccurred: false,
+        streamRetries: 2,
+        maxRetries: 2,
+        hasContent: false,
+        toolCallsCount: 0,
+      });
+      assert.equal(maxRetried.shouldRetry, false);
+    });
+
+    it("waitWithBackoff resolves immediately on cancellation signal without waiting out delay", async () => {
+      const ac = new AbortController();
+      const start = Date.now();
+
+      // Schedule abort in 25ms while backoff is 5000ms
+      setTimeout(() => ac.abort(), 25);
+      const res = await waitWithBackoff(5000, ac.signal);
+      const elapsed = Date.now() - start;
+
+      assert.equal(res, false, "Must return false on aborted signal");
+      assert.ok(elapsed < 500, `Should abort promptly, took ${elapsed}ms`);
+    });
+
+    it("sanitizeToolPairing drops orphaned tool responses and marks missing responses as unconfirmed errors", () => {
+      const messages: LLMMessage[] = [
+        // Orphaned tool response (no preceding assistant message)
+        {
+          role: "tool",
+          tool_call_id: "orphan-1",
+          name: "read_file",
+          content: "file content",
+        },
+        // Assistant message with 2 tool calls, but only 1 tool response
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            {
+              id: "tc-answered",
+              type: "function",
+              function: { name: "read_file", arguments: '{"path":"a.ts"}' },
+            },
+            {
+              id: "tc-missing",
+              type: "function",
+              function: { name: "write_file", arguments: '{"path":"b.ts","content":"hello"}' },
+            },
+            // Duplicate tool call ID
+            {
+              id: "tc-answered",
+              type: "function",
+              function: { name: "read_file", arguments: '{"path":"c.ts"}' },
+            },
+          ],
+        },
+        // Only one tool response provided
+        {
+          role: "tool",
+          tool_call_id: "tc-answered",
+          name: "read_file",
+          content: "export const a = 1;",
+        },
+      ];
+
+      const sanitized = sanitizeToolPairing(messages);
+
+      // 1. First message must NOT be the orphaned tool message
+      assert.equal(sanitized[0].role, "assistant");
+
+      // 2. Duplicate tool call ID in assistant message should be repaired with a unique ID
+      const assistantCalls = sanitized[0].tool_calls ?? [];
+      assert.equal(assistantCalls.length, 3);
+      const ids = assistantCalls.map((c) => c.id);
+      const uniqueIds = new Set(ids);
+      assert.equal(uniqueIds.size, 3, "All tool calls must have unique IDs");
+
+      // 3. Every assistant tool call must have a corresponding role: 'tool' message
+      const toolMsgs = sanitized.filter((m) => m.role === "tool");
+      assert.equal(toolMsgs.length, 3);
+
+      // 4. The missing tool response must be explicitly marked as unconfirmed/error, NOT assumed success
+      const missingOutcome = toolMsgs.find((m) => m.tool_call_id === "tc-missing");
+      assert.ok(missingOutcome, "Missing tool response must be synthesized");
+      assert.ok(missingOutcome.content.includes("[TOOL_ERROR"), "Missing outcome must be marked TOOL_ERROR");
+      assert.ok(missingOutcome.content.includes("NOT confirmed") || missingOutcome.content.includes("must NOT be assumed"));
+    });
+
+    it("compaction only marks confirmed successes as filesModified and preserves unconfirmed/failed tools as unresolved", () => {
+      const messages: ChatMessage[] = [
+        {
+          id: "m1",
+          role: "user",
+          content: "Modify workspace files",
+          createdAt: 1,
+        },
+        {
+          id: "m2",
+          role: "assistant",
+          content: "Executing operations",
+          createdAt: 2,
+          toolCalls: [
+            // Successful mutation
+            {
+              id: "tc-ok",
+              name: "edit_file",
+              args: { path: "src/success.ts", old_str: "1", new_str: "2" },
+              status: "done",
+              result: "Replaced 1 with 2",
+            },
+            // Proposed mutation (not yet approved or executed)
+            {
+              id: "tc-proposed",
+              name: "write_file",
+              args: { path: "src/proposed.ts", content: "data" },
+              status: "proposed",
+            },
+            // Denied mutation
+            {
+              id: "tc-denied",
+              name: "delete_file",
+              args: { path: "src/denied.ts" },
+              status: "denied",
+            },
+            // Failed mutation
+            {
+              id: "tc-err",
+              name: "append_file",
+              args: { path: "src/failed.ts", content: "more" },
+              status: "error",
+              error: "ENOENT: no such file",
+            },
+          ],
+        },
+      ];
+
+      const structured = extractStructuredCompactionData(messages);
+
+      // Only src/success.ts should be in filesModified
+      assert.equal(structured.filesModified.has("src/success.ts"), true);
+      assert.equal(structured.filesModified.has("src/proposed.ts"), false, "Proposed file must not be marked modified");
+      assert.equal(structured.filesModified.has("src/denied.ts"), false, "Denied file must not be marked modified");
+      assert.equal(structured.filesModified.has("src/failed.ts"), false, "Failed file must not be marked modified");
+
+      // The unconfirmed and failed operations must be in unresolvedItems
+      const unresolved = structured.unresolvedItems.join(" ");
+      assert.ok(unresolved.includes("proposed.ts") || unresolved.includes("not executed"));
+      assert.ok(unresolved.includes("denied.ts") || unresolved.includes("denied"));
+      assert.ok(unresolved.includes("failed.ts") || unresolved.includes("failed"));
     });
   });
 });

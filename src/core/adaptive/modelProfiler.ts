@@ -34,7 +34,9 @@ async function profileUncached(client: OllamaClient, tag: OllamaTagModel): Promi
   };
   let show: OllamaShowResponse | undefined;
   try { show = await client.showModel(tag.name); } catch { /* tag-only fallback */ }
-  base.contextLength = extractContextLength(show) ?? guessContextLength(base.family);
+  const extractedCtx = extractContextLength(show);
+  base.contextLength = extractedCtx ?? guessContextLength(base.family);
+  base.contextEstimated = extractedCtx === undefined;
   base.toolTrained = detectToolTrained(tag.name, show);
   base.vision = detectVision(tag.name, show);
   base.thinking = detectThinking(tag.name, show);
@@ -42,6 +44,8 @@ async function profileUncached(client: OllamaClient, tag: OllamaTagModel): Promi
   base.audio = detectAudio(tag.name, show);
   base.video = detectVideo(tag.name, show);
   base.capabilities = show?.capabilities?.slice() ?? [];
+  const hasExplicitSignals = Boolean(show?.capabilities?.length || show?.template || show?.model_info);
+  base.capabilitiesEstimated = !hasExplicitSignals;
   base.tier = classifyModel(base.paramsB);
   base.capabilityProfile = capabilityForModel(base);
   return base;

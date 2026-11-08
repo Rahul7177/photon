@@ -453,6 +453,7 @@ export function Composer({
   const [confirmInstallModel, setConfirmInstallModel] = useState<string | null>(null);
   const [slashIndex, setSlashIndex] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -493,6 +494,9 @@ export function Composer({
   const showSlashMenu = filteredSlash.length > 0;
 
   const busy = state.status === "thinking" || state.status === "running";
+  useEffect(() => {
+    if (!busy) setStopping(false);
+  }, [busy]);
   const canSend = (text.trim().length > 0 || attachments.length > 0) && !!state.selectedModel && !busy;
   const model = state.models.find((m) => m.name === state.selectedModel);
   const supportsVision = model?.vision === true;
@@ -906,10 +910,14 @@ export function Composer({
             {busy ? (
               <button
                 type="button"
-                className="send-btn stop"
-                title="Stop generation"
-                aria-label="Stop generation"
-                onClick={actions.cancel}
+                className={`send-btn stop${stopping ? " stopping" : ""}`}
+                title={stopping ? "Stopping…" : "Stop generation"}
+                aria-label={stopping ? "Stopping generation" : "Stop generation"}
+                disabled={stopping}
+                onClick={() => {
+                  setStopping(true);
+                  actions.cancel();
+                }}
               >
                 <StopSquareIcon />
               </button>

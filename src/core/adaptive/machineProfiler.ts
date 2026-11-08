@@ -1,9 +1,18 @@
 import * as os from "node:os";
+import * as fs from "node:fs";
 import { exec } from "node:child_process";
 import { promisify } from "node:util";
 import type { HardwareMetrics, MachineProfile } from "../../shared/types";
 
 const execAsync = promisify(exec);
+
+let cachedGpu: MachineProfile["gpu"] | undefined;
+let cachedGpuTime = 0;
+const GPU_CACHE_TTL = 30_000;
+
+let lastHardwareSample: HardwareMetrics | undefined;
+let lastHardwareSampleTime = 0;
+const SAMPLE_TTL = 1000;
 
 /**
  * Profile the host machine. RAM/CPU come from `os`; GPU is best-effort via a
@@ -39,6 +48,11 @@ export async function profileMachine(): Promise<MachineProfile> {
 export async function sampleHardwareMetrics(
   fallbackGpu?: MachineProfile["gpu"]
 ): Promise<HardwareMetrics> {
+  const now = Date.now();
+  if (lastHardwareSample && now - lastHardwareSampleTime < SAMPLE_TTL) {
+    return { ...lastHardwareSample };
+  }
+
   const ramTotalBytes = os.totalmem();
   const ramFreeBytes = os.freemem();
   const ramUsedBytes = Math.max(0, ramTotalBytes - ramFreeBytes);
@@ -76,7 +90,7 @@ export async function sampleHardwareMetrics(
     // Non-NVIDIA or nvidia-smi unavailable — fall back gracefully to fallbackGpu + RAM metrics
   }
 
-  return {
+  const sample: HardwareMetrics = {
     gpuName,
     gpuUtilPercent,
     vramUsedBytes,
@@ -87,11 +101,14 @@ export async function sampleHardwareMetrics(
     ramTotalBytes,
     ramFreeBytes,
     ramUsedPercent,
-    updatedAt: Date.now(),
+    updatedAt: now,
   };
+  lastHardwareSample = sample;
+  lastHardwareSampleTime = now;
+  return sample;
 }
 
-function classifyMachine(
+export function classifyMachine(
   totalRamBytes: number,
   vramBytes?: number
 ): MachineProfile["tier"] {
@@ -102,32 +119,37 @@ function classifyMachine(
   return "low";
 }
 
-async function detectGpu(
+export async function detectGpu(
   platform: NodeJS.Platform
 ): Promise<MachineProfile["gpu"]> {
+  const now = Date.now();
+  if (cachedGpu && now - cachedGpuTime < GPU_CACHE_TTL) {
+    return cachedGpu;
+  }
+
   try {
     // nvidia-smi works on any OS where the driver is installed and reports
     // exact VRAM — always prefer it when present.
     const nvidia = await detectNvidiaGpu().catch(() => undefined);
-    if (nvidia) return nvidia;
+    if (nvidia) {
+      cachedGpu = nvidia;
+      cachedGpuTime = now;
+      return nvidia;
+    }
 
+    let detected: MachineProfile["gpu"] | undefined;
     if (platform === "win32") {
-      return await detectWindowsGpu();
+      detected = await detectWindowsGpu();
     } else if (platform === "darwin") {
-      const { stdout } = await execAsync(
-        "system_profiler SPDisplaysDataType 2>/dev/null",
-        { timeout: 5000 }
-      );
-      const nameMatch = stdout.match(/Chipset Model:\s*(.+)/);
-      const vramMatch = stdout.match(/VRAM.*?:\s*(\d+)\s*(MB|GB)/i);
-      if (nameMatch) {
-        let vramBytes: number | undefined;
-        if (vramMatch) {
-          const n = parseInt(vramMatch[1], 10);
-          vramBytes = vramMatch[2].toUpperCase() === "GB" ? n * 1024 ** 3 : n * 1024 ** 2;
-        }
-        return { name: nameMatch[1].trim(), vramBytes, vendor: guessVendor(nameMatch[1]) };
-      }
+      detected = await detectDarwinGpu();
+    } else if (platform === "linux") {
+      detected = await detectLinuxGpu();
+    }
+
+    if (detected) {
+      cachedGpu = detected;
+      cachedGpuTime = now;
+      return detected;
     }
   } catch {
     // Ignore — GPU detection is a nicety, not a requirement.
@@ -148,6 +170,32 @@ async function detectNvidiaGpu(): Promise<MachineProfile["gpu"] | undefined> {
     vramBytes: memMb && /^\d+$/.test(memMb) ? parseInt(memMb, 10) * 1024 ** 2 : undefined,
     vendor: "nvidia",
   };
+}
+
+async function detectDarwinGpu(): Promise<MachineProfile["gpu"] | undefined> {
+  const { stdout } = await execAsync(
+    "system_profiler SPDisplaysDataType 2>/dev/null",
+    { timeout: 5000 }
+  );
+  const nameMatch = stdout.match(/Chipset Model:\s*(.+)/);
+  const vramMatch = stdout.match(/VRAM.*?:\s*(\d+)\s*(MB|GB)/i);
+  if (nameMatch) {
+    const name = nameMatch[1].trim();
+    const vendor = guessVendor(name);
+    let vramBytes: number | undefined;
+    let isUnifiedMemory = false;
+
+    if (vramMatch) {
+      const n = parseInt(vramMatch[1], 10);
+      vramBytes = vramMatch[2].toUpperCase() === "GB" ? n * 1024 ** 3 : n * 1024 ** 2;
+    } else if (vendor === "apple") {
+      // Apple Silicon unified memory: ~65% of total system RAM is addressable by GPU
+      isUnifiedMemory = true;
+      vramBytes = Math.floor(os.totalmem() * 0.65);
+    }
+    return { name, vramBytes, vendor, isUnifiedMemory };
+  }
+  return undefined;
 }
 
 /**
@@ -191,10 +239,50 @@ async function detectWindowsGpu(): Promise<MachineProfile["gpu"] | undefined> {
       vramBytes = qword;
     }
   }
-  return { name, vramBytes, vendor: guessVendor(name) };
+
+  const vendor = guessVendor(name);
+  const isIntegrated = (vramBytes === undefined || vramBytes <= 512 * 1024 ** 2) && (vendor === "intel" || /integrated|uhd|iris/i.test(name));
+  const sharedMemoryBytes = isIntegrated ? Math.floor(os.totalmem() * 0.5) : undefined;
+
+  return { name, vramBytes, vendor, isIntegrated, sharedMemoryBytes };
 }
 
-function guessVendor(name: string): string | undefined {
+async function detectLinuxGpu(): Promise<MachineProfile["gpu"] | undefined> {
+  // 1. Check /sys/class/drm for dedicated VRAM info (instant without child process)
+  try {
+    const cards = fs.readdirSync("/sys/class/drm");
+    for (const card of cards) {
+      if (/^card\d+$/.test(card)) {
+        const vramPath = `/sys/class/drm/${card}/device/mem_info_vram_total`;
+        if (fs.existsSync(vramPath)) {
+          const raw = fs.readFileSync(vramPath, "utf8").trim();
+          const bytes = parseInt(raw, 10);
+          if (Number.isFinite(bytes) && bytes > 256 * 1024 ** 2) {
+            return { name: `Linux DRM (${card})`, vramBytes: bytes, vendor: "amd" };
+          }
+        }
+      }
+    }
+  } catch {
+    /* /sys/class/drm unavailable or permission restricted */
+  }
+
+  // 2. Check lspci
+  try {
+    const { stdout } = await execAsync("lspci -nn | grep -E -i 'vga|3d|display'", { timeout: 3000 });
+    const line = stdout.trim().split("\n")[0];
+    if (line) {
+      const vendor = guessVendor(line);
+      return { name: line.replace(/^[0-9a-f:.]+\s+/, "").trim(), vendor };
+    }
+  } catch {
+    /* lspci unavailable */
+  }
+
+  return undefined;
+}
+
+export function guessVendor(name: string): string | undefined {
   const n = name.toLowerCase();
   if (n.includes("nvidia") || n.includes("geforce") || n.includes("rtx") || n.includes("gtx")) return "nvidia";
   if (n.includes("amd") || n.includes("radeon")) return "amd";

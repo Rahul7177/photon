@@ -15,7 +15,11 @@ export class ProviderManager implements LLMProvider {
   constructor(private providers: LLMProvider[]) {}
 
   setProviders(providers: LLMProvider[]): void {
-    this.providers = providers;
+    if (!providers || providers.length === 0) {
+      // Never wipe out active working providers on an empty or failed refresh
+      return;
+    }
+    this.providers = [...providers];
   }
 
   /** Set the current user-selected reasoning level. `auto` means no override. */

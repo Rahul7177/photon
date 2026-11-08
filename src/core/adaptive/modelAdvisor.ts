@@ -1,6 +1,7 @@
 import {
   isLocalModel,
   matchInstalledModelName,
+  type BenchResult,
   type FitAssessment,
   type HardwareSummary,
   type InstalledModelEvaluation,
@@ -36,15 +37,96 @@ export interface CatalogModel {
 
 /** Curated, tested local models (checklist 3.2). */
 export const MODEL_CATALOG: CatalogModel[] = [
-  { name: "qwen2.5-coder:1.5b", label: "Qwen2.5 Coder 1.5B", sizeGb: 1.0, kvGbPer1k: 0.03, tier: "light", capabilities: ["coding", "autocomplete"], rank: { coding: 30, autocomplete: 80 }, blurb: "Fast autocompletions & small edits." },
-  { name: "qwen2.5-coder:3b", label: "Qwen2.5 Coder 3B", sizeGb: 1.9, kvGbPer1k: 0.04, tier: "light", capabilities: ["coding", "autocomplete"], rank: { coding: 45, autocomplete: 70 }, blurb: "Solid syntax and single-file code assistant." },
-  { name: "gemma4:e2b", label: "Gemma 4 E2B", sizeGb: 2.2, kvGbPer1k: 0.04, tier: "light", capabilities: ["coding", "reasoning", "multimodal"], rank: { coding: 40, reasoning: 40, multimodal: 55 }, blurb: "Compact reasoning & multimodal understanding." },
-  { name: "qwen2.5-coder:7b", label: "Qwen2.5 Coder 7B", sizeGb: 4.7, kvGbPer1k: 0.06, tier: "sweet", capabilities: ["coding", "autocomplete"], rank: { coding: 70, autocomplete: 50 }, blurb: "State-of-the-art coding, reliable native tool calling, fast on consumer GPUs." },
-  { name: "gemma4:e4b", label: "Gemma 4 E4B", sizeGb: 3.5, kvGbPer1k: 0.05, tier: "sweet", capabilities: ["coding", "reasoning", "multimodal"], rank: { coding: 55, reasoning: 55, multimodal: 70 }, blurb: "Multimodal, fast reasoning, fits comfortably in 4–6GB VRAM." },
-  { name: "deepseek-r1:8b", label: "DeepSeek R1 8B", sizeGb: 4.9, kvGbPer1k: 0.07, tier: "sweet", capabilities: ["reasoning", "coding"], rank: { reasoning: 75, coding: 62 }, blurb: "Deep reasoning and complex bug diagnosis." },
-  { name: "qwen2.5-coder:14b", label: "Qwen2.5 Coder 14B", sizeGb: 9.0, kvGbPer1k: 0.12, tier: "high", capabilities: ["coding"], rank: { coding: 80 }, blurb: "Near frontier-level coding accuracy." },
-  { name: "qwen2.5-coder:32b", label: "Qwen2.5 Coder 32B", sizeGb: 20.0, kvGbPer1k: 0.25, tier: "high", capabilities: ["coding"], rank: { coding: 90 }, blurb: "Full codebase architecture refactoring." },
-  { name: "command-r:35b", label: "Command R 35B", sizeGb: 21.0, kvGbPer1k: 0.25, tier: "high", capabilities: ["coding", "reasoning"], rank: { coding: 65, reasoning: 70 }, blurb: "128k-context agentic powerhouse." },
+  {
+    name: "qwen2.5-coder:1.5b",
+    label: "Qwen2.5 Coder 1.5B",
+    sizeGb: 1.0,
+    kvGbPer1k: 0.03,
+    tier: "light",
+    capabilities: ["coding", "autocomplete"],
+    rank: { coding: 30, autocomplete: 80 },
+    blurb: "Fast autocompletions & small edits.",
+  },
+  {
+    name: "qwen2.5-coder:3b",
+    label: "Qwen2.5 Coder 3B",
+    sizeGb: 1.9,
+    kvGbPer1k: 0.04,
+    tier: "light",
+    capabilities: ["coding", "autocomplete"],
+    rank: { coding: 45, autocomplete: 70 },
+    blurb: "Solid syntax and single-file code assistant.",
+  },
+  {
+    name: "gemma4:e2b",
+    label: "Gemma 4 E2B",
+    sizeGb: 2.2,
+    kvGbPer1k: 0.04,
+    tier: "light",
+    capabilities: ["coding", "reasoning", "multimodal"],
+    rank: { coding: 40, reasoning: 40, multimodal: 55 },
+    blurb: "Compact reasoning & multimodal understanding.",
+  },
+  {
+    name: "qwen2.5-coder:7b",
+    label: "Qwen2.5 Coder 7B",
+    sizeGb: 4.7,
+    kvGbPer1k: 0.06,
+    tier: "sweet",
+    capabilities: ["coding", "autocomplete"],
+    rank: { coding: 70, autocomplete: 50 },
+    blurb: "State-of-the-art coding, reliable native tool calling, fast on consumer GPUs.",
+  },
+  {
+    name: "gemma4:e4b",
+    label: "Gemma 4 E4B",
+    sizeGb: 3.5,
+    kvGbPer1k: 0.05,
+    tier: "sweet",
+    capabilities: ["coding", "reasoning", "multimodal"],
+    rank: { coding: 55, reasoning: 55, multimodal: 70 },
+    blurb: "Multimodal, fast reasoning, fits comfortably in 4–6GB VRAM.",
+  },
+  {
+    name: "deepseek-r1:8b",
+    label: "DeepSeek R1 8B",
+    sizeGb: 4.9,
+    kvGbPer1k: 0.07,
+    tier: "sweet",
+    capabilities: ["reasoning", "coding"],
+    rank: { reasoning: 75, coding: 62 },
+    blurb: "Deep reasoning and complex bug diagnosis.",
+  },
+  {
+    name: "qwen2.5-coder:14b",
+    label: "Qwen2.5 Coder 14B",
+    sizeGb: 9.0,
+    kvGbPer1k: 0.12,
+    tier: "high",
+    capabilities: ["coding"],
+    rank: { coding: 80 },
+    blurb: "Near frontier-level coding accuracy.",
+  },
+  {
+    name: "qwen2.5-coder:32b",
+    label: "Qwen2.5 Coder 32B",
+    sizeGb: 20.0,
+    kvGbPer1k: 0.25,
+    tier: "high",
+    capabilities: ["coding"],
+    rank: { coding: 90 },
+    blurb: "Full codebase architecture refactoring.",
+  },
+  {
+    name: "command-r:35b",
+    label: "Command R 35B",
+    sizeGb: 21.0,
+    kvGbPer1k: 0.25,
+    tier: "high",
+    capabilities: ["coding", "reasoning"],
+    rank: { coding: 65, reasoning: 70 },
+    blurb: "128k-context agentic powerhouse.",
+  },
 ];
 
 export interface HardwareInput {
@@ -103,10 +185,79 @@ function round(n: number): number {
 
 function shortGpuName(name?: string): string {
   if (!name) return "GPU";
-  return name.replace(/^NVIDIA\s+/i, "").replace(/GeForce\s+/i, "").replace(/\s+with Max-Q Design$/i, "").replace(/\s+(Laptop GPU|Max-Q)$/i, "").trim() || "GPU";
+  return (
+    name
+      .replace(/^NVIDIA\s+/i, "")
+      .replace(/GeForce\s+/i, "")
+      .replace(/\s+with Max-Q Design$/i, "")
+      .replace(/\s+(Laptop GPU|Max-Q)$/i, "")
+      .trim() || "GPU"
+  );
 }
 
 const fmtGb = (n: number) => (Math.round(n * 10) / 10).toString();
+
+/**
+ * Finds a matching, compatible, and unexpired benchmark result for a model.
+ * Matches by exact model name or base name, checks methodology version,
+ * verifies positive throughput, and validates hardware tier compatibility.
+ */
+export function findMatchingBenchmark(
+  modelName: string,
+  benchmarks: Map<string, BenchResult> | Record<string, BenchResult> | BenchResult[] | undefined,
+  hw?: HardwareInput
+): BenchResult | undefined {
+  if (!benchmarks) return undefined;
+
+  let benchList: BenchResult[];
+  if (benchmarks instanceof Map) {
+    benchList = Array.from(benchmarks.values());
+  } else if (Array.isArray(benchmarks)) {
+    benchList = benchmarks;
+  } else {
+    benchList = Object.values(benchmarks);
+  }
+
+  const normTarget = modelName.toLowerCase().replace(/^(ollama|llamacpp):/i, "");
+  const baseTarget = normTarget.split(":")[0];
+
+  const match = benchList.find((b) => {
+    const bModel = b.model.toLowerCase().replace(/^(ollama|llamacpp):/i, "");
+    return bModel === normTarget || bModel.split(":")[0] === baseTarget;
+  });
+
+  if (!match) return undefined;
+
+  // 1. Reject stale benchmarks older than 30 days
+  const MAX_BENCH_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+  if (match.ranAt && Date.now() - match.ranAt > MAX_BENCH_AGE_MS) {
+    return undefined;
+  }
+
+  // 2. Reject benchmarks with invalid methodology version (< 1)
+  if (typeof match.methodologyVersion === "number" && match.methodologyVersion < 1) {
+    return undefined;
+  }
+
+  // 3. Reject benchmarks with non-positive throughput
+  if (
+    typeof match.tokensPerSec !== "number" ||
+    match.tokensPerSec <= 0 ||
+    !Number.isFinite(match.tokensPerSec)
+  ) {
+    return undefined;
+  }
+
+  // 4. Hardware compatibility check if hardware summary is provided
+  if (hw && match.hardwareClass) {
+    const currentTier = hardwareTier(hw);
+    if (match.hardwareClass !== currentTier && match.hardwareClass !== "unknown") {
+      return undefined;
+    }
+  }
+
+  return match;
+}
 
 export function assessFit(
   model: Pick<CatalogModel, "sizeGb" | "kvGbPer1k">,
@@ -114,11 +265,25 @@ export function assessFit(
   ctxTokens = DEFAULT_CONTEXT_TOKENS,
   measuredBenchTps?: number
 ): FitAssessment {
-  const required = memoryRequiredGb(model, ctxTokens);
-  // Consider current free RAM vs total RAM safety buffer to prevent disk thrashing under pressure
+  const RUNTIME_OVERHEAD_GB = 0.4;
+  const required = memoryRequiredGb(model, ctxTokens) + RUNTIME_OVERHEAD_GB;
+
+  // Reconcile total/free RAM, safety reserve, VRAM, weights, KV cache, and runtime overhead:
+  // 1. Nominal usable RAM based on safety reserve:
   const nominalUsableRam = Math.max(0, hw.totalRamGb - hw.ramBufferGb);
-  const isCriticalRam = hw.freeRamGb > 0 && hw.freeRamGb < 1.5 && hw.freeRamGb < nominalUsableRam * 0.35;
-  const usableRam = isCriticalRam ? Math.max(hw.freeRamGb, 1.0) : nominalUsableRam;
+
+  // 2. Usable RAM bounded by actual free RAM under pressure:
+  // If free RAM indicates memory pressure, bound usable RAM to avoid heavy disk swapping.
+  let usableRam = nominalUsableRam;
+  let isPressure = false;
+  if (hw.freeRamGb > 0) {
+    const freeWithMargin = Math.max(0, hw.freeRamGb - Math.min(2.0, hw.totalRamGb * 0.08));
+    if (freeWithMargin < nominalUsableRam) {
+      usableRam = Math.max(0.5, freeWithMargin);
+      isPressure = true;
+    }
+  }
+
   const usableVram = Math.max(0, hw.vramGb - VRAM_RESERVE_GB);
   const hasGpu = usableVram > 0;
   const gpuBw = hw.unifiedMemory ? APPLE_BW : GPU_BW;
@@ -126,10 +291,10 @@ export function assessFit(
 
   const hasBench = typeof measuredBenchTps === "number" && measuredBenchTps > 0;
 
-  // 100% GPU resident.
+  // 100% GPU resident
   if (hasGpu && required <= usableVram) {
     const tok = hasBench ? Math.round(measuredBenchTps) : Math.min(120, round(gpuBw / model.sizeGb));
-    const speedLabel = hasBench ? `${tok} tok/s bench` : `~${tok} tok/s`;
+    const speedLabel = hasBench ? `${tok} tok/s (measured benchmark)` : `~${tok} tok/s (estimated)`;
     return {
       ...base,
       mode: "gpu",
@@ -138,18 +303,21 @@ export function assessFit(
       ramGb: 0,
       tokPerSec: tok,
       isEstimate: !hasBench,
-      label: `Fits 100% in your ${shortGpuName(hw.gpuName)} ${hw.unifiedMemory ? "unified memory" : "VRAM"} (${speedLabel})`,
+      label: `Fits 100% in your ${shortGpuName(hw.gpuName)} ${
+        hw.unifiedMemory ? "unified memory" : "VRAM"
+      } (${speedLabel})`,
     };
   }
 
-  // Hybrid GPU+RAM (weights spill into RAM but stay out of the OS buffer).
+  // Hybrid GPU+RAM (weights spill into RAM)
   if (hasGpu && required <= usableVram + usableRam) {
     const gpuPart = usableVram;
     const ramPart = required - gpuPart;
     const frac = Math.min(1, gpuPart / required);
     const secPerToken = (frac * model.sizeGb) / gpuBw + ((1 - frac) * model.sizeGb) / RAM_BW;
     const tok = hasBench ? Math.round(measuredBenchTps) : round(1 / secPerToken);
-    const speedLabel = hasBench ? `${tok} tok/s bench` : `~${tok} tok/s`;
+    const speedLabel = hasBench ? `${tok} tok/s (measured benchmark)` : `~${tok} tok/s (estimated)`;
+    const pressureNote = isPressure ? " — note: free RAM is currently tight" : "";
     return {
       ...base,
       mode: "hybrid",
@@ -158,15 +326,18 @@ export function assessFit(
       ramGb: round1(ramPart),
       tokPerSec: tok,
       isEstimate: !hasBench,
-      label: `Hybrid GPU+RAM: ${fmtGb(gpuPart)}GB in VRAM, ${fmtGb(ramPart)}GB in RAM (${speedLabel})`,
+      label: `Hybrid GPU+RAM: ${fmtGb(gpuPart)}GB VRAM + ${fmtGb(ramPart)}GB RAM (${speedLabel})${pressureNote}`,
     };
   }
 
-  // CPU only.
+  // CPU only
   if (!hasGpu && required <= usableRam) {
     const scale = Math.min(1, hw.cpuCores / 8);
-    const tok = hasBench ? Math.round(measuredBenchTps) : round((RAM_BW / model.sizeGb) * Math.max(0.4, scale));
-    const speedLabel = hasBench ? `${tok} tok/s bench` : `~${tok} tok/s`;
+    const tok = hasBench
+      ? Math.round(measuredBenchTps)
+      : round((RAM_BW / model.sizeGb) * Math.max(0.4, scale));
+    const speedLabel = hasBench ? `${tok} tok/s (measured benchmark)` : `~${tok} tok/s (estimated)`;
+    const pressureNote = isPressure ? " — note: free RAM is currently tight" : "";
     return {
       ...base,
       mode: "cpu",
@@ -175,7 +346,7 @@ export function assessFit(
       ramGb: round1(required),
       tokPerSec: tok,
       isEstimate: !hasBench,
-      label: `CPU-only: runs in system RAM (${speedLabel})`,
+      label: `CPU-only: runs in system RAM (${speedLabel})${pressureNote}`,
     };
   }
 
@@ -186,9 +357,9 @@ export function assessFit(
     gpuGb: 0,
     ramGb: 0,
     isEstimate: true,
-    label: isCriticalRam
-      ? "Exceeds safe memory: low free RAM on system"
-      : "Exceeds safe memory: heavy disk swap risk",
+    label: isPressure
+      ? `Exceeds safe memory: requires ${fmtGb(required)}GB, but only ${fmtGb(hw.freeRamGb)}GB RAM currently free`
+      : `Exceeds safe memory: requires ${fmtGb(required)}GB (heavy disk swap risk)`,
   };
 }
 
@@ -200,9 +371,10 @@ const MODE_SCORE: Record<FitAssessment["mode"], number> = { gpu: 3, hybrid: 2, c
 
 export function summarizeHardware(hw: HardwareInput): HardwareSummary {
   const tier = hardwareTier(hw);
-  const gpuLabel = hw.vramGb > 0
-    ? `${Math.round(hw.vramGb)}GB ${hw.unifiedMemory ? "unified memory" : shortGpuName(hw.gpuName)}`
-    : "no dedicated GPU";
+  const gpuLabel =
+    hw.vramGb > 0
+      ? `${Math.round(hw.vramGb)}GB ${hw.unifiedMemory ? "unified memory" : shortGpuName(hw.gpuName)}`
+      : "no dedicated GPU";
   return {
     totalRamGb: round1(hw.totalRamGb),
     freeRamGb: round1(hw.freeRamGb),
@@ -223,6 +395,8 @@ export interface RecommendOptions {
   installed?: string[];
   /** Full ModelInfo list for installed models to evaluate arbitrary local models. */
   installedModels?: ModelInfo[];
+  /** Benchmark results by model name to supply measured tokens/sec and tool reliability. */
+  benchmarks?: Map<string, BenchResult> | Record<string, BenchResult> | BenchResult[];
 }
 
 function inferModelMetadata(m: ModelInfo): {
@@ -233,10 +407,7 @@ function inferModelMetadata(m: ModelInfo): {
   rank: Record<ModelCapability, number>;
 } {
   const catalogMatch = MODEL_CATALOG.find((c) => matchInstalledModelName(c.name, [m.name]) !== undefined);
-  const actualSizeGb =
-    m.sizeBytes && m.sizeBytes > 0
-      ? round1(m.sizeBytes / GB)
-      : undefined;
+  const actualSizeGb = m.sizeBytes && m.sizeBytes > 0 ? round1(m.sizeBytes / GB) : undefined;
 
   if (catalogMatch) {
     const sizeGb = actualSizeGb ?? catalogMatch.sizeGb;
@@ -255,14 +426,16 @@ function inferModelMetadata(m: ModelInfo): {
   }
 
   const lower = m.name.toLowerCase();
-  const paramMatch = lower.match(/[:\-_]([a-z]?\d+(?:\.\d+)?)b\b/i) ?? lower.match(/(\d+(?:\.\d+)?)b/i);
+  const paramMatch =
+    lower.match(/[:\-_]([a-z]?\d+(?:\.\d+)?)b\b/i) ?? lower.match(/(\d+(?:\.\d+)?)b/i);
   const paramB = paramMatch ? parseFloat(paramMatch[1].replace(/^[a-z]/i, "")) : 7;
   const sizeGb = actualSizeGb ?? round1(Math.max(0.8, paramB * 0.65));
   const kvGbPer1k = round1(Math.max(0.03, sizeGb * 0.013));
 
   const isCoder = /coder|codellama|starcoder|codestral|devstral|qwen2\.5-coder/i.test(lower);
   const isReasoning = /deepseek-r1|qwq|reason|think|o1|r1/i.test(lower);
-  const isVision = Boolean(m.vision) || /vl|vision|llava|moondream|minicpm-v|gemma3|gemma4|pixtral/i.test(lower);
+  const isVision =
+    Boolean(m.vision) || /vl|vision|llava|moondream|minicpm-v|gemma3|gemma4|pixtral/i.test(lower);
   const isSmallFast = paramB <= 3.5;
 
   const capabilities: ModelCapability[] = ["coding"];
@@ -295,7 +468,8 @@ export function evaluateInstalledLocalModels(
   models: ModelInfo[],
   machine: MachineProfile | null | undefined,
   goal: ModelCapability = "coding",
-  ctxTokens = DEFAULT_CONTEXT_TOKENS
+  ctxTokens = DEFAULT_CONTEXT_TOKENS,
+  benchmarks?: Map<string, BenchResult> | Record<string, BenchResult> | BenchResult[]
 ): InstalledModelEvaluation[] {
   const hw = hardwareFromProfile(machine);
   const localModels = models.filter((m) => isLocalModel(m));
@@ -303,7 +477,13 @@ export function evaluateInstalledLocalModels(
 
   const evals: InstalledModelEvaluation[] = localModels.map((m) => {
     const meta = inferModelMetadata(m);
-    const fit = assessFit({ sizeGb: meta.sizeGb, kvGbPer1k: meta.kvGbPer1k }, hw, ctxTokens);
+    const bench = findMatchingBenchmark(m.name, benchmarks, hw);
+    const fit = assessFit(
+      { sizeGb: meta.sizeGb, kvGbPer1k: meta.kvGbPer1k },
+      hw,
+      ctxTokens,
+      bench?.tokensPerSec
+    );
     const quality = meta.rank[goal] ?? 50;
     return {
       name: m.name,
@@ -336,7 +516,9 @@ export function evaluateInstalledLocalModels(
     }
   }
   if (!pick && evals.length > 0) {
-    pick = [...evals].sort((a, b) => MODE_SCORE[b.fit.mode] - MODE_SCORE[a.fit.mode] || b.quality - a.quality)[0];
+    pick = [...evals].sort(
+      (a, b) => MODE_SCORE[b.fit.mode] - MODE_SCORE[a.fit.mode] || b.quality - a.quality
+    )[0];
   }
 
   if (pick) {
@@ -345,10 +527,10 @@ export function evaluateInstalledLocalModels(
       goal === "coding"
         ? "coding & tool use"
         : goal === "reasoning"
-          ? "deep reasoning"
-          : goal === "multimodal"
-            ? "vision & multimodal"
-            : "fast autocomplete";
+        ? "deep reasoning"
+        : goal === "multimodal"
+        ? "vision & multimodal"
+        : "fast autocomplete";
     pick.reason = `Best installed model for ${capLabel} on your hardware (${pick.fit.label})`;
   }
 
@@ -375,10 +557,12 @@ export function recommendModels(
   const hw = hardwareFromProfile(machine);
   const ctx = opts.ctxTokens ?? DEFAULT_CONTEXT_TOKENS;
   const goal = opts.goal ?? "coding";
-  const installedList = opts.installed ?? (opts.installedModels ? opts.installedModels.map((m) => m.name) : []);
+  const installedList =
+    opts.installed ?? (opts.installedModels ? opts.installedModels.map((m) => m.name) : []);
 
   const rows: ModelRecommendation[] = MODEL_CATALOG.map((m) => {
-    const fit = assessFit(m, hw, ctx);
+    const bench = findMatchingBenchmark(m.name, opts.benchmarks, hw);
+    const fit = assessFit(m, hw, ctx, bench?.tokensPerSec);
     const matchedName = matchInstalledModelName(m.name, installedList);
     return {
       name: m.name,
@@ -422,7 +606,13 @@ export function recommendModels(
 
   const syntheticModels: ModelInfo[] =
     opts.installedModels ?? installedList.map((name) => ({ name, provider: "ollama" }));
-  const evaluatedInstalled = evaluateInstalledLocalModels(syntheticModels, machine, goal, ctx);
+  const evaluatedInstalled = evaluateInstalledLocalModels(
+    syntheticModels,
+    machine,
+    goal,
+    ctx,
+    opts.benchmarks
+  );
   const bestInstalled = evaluatedInstalled.find((e) => e.recommended);
 
   const best = pick;

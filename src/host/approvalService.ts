@@ -3,10 +3,13 @@ import type { McpServerConfig } from "../core/tools/mcp/bridge";
 
 /**
  * Manages tool execution approval lifecycles, auto-approve state, and MCP configuration parsing.
+ * Enforces fail-closed rules: critical/destructive commands can NEVER bypass confirmation
+ * through general auto-approve.
  */
 export class ApprovalService {
   private pendingApprovals = new Map<string, (approved: boolean) => void>();
   private sessionApprovedToolNames = new Set<string>();
+  private approvedCallIds = new Set<string>();
   private userConfiguredAutoApprove = false;
   private sessionAutoApprove = false;
 
@@ -45,16 +48,28 @@ export class ApprovalService {
     return this.pendingApprovals.size;
   }
 
-  /** Request user approval for a side-effecting tool call. */
+  /**
+   * Request user approval for a tool call.
+   * Critical and destructive actions (such as high-risk shell commands or file removals)
+   * can NEVER bypass confirmation through general auto-approve.
+   */
   requestApproval(
     call: ToolCall,
     onPostRequest: (call: ToolCall) => void
   ): Promise<boolean> {
+    if (call.id && this.approvedCallIds.has(call.id)) {
+      return Promise.resolve(true);
+    }
+
+    const isCritical = call.risk === "critical" || call.risk === "destructive";
+
     if (
-      this.autoApprove ||
-      !call.sideEffecting ||
-      this.sessionApprovedToolNames.has(call.name)
+      !isCritical &&
+      (this.autoApprove ||
+        !call.sideEffecting ||
+        this.sessionApprovedToolNames.has(call.name))
     ) {
+      if (call.id) this.approvedCallIds.add(call.id);
       return Promise.resolve(true);
     }
     return new Promise<boolean>((resolve) => {
@@ -76,8 +91,13 @@ export class ApprovalService {
     }
     this.pendingApprovals.delete(callId);
     let autoApproveChanged = false;
+    if (approved) {
+      this.approvedCallIds.add(callId);
+    }
     if (remember && approved) {
-      if (toolName) {
+      // General shell execution ('run_command') cannot receive blanket session approval
+      // because arbitrary dangerous commands could be executed under the same tool name.
+      if (toolName && toolName !== "run_command") {
         this.sessionApprovedToolNames.add(toolName);
       }
       if (!this.sessionAutoApprove) {
@@ -93,6 +113,7 @@ export class ApprovalService {
 
   /** Cancel and deny all pending approvals (e.g., when a turn is aborted or switched). */
   cancelAllPending(): number {
+    this.approvedCallIds.clear();
     let count = 0;
     for (const [id, resolve] of this.pendingApprovals) {
       this.pendingApprovals.delete(id);
@@ -105,10 +126,16 @@ export class ApprovalService {
   /** Clear session-scoped tool approvals and reset session-level auto-approval. */
   clearSessionApprovals(): { autoApproveChanged: boolean } {
     this.sessionApprovedToolNames.clear();
+    this.approvedCallIds.clear();
     const hadSessionAuto = this.sessionAutoApprove;
     this.sessionAutoApprove = false;
     const changed = hadSessionAuto && !this.userConfiguredAutoApprove;
     return { autoApproveChanged: changed };
+  }
+
+  /** Clear turn-scoped approvals without resetting session-level permissions. */
+  clearTurnApprovals(): void {
+    this.approvedCallIds.clear();
   }
 }
 
@@ -126,6 +153,7 @@ export function parseMcpConfigJson(rawJson: string): McpServerConfig[] {
           command?: string;
           args?: string[];
           env?: Record<string, string>;
+          cwd?: string;
           allowLocalNetwork?: boolean;
           permissions?: McpServerConfig["permissions"];
         }
@@ -150,6 +178,7 @@ export function parseMcpConfigJson(rawJson: string): McpServerConfig[] {
           command: v.command,
           args: v.args,
           env: v.env,
+          cwd: v.cwd,
           permissions: v.permissions,
         });
       }
@@ -159,4 +188,3 @@ export function parseMcpConfigJson(rawJson: string): McpServerConfig[] {
     return [];
   }
 }
-

@@ -34,8 +34,10 @@ export function buildPlan(input:OrchestratorInput):AdaptivePlan{
   const tier=model.tier??"small";
   const task=input.task??analyzeTask(input.prompt??"",mode);
   const capabilities=capabilityForModel(model,input.bench);
-  const auto=input.intelligence==="auto";
-  const level:IntelligenceLevel=auto?deriveScaffoldingLevel(tier,capabilities,task):(input.intelligence as IntelligenceLevel);
+  const auto=adaptiveEnabled&&input.intelligence==="auto";
+  const level:IntelligenceLevel=auto
+    ? deriveScaffoldingLevel(tier,capabilities,task)
+    : (input.intelligence==="auto"?"medium":input.intelligence as IntelligenceLevel);
   const profile=LEVELS[level];
 
   const scaffoldingLabel:Record<IntelligenceLevel,string>={
@@ -44,16 +46,29 @@ export function buildPlan(input:OrchestratorInput):AdaptivePlan{
     medium:"Balanced scaffolding (standard workflow & tool guidance)",
     low:"Autonomous / minimal scaffolding (lean prompt overhead for self-sufficient models)",
   };
-  rationale.push(auto?`Adaptive Assistance: ${scaffoldingLabel[level]}.`:`Adaptive Assistance: ${level} (pinned by user) — ${scaffoldingLabel[level]}.`);
+  if(!adaptiveEnabled){
+    rationale.push(`Adaptive Assistance: ${level} (adaptive disabled by user) — ${scaffoldingLabel[level]}.`);
+  }else if(auto){
+    rationale.push(`Adaptive Assistance: ${scaffoldingLabel[level]}.`);
+  }else{
+    rationale.push(`Adaptive Assistance: ${level} (pinned by user) — ${scaffoldingLabel[level]}.`);
+  }
   rationale.push(`Task: ${task.scope}, reasoning=${task.reasoning}, risk=${task.risk}, verification=${task.verification.join(",")||"none"}.`);
   if(isFreshInfoRequest(input.prompt??""))rationale.push("Fresh-data request detected; web-capable tools are prioritized and grounded synthesis is enforced.");
 
   const ctxSelection=computeOptimalContextWindow(model,machine,adaptiveEnabled);
   let numCtx=ctxSelection.numCtx;
-  rationale.push(ctxSelection.reason);
+  const modelMax=(model.contextLength&&model.contextLength>0)?model.contextLength:8192;
   if(input.userNumCtx&&input.userNumCtx>0){
-    numCtx=input.userNumCtx;
-    rationale.push(`Context pinned to ${numCtx.toLocaleString()} tokens by user (${ctxSelection.recommendedNumCtx.toLocaleString()} recommended for this hardware).`);
+    if(input.userNumCtx>modelMax){
+      numCtx=modelMax;
+      rationale.push(`Context requested (${input.userNumCtx.toLocaleString()} tokens) exceeds model limit (${modelMax.toLocaleString()} tokens); clamped to model ceiling.`);
+    }else{
+      numCtx=input.userNumCtx;
+      rationale.push(`Context pinned to ${numCtx.toLocaleString()} tokens by user (${ctxSelection.recommendedNumCtx.toLocaleString()} recommended for this hardware).`);
+    }
+  }else{
+    rationale.push(ctxSelection.reason);
   }
 
   const isCloud=!!model.provider&&model.provider!=="ollama"&&model.provider!=="llamacpp";
@@ -73,10 +88,11 @@ export function buildPlan(input:OrchestratorInput):AdaptivePlan{
   // Lower temperature for smaller models / high-scaffolding turns reduces tool & fact hallucination
   const temperature=mode==="chat"?profile.chatTemp:profile.taskTemp;
   const policy=buildExecutionPolicy(task,capabilities,hardCap,maxTools)!;
-  policy.maxConcurrent=1;
+  policy.maxConcurrent=task.risk==="destructive"?1:1;
   policy.stepBudget=hardCap;
-  const contextBudget=Math.max(256,numCtx-reserveOutputTokens);
-  const maxOutputTokens=Math.max(512,Math.min(contextBudget,Math.floor(numCtx*.5),profile.outputCap+policy.generationBudgetTokens,policy.generationBudgetTokens));
+  const effectiveOutputReserve=Math.max(256,Math.min(reserveOutputTokens,Math.floor(numCtx*.5)));
+  const contextBudget=Math.max(256,numCtx-effectiveOutputReserve);
+  const maxOutputTokens=Math.max(256,Math.min(contextBudget,Math.floor(numCtx*.5),profile.outputCap,effectiveOutputReserve));
   policy.generationBudgetTokens=Math.min(policy.generationBudgetTokens,maxOutputTokens);
   const verification=buildVerificationPlan(task);
 
@@ -130,7 +146,8 @@ export function computeOptimalContextWindow(
   machine:MachineProfile|null,
   adaptiveEnabled:boolean
 ):{numCtx:number;recommendedNumCtx:number;safeMaxTokens:number;reason:string}{
-  const modelMax=Math.max(8192, model.contextLength??8192);
+  const modelMax=(model.contextLength&&model.contextLength>0)?model.contextLength:8192;
+  const minCtx=Math.min(8192,modelMax);
   if(!adaptiveEnabled||!machine){
     return{
       numCtx:modelMax,
@@ -185,17 +202,16 @@ export function computeOptimalContextWindow(
     ? (cores>=12 ? 65536 : cores>=8 ? 32768 : 16384)
     : 131072;
 
-  // 5. Never drop below 8k (4k is too small for agentic coding)
-  const MIN_CTX=8192;
-  const targetTokens=Math.max(MIN_CTX, Math.min(modelMax, rawSafeTokens, cpuPracticalCap));
+  // 5. Never exceed modelMax or drop below minCtx
+  const targetTokens=Math.max(minCtx, Math.min(modelMax, rawSafeTokens, cpuPracticalCap));
 
   // Snap to the highest standard bucket (8k, 16k, 32k, 64k, 128k, 256k) <= targetTokens
-  let chosen:number=MIN_CTX;
+  let chosen:number=minCtx;
   for(const b of CONTEXT_WINDOW_BUCKETS){
     if(b<=targetTokens)chosen=b;
   }
-  chosen=Math.max(MIN_CTX, Math.min(modelMax, chosen));
-  const safeMaxTokens=Math.max(MIN_CTX, rawSafeTokens);
+  chosen=Math.max(minCtx, Math.min(modelMax, chosen));
+  const safeMaxTokens=Math.max(minCtx, Math.min(modelMax, rawSafeTokens));
 
   const memSummary=vramGb>0
     ? `${vramGb.toFixed(1)} GB VRAM + ${freeRamGb.toFixed(1)}/${totalRamGb.toFixed(1)} GB RAM (${cores} CPU cores, 22% RAM buffer reserved)`

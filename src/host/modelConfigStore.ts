@@ -26,15 +26,15 @@ export class ModelConfigStore {
     // Deep-merge llamacpp sub-object
     if (patch.llamacpp && cur.llamacpp) next.llamacpp = { ...cur.llamacpp, ...patch.llamacpp };
     if (patch.sampling && cur.sampling) next.sampling = { ...cur.sampling, ...patch.sampling };
-    if (!next.numCtx) delete (next as any).numCtx;
+    if (!next.numCtx) delete next.numCtx;
     // Prune empty llamacpp
-    if (next.llamacpp && Object.keys(next.llamacpp).length === 0) delete (next as any).llamacpp;
-    if (next.sampling && Object.keys(next.sampling).length === 0) delete (next as any).sampling;
+    if (next.llamacpp && Object.keys(next.llamacpp).length === 0) delete next.llamacpp;
+    if (next.sampling && Object.keys(next.sampling).length === 0) delete next.sampling;
     if (next.sampling) {
-      if (next.sampling.temp === undefined) delete (next.sampling as any).temp;
-      if (next.sampling.topP === undefined) delete (next.sampling as any).topP;
-      if (next.sampling.seed === undefined) delete (next.sampling as any).seed;
-      if (Object.keys(next.sampling).length === 0) delete (next as any).sampling;
+      if (next.sampling.temp === undefined) delete next.sampling.temp;
+      if (next.sampling.topP === undefined) delete next.sampling.topP;
+      if (next.sampling.seed === undefined) delete next.sampling.seed;
+      if (Object.keys(next.sampling).length === 0) delete next.sampling;
     }
     await this.set(model, next);
   }

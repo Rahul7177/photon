@@ -23,7 +23,10 @@ export interface TurnEmitter {
 export interface EngineDeps {
   client: LLMProvider;
   registry: ToolRegistry;
-  toolContext: (signal: AbortSignal) => ToolContext;
+  toolContext: (
+    signal: AbortSignal,
+    turnContext?: { sessionId?: string; messageId?: string }
+  ) => ToolContext;
   workspaceName: string | undefined;
   workspaceMap: () => Promise<string | undefined>;
   retrieveContext?: (query: string, signal: AbortSignal) => Promise<string | undefined>;
@@ -62,14 +65,21 @@ export class AgentEngine {
     signal: AbortSignal
   ): Promise<void> {
     const d = this.deps;
-    return runUnifiedTurn(session, plan, emitter, signal, {
-      provider: d.client,
-      tools: d.registry.all(),
-      workspaceName: d.workspaceName,
-      workspaceMap: d.workspaceMap,
-      retrieveContext: d.retrieveContext,
-      buildToolContext: d.toolContext,
-      reserveOutputTokens: d.reserveOutputTokens,
-    });
+    const lastUserMsg = [...session.messages].reverse().find((m) => m.role === "user");
+    const turnContext = { sessionId: session.id, messageId: lastUserMsg?.id || "" };
+    d.registry.lockTurn();
+    try {
+      return await runUnifiedTurn(session, plan, emitter, signal, {
+        provider: d.client,
+        tools: d.registry.all(),
+        workspaceName: d.workspaceName,
+        workspaceMap: d.workspaceMap,
+        retrieveContext: d.retrieveContext,
+        buildToolContext: (sig) => d.toolContext(sig, turnContext),
+        reserveOutputTokens: d.reserveOutputTokens,
+      });
+    } finally {
+      d.registry.unlockTurn();
+    }
   }
 }

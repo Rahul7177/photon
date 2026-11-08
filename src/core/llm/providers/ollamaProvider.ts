@@ -2,6 +2,7 @@ import type { ModelInfo, ThinkingLevel } from "../../../shared/types";
 import { profileModel } from "../../adaptive/modelProfiler";
 import type { OllamaClient } from "../../ollama/client";
 import type { LLMChatChunk, LLMChatRequest, LLMProvider } from "../types";
+import { LLMProviderError } from "../errors";
 
 export class OllamaProvider implements LLMProvider {
   readonly id = "ollama";
@@ -45,8 +46,27 @@ export class OllamaProvider implements LLMProvider {
       ...req,
       think: mapOllamaThink(req.model, level, req.messages),
     };
-    for await (const chunk of this.client.chatStream(ollamaReq as any, signal)) {
-      yield chunk;
+    try {
+      for await (const chunk of this.client.chatStream(ollamaReq as any, signal)) {
+        yield chunk;
+      }
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      const msg = (err as Error).message || String(err);
+      if (
+        msg.includes("ECONNREFUSED") ||
+        msg.includes("Failed to fetch") ||
+        msg.includes("fetch failed") ||
+        msg.includes("ENOTFOUND")
+      ) {
+        throw new LLMProviderError({
+          message: `Ollama is not reachable (${msg}). Check that the Ollama service is running.`,
+          code: "network_error",
+          provider: "ollama",
+          retryable: true,
+        });
+      }
+      throw err;
     }
   }
 }

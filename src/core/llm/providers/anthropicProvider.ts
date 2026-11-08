@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import type { ModelInfo } from "../../../shared/types";
 import type { LLMChatChunk, LLMChatRequest, LLMProvider, ProviderModel } from "../types";
 import { fetchWithRetry, streamSse, tryJson } from "../sse";
+import { classifyHttpError } from "../errors";
+import { normalizeAnthropicMessages } from "../normalizeMessages";
 
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION = "2023-06-01";
@@ -84,7 +86,7 @@ export class AnthropicProvider implements LLMProvider {
       );
       if (!res.ok) {
         const detail = await res.text().catch(() => "");
-        throw new Error(`Anthropic model list failed (${res.status}). ${detail.slice(0, 500)}`.trim());
+        throw classifyHttpError(this.label, res.status, detail, res.headers, [this.apiKey]);
       }
       const json = (await res.json()) as {
         data?: { id: string; display_name?: string; created_at?: string }[];
@@ -112,52 +114,7 @@ export class AnthropicProvider implements LLMProvider {
   }
 
   async *chatStream(req: LLMChatRequest, signal?: AbortSignal): AsyncGenerator<LLMChatChunk> {
-    let system = "";
-    type Block = Record<string, unknown>;
-    const messages: { role: "user" | "assistant"; content: string | Block[] }[] = [];
-    const push = (role: "user" | "assistant", content: string | Block[]) => {
-      const last = messages[messages.length - 1];
-      if (last && last.role === role) {
-        if (typeof last.content === "string" && typeof content === "string") {
-          last.content += "\n\n" + content;
-        } else if (Array.isArray(last.content) && Array.isArray(content)) {
-          last.content.push(...content);
-        }
-      } else {
-        messages.push({ role, content });
-      }
-    };
-    for (const m of req.messages) {
-      if (m.role === "system") {
-        system += (system ? "\n\n" : "") + m.content;
-        continue;
-      }
-      if (m.role === "tool") {
-        push("user", [
-          {
-            type: "tool_result",
-            tool_use_id: m.tool_call_id || `missing-${messages.length}`,
-            content: m.content,
-          },
-        ]);
-        continue;
-      }
-      if (m.role === "assistant" && m.tool_calls?.length) {
-        const blocks: Block[] = [];
-        if (m.content) blocks.push({ type: "text", text: m.content });
-        for (const tc of m.tool_calls) {
-          blocks.push({
-            type: "tool_use",
-            id: tc.id ?? randomUUID(),
-            name: tc.function.name,
-            input: tc.function.arguments ?? {},
-          });
-        }
-        messages.push({ role: "assistant", content: blocks });
-        continue;
-      }
-      push(m.role === "assistant" ? "assistant" : "user", m.content);
-    }
+    const { system, messages } = normalizeAnthropicMessages(req.messages);
 
     const wireModel = req.model.startsWith("claude:") ? req.model.slice("claude:".length) : req.model;
     const body: Record<string, unknown> = {
@@ -209,7 +166,7 @@ export class AnthropicProvider implements LLMProvider {
     );
     if (!res.ok || !res.body) {
       const detail = await res.text().catch(() => "");
-      throw new Error(`Anthropic /v1/messages failed (${res.status}). ${detail.slice(0, 500)}`.trim());
+      throw classifyHttpError(this.label, res.status, detail, res.headers, [this.apiKey]);
     }
 
     const pendingCalls = new Map<number, { id: string; name: string; json: string }>();
@@ -247,7 +204,8 @@ export class AnthropicProvider implements LLMProvider {
       }>(payload);
       if (!json) continue;
       if (json.type === "error" || json.error) {
-        throw new Error(`Anthropic stream error: ${json.error?.message ?? payload.slice(0, 300)}`);
+        const msg = json.error?.message ?? payload;
+        throw classifyHttpError(this.label, 400, msg, undefined, [this.apiKey]);
       }
       if (json.type === "message_start" && json.message?.usage) {
         const u = json.message.usage;

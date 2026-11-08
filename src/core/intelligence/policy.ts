@@ -4,14 +4,57 @@ const LOCAL_CORE_TOOLS = ["query_project_context","list_dir","find_files","searc
 const LOCAL_EXTENDED_TOOLS = ["update_project_context","code_outline","move_path","todo_write","think","web_search","web_fetch"] as const;
 
 export function analyzeTask(prompt:string,mode:"chat"|"plan"|"agent",attachmentCount=0):TaskAnalysis{
-  const text=(prompt??"").toLowerCase();const fileRefs=new Set<string>();
+  const text=(prompt??"").toLowerCase();
+  const fileRefs=new Set<string>();
   for(const m of prompt.matchAll(/(?:[\w@./-]+\/)*[\w.-]+\.[a-z0-9]{1,8}\b/gi))fileRefs.add(m[0].toLowerCase());
   for(const m of prompt.matchAll(/@[\w./-]+/g))fileRefs.add(m[0].toLowerCase());
-  const referenceCount=fileRefs.size+attachmentCount;const codebase=/\b(codebase|entire project|all files|every file|throughout|migration|migrate|restructure|re-architect)\b/i.test(prompt);const multi=referenceCount>=2||/\b(across|multiple files|both files|several files)\b/i.test(prompt);const scope:TaskAnalysis["scope"]=codebase?"codebase":multi?"multi_file":"single_file";
-  const highReasoning=/\b(debug|race|concurrency|architecture|architect|refactor|migrate|performance|optimi[sz]e|algorithm|security|dependency|integration|root cause|design)\b/i.test(text);const moderateReasoning=/\b(implement|feature|fix|change|modify|wire|hook|add|remove|rename|update|create|build)\b/i.test(text);const reasoning:TaskAnalysis["reasoning"]=highReasoning?"high":moderateReasoning||scope!=="single_file"?"medium":"low";
-  let risk:TaskAnalysis["risk"]="low";if(/\b(rm\s+-rf|delete database|drop table|destroy|wipe|reset production|force push|credential|secret|api key|password)\b/i.test(text))risk="destructive";else if(/\b(deploy|publish|release|dependency|install|uninstall|migration|security|permission|auth|database|schema|git)\b/i.test(text))risk="high";else if(/\b(write|edit|modify|change|remove|rename|replace|create|implement|fix)\b/i.test(text))risk="medium";
-  const verification:VerificationKind[]=[];if(/\b(test|tests|testing|spec|unit|integration|regression)\b/i.test(text)||/\bbug\b/i.test(text))verification.push("tests");if(/\b(build|compile|bundle|tsc|package)\b/i.test(text))verification.push("build");if(/\b(lint|eslint|format|prettier)\b/i.test(text))verification.push("lint");if(/\b(diagnostic|type error|types|compile error)\b/i.test(text))verification.push("diagnostics");if(/\b(run|execute|runtime|start|server|endpoint|ui|browser)\b/i.test(text))verification.push("runtime");if(!verification.length&&mode!=="chat"&&risk!=="low")verification.push("diagnostics");if(scope==="codebase"&&!verification.includes("tests"))verification.push("tests");
-  const ambiguity=/\b(maybe|somewhere|around|similar|something|it|that|the thing)\b/i.test(prompt)&&fileRefs.size===0?"medium":"low";const estimatedSteps=Math.max(1,Math.min(20,1+referenceCount+(scope==="codebase"?4:scope==="multi_file"?2:0)+verification.length));return{scope,reasoning,risk,verification:[...new Set(verification)],ambiguity,estimatedSteps};
+  const referenceCount=fileRefs.size+attachmentCount;
+
+  const codebase=/\b(codebase|entire project|whole project|all files|every file|throughout|migration|migrate|restructure|re-architect|repo-wide|project-wide|repository-wide)\b/i.test(prompt);
+  const multi=referenceCount>=2||/\b(across|multiple files|both files|several files|few files)\b/i.test(prompt);
+  const scope:TaskAnalysis["scope"]=codebase?"codebase":multi?"multi_file":"single_file";
+
+  const highReasoning=/\b(debug|race|concurrency|architecture|architect|refactor|migrate|performance|optimi[sz]e|algorithm|security|dependency|integration|root cause|design)\b/i.test(text);
+  const moderateReasoning=/\b(implement|feature|fix|change|modify|wire|hook|add|remove|rename|update|create|build)\b/i.test(text);
+  const reasoning:TaskAnalysis["reasoning"]=highReasoning?"high":moderateReasoning||scope!=="single_file"?"medium":"low";
+
+  // Distinguish read-only inspection/explanation from active modification
+  const hasMutationIntent=/\b(write|edit|modify|change|remove|rename|replace|create|implement|fix|refactor|update|add|delete|drop|wipe|destroy|install|uninstall|deploy|publish|reset|rebase|clean|purge)\b/i.test(text);
+  const isQuestion=/^(?:what|why|how|where|who|when|which|is|are|can|could|should|explain|describe|show|find|search|list|inspect|view|read|summarize|tell me|outline|check|audit|grep)\b/i.test(text.trim());
+  const hasImperativeAction=/\b(and (?:fix|edit|modify|change|delete|remove|update|create|write|implement|run|execute|deploy|install|purge)|please (?:fix|edit|modify|change|delete|remove|update|create|write|implement|run|execute|deploy|install|purge))\b/i.test(text);
+
+  const isDestructive=/\b(rm\s+.*(-r|-f|\/s|\/q)|rm\s+-rf|rmdir\s+.*(\/s|\/q)|del\s+.*(\/s|\/q)|format\s+[a-z]:|mkfs|drop\s+table|drop\s+database|delete\s+database|wipe\s+(database|disk|drive|repo|workspace)|destroy\s+(cluster|database|server|env)|reset\s+production|force\s+push|git\s+reset\s+--hard|git\s+clean\s+-[a-z]*f|git\s+push\s+.*(-f|--force))\b/i.test(text)
+    ||(/\b(delete|wipe|purge|clear|drop)\b.*\b(credentials?|secrets?|api[\s_-]?keys?|passwords?|tokens?)\b/i.test(text));
+
+  const isReadOnly=(isQuestion&&!hasImperativeAction)||(mode==="chat"&&!hasImperativeAction&&!isDestructive);
+
+  let risk:TaskAnalysis["risk"]="low";
+  const isHighRisk=!isReadOnly&&(
+    /\b(deploy|publish|release|migration|migrate\s+(database|schema)|install|uninstall|chown|chmod\s+777|grant\s+permission|revoke\s+permission)\b/i.test(text)
+    ||/\b(npm|yarn|pnpm)\s+(install|add|remove|uninstall|publish)\b/i.test(text)
+    ||/\b(git\s+(commit|push|rebase|merge|branch\s+-[dD]))\b/i.test(text)
+    ||(/\b(change|modify|update|rotate)\b.*\b(permission|auth|role|access|credentials?|secrets?|api[\s_-]?keys?|tokens?)\b/i.test(text))
+  );
+
+  const isMediumRisk=!isReadOnly&&hasMutationIntent;
+
+  if(isDestructive)risk="destructive";
+  else if(isHighRisk)risk="high";
+  else if(isMediumRisk)risk="medium";
+  else risk="low";
+
+  const verification:VerificationKind[]=[];
+  if(/\b(test|tests|testing|spec|unit|integration|regression)\b/i.test(text)||/\bbug\b/i.test(text))verification.push("tests");
+  if(/\b(build|compile|bundle|tsc|package)\b/i.test(text))verification.push("build");
+  if(/\b(lint|eslint|format|prettier)\b/i.test(text))verification.push("lint");
+  if(/\b(diagnostic|type error|types|compile error)\b/i.test(text))verification.push("diagnostics");
+  if(/\b(run|execute|runtime|start|server|endpoint|ui|browser)\b/i.test(text))verification.push("runtime");
+  if(!verification.length&&mode!=="chat"&&risk!=="low"&&!isReadOnly)verification.push("diagnostics");
+  if(scope==="codebase"&&!verification.includes("tests")&&!isReadOnly)verification.push("tests");
+
+  const ambiguity=/\b(maybe|somewhere|around|similar|something|it|that|the thing)\b/i.test(prompt)&&fileRefs.size===0?"medium":"low";
+  const estimatedSteps=Math.max(1,Math.min(20,1+referenceCount+(scope==="codebase"?4:scope==="multi_file"?2:0)+verification.length));
+  return{scope,reasoning,risk,verification:[...new Set(verification)],ambiguity,estimatedSteps};
 }
 
 export function isFreshInfoRequest(prompt:string):boolean{
@@ -112,10 +155,33 @@ export function suggestFirstTool(specs:ToolSpec[],lastUser:string):string{
  * A local model must demonstrate high tool-call and schema reliability before
  * Photon trusts its provider-native interface. Without a benchmark result,
  * local models stay on the tolerant Photon block protocol. */
-export function shouldUseNativeToolProtocol(model:ModelInfo,capabilities:ModelCapabilityProfile,bench:BenchResult|undefined,intelligence:import("../../shared/types").IntelligenceLevel):boolean{const isLocal=!model.provider||model.provider==="ollama"||model.provider==="llamacpp";if(!isLocal)return true;if(model.capabilities?.some(c=>c.toLowerCase()==="tools"))return true;if(intelligence==="low")return false;return!!bench&&bench.toolCallReliability>=.80&&capabilities.schemaAdherence>=.82&&capabilities.toolCalling>=.82;}
+export function shouldUseNativeToolProtocol(model:ModelInfo,capabilities:ModelCapabilityProfile,bench:BenchResult|undefined,intelligence:import("../../shared/types").IntelligenceLevel):boolean{
+  const isLocal=!model.provider||model.provider==="ollama"||model.provider==="llamacpp";
+  if(!isLocal)return true;
+  if(model.capabilities?.some(c=>c.toLowerCase()==="tools"))return true;
+  if(intelligence==="low")return false;
+  const isFreshBench=!!bench&&(bench.methodologyVersion??0)>=1&&(Date.now()-bench.ranAt<=30*86_400_000);
+  return isFreshBench&&bench.toolCallReliability>=.80&&capabilities.schemaAdherence>=.82&&capabilities.toolCalling>=.82;
+}
 export function executionFingerprint(call:ToolCall,mutationEpoch:number):string{return`${call.name}|${JSON.stringify(stableNormalize(call.args))}|epoch:${mutationEpoch}`;}
 function stableNormalize(value:unknown):unknown{if(Array.isArray(value))return value.map(stableNormalize);if(value&&typeof value==="object")return Object.fromEntries(Object.entries(value as Record<string,unknown>).sort(([a],[b])=>a.localeCompare(b)).map(([k,v])=>[k,stableNormalize(v)]));return value;}
 export function canRunInParallel(a:ToolSpec,b:ToolSpec):boolean{const ar=a.risk??(a.sideEffecting?"workspace_write":"read");const br=b.risk??(b.sideEffecting?"workspace_write":"read");return(a.concurrency??"serial")==="safe_parallel"&&(b.concurrency??"serial")==="safe_parallel"&&ar==="read"&&br==="read";}
-export function buildExecutionPolicy(task:TaskAnalysis,capability:ModelCapabilityProfile,maxSteps:number,maxTools:number):AdaptivePlan["executionPolicy"]{const concurrency=capability.toolCalling>=.78&&capability.recovery>=.60?4:capability.toolCalling>=.60?2:1;const reasoningBudget=task.reasoning==="high"?Math.round(3072+Math.max(0,capability.reasoning-.7)*3400):task.reasoning==="medium"?Math.round(768+Math.max(0,capability.reasoning-.65)*1200):0;const visibleBudget=task.reasoning==="high"?4096:task.reasoning==="medium"?2048:1536;const generationBudgetTokens=Math.max(512,Math.min(8192,visibleBudget+reasoningBudget));return{maxConcurrent:task.risk==="destructive"?1:Math.min(concurrency,4),allowParallelReads:task.risk!=="destructive",serializeMutations:true,generationBudgetTokens,stepBudget:Math.max(8,Math.min(200,Math.max(maxSteps,task.estimatedSteps*3,maxTools*2)))}}
+export function buildExecutionPolicy(task:TaskAnalysis,capability:ModelCapabilityProfile,maxSteps:number,maxTools:number):AdaptivePlan["executionPolicy"]{
+  const concurrency=capability.toolCalling>=.78&&capability.recovery>=.60?4:capability.toolCalling>=.60?2:1;
+  const reasoningBudget=task.reasoning==="high"?Math.round(3072+Math.max(0,capability.reasoning-.7)*3400):task.reasoning==="medium"?Math.round(768+Math.max(0,capability.reasoning-.65)*1200):0;
+  const visibleBudget=task.reasoning==="high"?4096:task.reasoning==="medium"?2048:1536;
+  const generationBudgetTokens=Math.max(512,Math.min(8192,visibleBudget+reasoningBudget));
+  const requireExplicitApproval=task.risk==="destructive"||task.risk==="high";
+  const stepBudget=Math.max(1,Math.min(maxSteps,Math.max(8,Math.min(200,Math.max(maxSteps,task.estimatedSteps*3,maxTools*2)))));
+  return{
+    maxConcurrent:task.risk==="destructive"?1:Math.min(concurrency,4),
+    allowParallelReads:task.risk!=="destructive",
+    serializeMutations:true,
+    generationBudgetTokens,
+    stepBudget,
+    requireExplicitApproval,
+    blockTerminalCommands:task.risk==="destructive",
+  };
+}
 export function buildVerificationPlan(task:TaskAnalysis):VerificationPlan{return{required:[...new Set(task.verification)],completed:[],evidence:[]};}
 export function recoveryDirective(result:{status?:string;recovery?:{action?:string;hints?:string[]};output:string}):string|undefined{const action=result.recovery?.action;if(!action)return undefined;const prefix:Record<string,string>={reread:"Re-read the affected file before retrying the operation.",search:"Search for the correct path, symbol, or current text before retrying.",repair:"Re-check the tool schema and correct the arguments before retrying.",verify:"Run the relevant verification step before making another change.",retry:"Retry once after inspecting the reported error.",ask_user:"Ask the user for the missing information or approval."};return`${prefix[action]??"Diagnose the tool failure before continuing."}${result.recovery?.hints?.length?` Hints: ${result.recovery.hints.join("; ")}`:""}\nTool output: ${result.output}`;}

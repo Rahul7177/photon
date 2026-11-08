@@ -30,13 +30,27 @@ export function Approval({
   const newStr = (args.new_str || args.new_string || args.replace) as string | undefined;
   const command = (args.command || args.cmd) as string | undefined;
 
+  const isDestructive =
+    (call as any).risk === "destructive" ||
+    /delete|remove|rmdir|unlink|drop|purge|reset/i.test(toolName) ||
+    Boolean(command && /\b(rm\s+-[rf]|git\s+reset\s+--hard|drop\s+database|del\s+\/[fq]|format)\b/i.test(command));
+
+  let permissionDescription = "Execute tool operation";
+  if (isFileWrite) permissionDescription = "Write / create file on disk in your workspace";
+  else if (isFileEdit) permissionDescription = "Modify existing file content in your workspace";
+  else if (isCommand) permissionDescription = "Execute command in terminal with OS privileges";
+  else if (/delete|remove/i.test(toolName)) permissionDescription = "Permanently delete file or directory in your workspace";
+
   return (
-    <div className="approval" role="region" aria-label={`Tool approval required for ${toolName}`}>
+    <div className={`approval${isDestructive ? " approval-destructive" : ""}`} role="region" aria-label={`Tool approval required for ${toolName}`}>
       <div className="approval-header">
         <div className="approval-title-wrap">
-          <span className="approval-badge" aria-hidden="true">!</span>
+          <span className={`approval-badge${isDestructive ? " destructive" : ""}`} aria-hidden="true">
+            {isDestructive ? "⚠️" : "!"}
+          </span>
           <span className="approval-title-text">
-            Allow <strong>{toolName}</strong>?
+            {isDestructive ? "Confirm Destructive Action: " : "Allow "}
+            <strong>{toolName}</strong>?
           </span>
         </div>
         {filePath && (
@@ -45,6 +59,16 @@ export function Approval({
             <span className="approval-file-name">{filePath}</span>
           </div>
         )}
+      </div>
+
+      {isDestructive && (
+        <div className="approval-destructive-banner" role="alert">
+          <strong>Warning:</strong> This operation permanently alters workspace state or executes high-risk shell commands.
+        </div>
+      )}
+
+      <div className="approval-permission-hint">
+        <span className="permission-key">Permission requested:</span> <span>{permissionDescription}</span>
       </div>
 
       <div className="approval-body">
@@ -119,16 +143,18 @@ export function Approval({
       <div className="approval-actions">
         <button
           type="button"
-          className="btn primary approval-btn-allow"
-          aria-label={`Allow ${toolName} once`}
+          className={`btn primary approval-btn-allow${isDestructive ? " btn-destructive" : ""}`}
+          aria-label={isDestructive ? `Confirm destructive action ${toolName}` : `Allow ${toolName} once`}
           onClick={() => decide(true, false)}
         >
-          Allow
+          {isDestructive ? "Confirm & Allow Once" : "Allow"}
         </button>
         <button
           type="button"
           className="btn approval-btn-always"
-          aria-label="Always allow tools in this session"
+          aria-label={isDestructive ? "Always allow is disabled for destructive commands" : "Always allow tools in this session"}
+          disabled={isDestructive}
+          title={isDestructive ? "Always allow is disabled for destructive actions to protect your workspace" : "Always allow this tool for this session"}
           onClick={() => decide(true, true)}
         >
           Always allow in session

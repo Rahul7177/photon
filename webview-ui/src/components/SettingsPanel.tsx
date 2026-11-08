@@ -60,7 +60,12 @@ function indexSummary(s: IndexStatus): string {
       return "Indexing is off.";
     case "indexing":
       return `Indexing… ${s.filesIndexed} files (${s.pending} pending)`;
+    case "validating":
+      return s.message ?? `Validating freshness… ${s.filesIndexed} files`;
     case "ready":
+      if (s.pending && s.pending > 0) {
+        return `Updating index… ${s.filesIndexed} files (${s.pending} pending)`;
+      }
       return `Ready · ${s.filesIndexed} files, ${s.chunks} chunks`;
     case "unavailable":
       return s.message ?? "Embedding model unavailable.";
@@ -483,6 +488,14 @@ export function SettingsPanel({
                             <span className={`rec-fit-badge ${rec.fit.badge}`}>
                               {rec.fit.label}
                             </span>
+                            {rec.fit.tokPerSec && (
+                              <span
+                                className={`rec-speed-badge ${rec.fit.isEstimate ? "estimated" : "measured"}`}
+                                title={rec.fit.isEstimate ? "Estimated bandwidth throughput" : "Measured via benchmark on this machine"}
+                              >
+                                {rec.fit.isEstimate ? `~${rec.fit.tokPerSec} tok/s (est.)` : `⚡ ${rec.fit.tokPerSec} tok/s (measured)`}
+                              </span>
+                            )}
                             <span className="rec-model-size">{rec.sizeGb.toFixed(1)} GB</span>
                           </div>
                           <div className="rec-model-foot">

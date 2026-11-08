@@ -1,6 +1,6 @@
-import type { IntelligenceLevel, ToolCall, ToolSpec } from "../../shared/types";
+import type { ExecutionPolicy, IntelligenceLevel, ToolCall, ToolSpec } from "../../shared/types";
 
-export type ToolStatus = "success" | "invalid_args" | "not_found" | "ambiguous" | "permission_denied" | "conflict" | "execution_error" | "timeout" | "stale_state";
+export type ToolStatus = "success" | "invalid_args" | "not_found" | "ambiguous" | "permission_denied" | "conflict" | "execution_error" | "timeout" | "stale_state" | "cancelled";
 export interface ToolRecovery { action: "retry" | "reread" | "search" | "repair" | "ask_user" | "verify"; hints?: string[]; }
 export interface ToolResult {
   ok: boolean;
@@ -16,6 +16,7 @@ export interface ToolResult {
     changedLines?: { start: number; end: number };
     changed?: boolean;
     evidence?: string[];
+    untrusted?: boolean;
   };
 }
 export interface DiagnosticInfo { file:string; line:number; col:number; severity:"error"|"warning"|"info"; message:string; source?:string; }
@@ -34,7 +35,16 @@ export interface ToolContext {
   capability:IntelligenceLevel;
   getDiagnostics:(path?:string)=>Promise<DiagnosticInfo[]>;
   todos:TodoItem[];
-  checkpointTracker?: { recordBeforeChange: (relPath: string) => Promise<void> };
+  checkpointTracker?: {
+    recordBeforeChange: (
+      relPath: string,
+      turnContext?: { sessionId?: string; messageId?: string } | string
+    ) => Promise<void>;
+  };
+  mode?: "chat" | "plan" | "agent";
+  allowedTools?: string[];
+  executionPolicy?: ExecutionPolicy;
+  timeoutMs?: number;
 }
 // §4 Context budget rules for 6K window
 export const CONTEXT_BUDGETS = {
@@ -48,6 +58,32 @@ export const CONTEXT_BUDGETS = {
 // Tool result char budget: ~1200 tokens * 4 chars/token = 4800 chars
 export const TOOL_RESULT_CHAR_BUDGET = 4800;
 export const TOOL_RESULT_LINE_BUDGET = 80; // for run_command/get_diagnostics per §4
+
+export const BUILTIN_TOOL_NAMES = new Set([
+  "query_project_context",
+  "update_project_context",
+  "read_file",
+  "edit_file",
+  "append_file",
+  "write_file",
+  "find_files",
+  "list_dir",
+  "search_code",
+  "get_diagnostics",
+  "run_command",
+  "move_path",
+  "code_outline",
+  "todo_write",
+  "think",
+  "web_search",
+  "web_fetch",
+  "attempt_completion",
+  "ask_followup_question",
+  "write_to_file",
+  "replace_in_file",
+  "execute_command",
+  "browse_folder",
+]);
 
 const OUTPUT_BUDGET:Record<IntelligenceLevel,number>={low:4000,medium:8000,high:16000,max:32000};
 export function outputBudget(ctx:ToolContext):number{

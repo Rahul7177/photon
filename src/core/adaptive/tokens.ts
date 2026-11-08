@@ -47,15 +47,29 @@ function tokenizerFor(model: string | undefined): ModelTokenizer | undefined {
   return best;
 }
 
+export const TOKENS_PER_IMAGE = 800;
+
 /**
  * Estimate tokens for a chunk of text. Mixes a chars/4 heuristic with a
  * word-count floor so code (few spaces) and prose (many spaces) both land close.
+ * Also accounts for code-dense text where symbols increase token fragmentation.
  */
 export function estimateTokens(text: string): number {
   if (!text) return 0;
+  const trimmed = text.trim();
   const byChars = text.length / 4;
-  const byWords = text.trim().split(/\s+/).length * 1.3;
-  return Math.ceil(Math.max(byChars, byWords));
+  const byWords = trimmed.split(/\s+/).length * 1.3;
+  let baseEstimate = Math.max(byChars, byWords);
+
+  // Symbol density check for code-heavy chunks:
+  // In code, punctuation and brackets split into individual BPE tokens (~3.2 chars/tok)
+  const symbols = trimmed.match(/[{}()\[\];:.,=><_+\-*\/\\&|^%!~?@#$"`]/g)?.length ?? 0;
+  const nonWs = trimmed.replace(/\s+/g, "").length;
+  if (nonWs > 20 && symbols / nonWs > 0.15) {
+    baseEstimate = Math.max(baseEstimate, nonWs / 3.2);
+  }
+
+  return Math.ceil(baseEstimate);
 }
 
 /**
@@ -72,6 +86,20 @@ export function estimateTokensForModel(text: string, model?: string): number {
 export function estimateMessageTokens(msg: ChatMessage, model?: string): number {
   // ~4 tokens of role/formatting overhead per message.
   let t = 4 + estimateTokensForModel(msg.content, model);
+
+  if (msg.thinking) {
+    t += estimateTokensForModel(msg.thinking, model);
+  }
+
+  // Account for multimodal image and text attachments
+  for (const att of msg.attachments ?? []) {
+    if (att.kind === "image") {
+      t += TOKENS_PER_IMAGE;
+    } else if (att.text) {
+      t += estimateTokensForModel(att.text, model);
+    }
+  }
+
   for (const call of msg.toolCalls ?? []) {
     t += estimateTokensForModel(call.name, model) + estimateTokensForModel(JSON.stringify(call.args), model);
     if (call.result) t += estimateTokensForModel(call.result, model);
@@ -81,4 +109,17 @@ export function estimateMessageTokens(msg: ChatMessage, model?: string): number 
 
 export function estimateMessagesTokens(msgs: ChatMessage[], model?: string): number {
   return msgs.reduce((sum, m) => sum + estimateMessageTokens(m, model), 0);
+}
+
+export function estimateToolSchemasTokens(
+  tools: unknown[],
+  model?: string
+): number {
+  let t = 0;
+  for (const tool of tools) {
+    if (!tool) continue;
+    const raw = (tool as { spec?: unknown }).spec ?? tool;
+    t += 8 + estimateTokensForModel(JSON.stringify(raw), model);
+  }
+  return t;
 }

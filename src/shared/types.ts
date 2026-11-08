@@ -2,22 +2,22 @@
 // Keep this file dependency-free (no vscode / node imports) so the webview can import it directly.
 export type Mode="chat"|"plan"|"agent";export type Role="system"|"user"|"assistant"|"tool";
 export interface ChatMessage{id:string;role:Role;content:string;toolCalls?:ToolCall[];attachments?:Attachment[];toolCallId?:string;createdAt:number;streaming?:boolean;notice?:string;hidden?:boolean;/** Model reasoning trace (display-only, collapsed once the answer streams). */thinking?:string;/** Ms spent reasoning, set when the trace completes. */thinkingElapsedMs?:number;/** Indicates this message is a context compaction digest. */isCompacted?:boolean;compactStats?:{messagesCount:number;tokensSaved:number;pctSaved:number;strategy?:string};/** Checkpoint created during this turn, allowing 1-click rollback of file changes. */checkpointId?:string;checkpointFiles?:string[];checkpointNumber?:number;}
-export interface Attachment{id:string;kind:"image"|"text";name:string;mime:string;size:number;dataBase64?:string;text?:string;}
+export interface Attachment{id:string;kind:"image"|"text";name:string;mime:string;size:number;dataBase64?:string;text?:string;url?:string;isPruned?:boolean;}
 export interface ToolCall{id:string;name:string;args:Record<string,unknown>;status:"proposed"|"running"|"done"|"error"|"denied";result?:string;error?:string;statusDetail?:string;sideEffecting?:boolean;thoughtSignature?:string;risk?:ToolRisk|"critical";}
 export interface ModelCapabilityProfile{reasoning:number;coding:number;toolCalling:number;schemaAdherence:number;contextRetention:number;editFidelity:number;recovery:number;verification:number;speed:number;}
-export interface ModelInfo{name:string;provider?:string;paramSize?:string;paramsB?:number;quantization?:string;family?:string;contextLength?:number;sizeBytes?:number;toolTrained?:boolean;vision?:boolean;audio?:boolean;video?:boolean;thinking?:boolean;thinkingLevels?:ThinkingLevel[];capabilities?:string[];tier?:ModelTier;capabilityProfile?:ModelCapabilityProfile;}
+export interface ModelInfo{name:string;provider?:string;paramSize?:string;paramsB?:number;quantization?:string;family?:string;contextLength?:number;sizeBytes?:number;toolTrained?:boolean;vision?:boolean;audio?:boolean;video?:boolean;thinking?:boolean;thinkingLevels?:ThinkingLevel[];capabilities?:string[];tier?:ModelTier;capabilityProfile?:ModelCapabilityProfile;contextEstimated?:boolean;capabilitiesEstimated?:boolean;}
 export interface GenerationStats{tps:number;totalTokens:number;elapsedMs:number;avg?:boolean;}
 export interface LlamaCppSettings{ctx?:number;ngl?:number|"all";fit?:boolean;np?:number;fa?:boolean;ctk?:string;ctv?:string;extraArgs?:string;}
 export interface PerModelConfig{numCtx?:number;llamacpp?:LlamaCppSettings;sampling?:{temp?:number;topP?:number;seed?:number};note?:string;}
 export type ModelTier="tiny"|"small"|"medium"|"large";export type IntelligenceLevel="low"|"medium"|"high"|"max";export type IntelligenceSetting="auto"|IntelligenceLevel;
 /** User-facing reasoning control. Auto leaves the model/provider's default policy in place. */
 export type ThinkingLevel="off"|"low"|"medium"|"high"|"xtrahigh";export type ThinkingSetting="auto"|ThinkingLevel;
-export interface MachineProfile{totalRamBytes:number;freeRamBytes:number;cpuCores:number;cpuModel:string;platform:string;arch:string;gpu?:{name:string;vramBytes?:number;vendor?:string};tier:"low"|"mid"|"high";}
+export interface MachineProfile{totalRamBytes:number;freeRamBytes:number;cpuCores:number;cpuModel:string;platform:string;arch:string;gpu?:{name:string;vramBytes?:number;vendor?:string;isUnifiedMemory?:boolean;isIntegrated?:boolean;sharedMemoryBytes?:number;};tier:"low"|"mid"|"high";}
 export type ToolRisk="read"|"workspace_write"|"execute"|"network"|"destructive";export type ToolConcurrency="safe_parallel"|"serial";export type ToolIdempotency="idempotent"|"stateful"|"non_idempotent";export type VerificationKind="diagnostics"|"tests"|"build"|"lint"|"runtime";
 export interface JsonSchema{type?:"object"|"array"|"string"|"number"|"integer"|"boolean"|"null";description?:string;enum?:unknown[];const?:unknown;default?:unknown;properties?:Record<string,JsonSchema>;required?:string[];additionalProperties?:boolean|JsonSchema;items?:JsonSchema;anyOf?:JsonSchema[];oneOf?:JsonSchema[];nullable?:boolean;}
 export interface ToolSpec{name:string;summary:string;params:ToolParam[];inputSchema?:JsonSchema;sideEffecting:boolean;priority:number;minTier?:IntelligenceLevel;tags?:string[];example?:string;risk?:ToolRisk;concurrency?:ToolConcurrency;idempotency?:ToolIdempotency;verifyAfter?:VerificationKind[];}
 export interface ToolParam{name:string;type:"string"|"number"|"boolean"|"integer"|"array"|"object"|"null";required:boolean;description:string;enum?:unknown[];items?:JsonSchema;properties?:Record<string,JsonSchema>;}
-export interface ExecutionPolicy{maxConcurrent:number;allowParallelReads:boolean;serializeMutations:boolean;generationBudgetTokens:number;stepBudget:number;}
+export interface ExecutionPolicy{maxConcurrent:number;allowParallelReads:boolean;serializeMutations:boolean;generationBudgetTokens:number;stepBudget:number;requireExplicitApproval?:boolean;blockTerminalCommands?:boolean;}
 export interface VerificationPlan{required:VerificationKind[];completed:VerificationKind[];evidence:string[];}
 export interface TaskAnalysis{scope:"single_file"|"multi_file"|"codebase";reasoning:"low"|"medium"|"high";risk:"low"|"medium"|"high"|"destructive";verification:VerificationKind[];ambiguity:"low"|"medium"|"high";estimatedSteps:number;}
 export interface AdaptivePlan{model:string;mode:Mode;contextWindow:number;numCtx:number;temperature:number;topP:number;seed?:number;maxOutputTokens:number;toolProtocol:ToolProtocol;maxTools:number;allowParallelTools:boolean;intelligence:IntelligenceLevel;intelligenceAuto:boolean;rationale:string[];task?:TaskAnalysis;modelCapabilities?:ModelCapabilityProfile;executionPolicy?:ExecutionPolicy;verification?:VerificationPlan;}
@@ -35,9 +35,9 @@ export type BenchTaskId="throughput"|"toolcall"|"schema"|"tool_selection"|"recov
 export interface BenchTaskOutcome{id:BenchTaskId;passed:boolean;detail:string;}
 export interface BenchResult{model:string;quantization?:string;hardwareClass:string;methodologyVersion:number;tokensPerSec:number;firstTokenMs:number;toolCallReliability:number;reasoningPass:boolean;tasks:BenchTaskOutcome[];ranAt:number;capabilityProfile?:ModelCapabilityProfile;}
 export type BenchPhase="idle"|"running"|"done"|"error";
-export type IndexPhase="idle"|"indexing"|"ready"|"unavailable"|"error";
+export type IndexPhase="idle"|"indexing"|"validating"|"ready"|"unavailable"|"error";
 export interface IndexStatus{phase:IndexPhase;filesIndexed:number;chunks:number;pending:number;embeddingModel?:string;message?:string;}
-export type McpTransport="http"|"stdio";export type McpServerStatus="pending"|"approved"|"connected"|"error"|"revoked";export interface McpServerInfo{id:string;transport:McpTransport;target:string;status:McpServerStatus;toolCount:number;message?:string;}
+export type McpTransport="http"|"stdio";export type McpServerStatus="pending"|"approved"|"connected"|"error"|"revoked";export interface McpServerInfo{id:string;transport:McpTransport;target:string;status:McpServerStatus;toolCount:number;message?:string;args?:string[];permissions?:unknown;envKeys?:string[];headerKeys?:string[];fingerprint?:string;}
 
 export interface OllamaRuntimeModel{name:string;sizeBytes:number;vramBytes:number;gpuPercent:number;contextLength:number;expiresAt?:string;}
 export interface PullProgress{model:string;phase:"pulling"|"done"|"error";status:string;percent?:number;error?:string;

@@ -8,11 +8,14 @@ import type {
   ToolRisk,
 } from "../../../shared/types";
 import type { ToolRegistry } from "../registry";
-import { clamp, fail, ok, type Tool } from "../types";
+import { BUILTIN_TOOL_NAMES, clamp, fail, ok, type Tool } from "../types";
 import { McpClient, type McpTool } from "./mcpClient";
 import { McpStdioClient } from "./mcpStdioClient";
 import type { IMcpClient } from "./transport";
 import { validateRemoteEndpoint, type DnsLookupFn } from "./dnsValidator";
+import { computeMcpConfigFingerprint } from "./fingerprint";
+
+export { computeMcpConfigFingerprint } from "./fingerprint";
 
 export const MCP_PREFIX = "mcp_";
 
@@ -46,6 +49,7 @@ export interface McpServerConfig {
   command?: string;
   args?: string[];
   env?: Record<string, string>;
+  cwd?: string;
   allowLocalNetwork?: boolean;
   permissions?: McpServerPermissions;
 }
@@ -56,6 +60,7 @@ interface Entry {
   status: McpServerStatus;
   toolCount: number;
   message?: string;
+  fingerprint?: string;
 }
 
 const ALLOWED_STDIO_BINS = new Set(["npx", "node", "python", "python3", "uvx", "bun", "deno"]);
@@ -85,11 +90,13 @@ export class McpManager {
       if (c.permissions) {
         this.permissions.set(c.id, c.permissions);
       }
+      const fp = computeMcpConfigFingerprint(c);
       const e = this.entries.get(c.id);
       if (e) {
         e.config = c;
+        e.fingerprint = fp;
       } else {
-        this.entries.set(c.id, { config: c, status: "pending", toolCount: 0 });
+        this.entries.set(c.id, { config: c, status: "pending", toolCount: 0, fingerprint: fp });
       }
     }
   }
@@ -160,7 +167,12 @@ export class McpManager {
       const tools = await client.listTools();
       this.registry.unregisterByPrefix(prefixFor(id));
       for (const t of tools) {
-        this.registry.register(makeBridgedTool(id, client, t, this));
+        const bridged = makeBridgedTool(id, client, t, this);
+        if (BUILTIN_TOOL_NAMES.has(bridged.spec.name)) {
+          this.log(`MCP "${id}": skipping tool "${bridged.spec.name}" because it collides with a built-in tool.`);
+          continue;
+        }
+        this.registry.register(bridged);
       }
       e.client = client;
       e.status = "connected";
@@ -185,6 +197,14 @@ export class McpManager {
     e.status = status;
   }
 
+  setServerMessage(id: string, message: string, status?: McpServerStatus): void {
+    const e = this.entries.get(id);
+    if (e) {
+      e.message = message;
+      if (status) e.status = status;
+    }
+  }
+
   list(): McpServerInfo[] {
     return [...this.entries.values()].map((e) => ({
       id: e.config.id,
@@ -193,6 +213,11 @@ export class McpManager {
       status: e.status,
       toolCount: e.toolCount,
       message: e.message,
+      args: e.config.args,
+      permissions: e.config.permissions,
+      envKeys: e.config.env ? Object.keys(e.config.env).sort() : undefined,
+      headerKeys: e.config.headers ? Object.keys(e.config.headers).sort() : undefined,
+      fingerprint: e.fingerprint ?? computeMcpConfigFingerprint(e.config),
     }));
   }
 
@@ -234,15 +259,7 @@ async function createClient(c: McpServerConfig, customLookup?: DnsLookupFn): Pro
       }
     }
 
-    const safeEnv: Record<string, string> | undefined = c.env
-      ? Object.fromEntries(
-          Object.entries(c.env).filter(
-            ([k]) => /^(PATH|NODE_ENV|PYTHONPATH)$/i.test(k) || k.startsWith("MCP_")
-          )
-        )
-      : undefined;
-
-    return new McpStdioClient(c.command, c.args ?? [], safeEnv);
+    return new McpStdioClient(c.command, c.args ?? [], c.env);
   }
 
   if (!c.url) throw new Error("http MCP server requires a `url`.");

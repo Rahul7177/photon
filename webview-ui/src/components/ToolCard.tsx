@@ -97,20 +97,32 @@ export function ToolCard({
   );
 }
 
-const KNOWN_STATUSES = new Set<string>(["proposed", "running", "done", "error", "denied"]);
+const KNOWN_STATUSES = new Set<string>([
+  "proposed",
+  "approval",
+  "running",
+  "done",
+  "error",
+  "denied",
+  "cancelled",
+  "timeout",
+]);
 
 const STATUS_LABELS: Record<string, string> = {
-  proposed: "Queued",
+  proposed: "Proposed",
+  approval: "Awaiting Approval",
   running: "Running…",
-  done: "Done",
+  done: "Completed",
   error: "Failed",
   denied: "Denied",
+  cancelled: "Cancelled",
+  timeout: "Timed Out",
 };
 
 function statusLabel(s: ToolCall["status"]): string {
   const label = STATUS_LABELS[String(s)];
   if (label) return label;
-  return typeof s === "string" && s.trim() ? s.trim() : "Queued";
+  return typeof s === "string" && s.trim() ? s.trim() : "Proposed";
 }
 
 function statusSymbol(status: string): string {
@@ -121,10 +133,15 @@ function statusSymbol(status: string): string {
       return "✕";
     case "denied":
       return "⊘";
+    case "cancelled":
+      return "⏹";
+    case "timeout":
+      return "⏱";
     case "approval":
       return "!";
     case "running":
       return "●";
+    case "proposed":
     default:
       return "○";
   }

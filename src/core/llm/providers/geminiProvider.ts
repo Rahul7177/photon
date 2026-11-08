@@ -1,6 +1,8 @@
 import type { ModelInfo, ThinkingLevel } from "../../../shared/types";
 import type { LLMChatChunk, LLMChatRequest, LLMProvider, ProviderModel } from "../types";
 import { fetchWithRetry, streamSse, tryJson } from "../sse";
+import { classifyHttpError } from "../errors";
+import { normalizeGeminiMessages } from "../normalizeMessages";
 
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
 type GeminiInputFunction = { function: { name: string; description?: string; parameters?: unknown } };
@@ -58,7 +60,7 @@ export class GeminiProvider implements LLMProvider {
     const res = await fetchWithRetry(`${GEMINI_BASE}/models`, { headers: geminiHeaders(this.apiKey) }, { retries: 1, timeoutMs: 12000 });
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
-      throw new Error(`Gemini model list failed (${res.status}). ${detail.slice(0, 500)}`.trim());
+      throw classifyHttpError(this.label, res.status, detail, res.headers, [this.apiKey]);
     }
     const json = (await res.json()) as {
       models?: { name: string; displayName?: string; supportedGenerationMethods?: string[]; inputTokenLimit?: number; outputTokenLimit?: number }[];
@@ -85,37 +87,7 @@ export class GeminiProvider implements LLMProvider {
     return out;
   }
   async *chatStream(req: LLMChatRequest, signal?: AbortSignal): AsyncGenerator<LLMChatChunk> {
-    const contents: { role: string; parts: Record<string, unknown>[] }[] = [];
-    let system = "";
-    for (const m of req.messages) {
-      if (m.role === "system") {
-        system += (system ? "\n\n" : "") + m.content;
-        continue;
-      }
-      if (m.role === "tool") {
-        const fnResp = { functionResponse: { name: m.name ?? "tool", response: { output: m.content } } };
-        const last = contents[contents.length - 1];
-        if (last && last.role === "user") last.parts.push(fnResp);
-        else contents.push({ role: "user", parts: [fnResp] });
-        continue;
-      }
-      if (m.role === "assistant" && m.tool_calls?.length) {
-        const parts: Record<string, unknown>[] = [];
-        if (m.content) parts.push({ text: m.content });
-        for (const tc of m.tool_calls) {
-          const fnPart: Record<string, unknown> = { functionCall: { name: tc.function.name, args: tc.function.arguments ?? {} } };
-          if (tc.thoughtSignature) fnPart.thoughtSignature = tc.thoughtSignature;
-          parts.push(fnPart);
-        }
-        contents.push({ role: "model", parts });
-        continue;
-      }
-      const role = m.role === "assistant" ? "model" : "user";
-      const parts: Record<string, unknown>[] = [];
-      if (m.content) parts.push({ text: m.content });
-      for (const img of m.images ?? []) parts.push({ inlineData: { mimeType: "image/png", data: img } });
-      contents.push({ role, parts });
-    }
+    const { system, contents } = normalizeGeminiMessages(req.messages);
     const body: Record<string, unknown> = { contents, generationConfig: {} };
     if (system) body.systemInstruction = { parts: [{ text: system }] };
     const gc = body.generationConfig as Record<string, unknown>;
@@ -133,7 +105,7 @@ export class GeminiProvider implements LLMProvider {
     );
     if (!res.ok || !res.body) {
       const detail = await res.text().catch(() => "");
-      throw new Error(`Gemini streamGenerateContent failed (${res.status}). ${detail.slice(0, 500)}`.trim());
+      throw classifyHttpError(this.label, res.status, detail, res.headers, [this.apiKey]);
     }
     let gotTerminal = false;
     let inputTokens = 0;
@@ -156,7 +128,9 @@ export class GeminiProvider implements LLMProvider {
         }[];
       }>(payload);
       if (!json) continue;
-      if (json.promptFeedback?.blockReason) throw new Error(`Gemini blocked the request (${json.promptFeedback.blockReason}).`);
+      if (json.promptFeedback?.blockReason) {
+        throw classifyHttpError(this.label, 400, `Gemini blocked the request: ${json.promptFeedback.blockReason}`, undefined, [this.apiKey]);
+      }
       if (json.usageMetadata) {
         if (json.usageMetadata.promptTokenCount !== undefined) inputTokens = json.usageMetadata.promptTokenCount;
         if (json.usageMetadata.candidatesTokenCount !== undefined) outputTokens = json.usageMetadata.candidatesTokenCount;

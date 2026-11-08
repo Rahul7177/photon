@@ -55,10 +55,12 @@ const MAX_FILE_BYTES = 300 * 1024;
 const IGNORE_DIRS = new Set([
   "node_modules",
   ".git",
+  ".photon",
   "dist",
   "out",
   "build",
   ".next",
+  ".nuxt",
   ".venv",
   "venv",
   "__pycache__",
@@ -227,7 +229,7 @@ export class ProjectContextManager {
 
       for (const entry of entries) {
         if (fileCount >= MAX_INDEXED_FILES) break;
-        if (entry.name.startsWith(".") && entry.name !== ".photon") continue;
+        if (entry.name.startsWith(".")) continue;
 
         const rel = current.rel ? `${current.rel}/${entry.name}` : entry.name;
         const abs = path.join(current.abs, entry.name);
@@ -309,12 +311,35 @@ export class ProjectContextManager {
   }
 
   /**
-   * Remove a deleted file from the project context index.
+   * Remove a deleted file from the project context index and clean active/recent caches.
    */
   removeFile(relPath: string): void {
     const clean = normalizeRelPath(relPath);
     if (this.data.files[clean]) {
       delete this.data.files[clean];
+      this.data.activeFiles = this.data.activeFiles.filter((p) => p !== clean);
+      this.data.recentEdits = this.data.recentEdits.filter((e) => e.path !== clean);
+      this.computeTopDirectories();
+      this.data.lastUpdatedAt = Date.now();
+      this.scheduleSave();
+      this.notify();
+    }
+  }
+
+  /**
+   * Rename a tracked file within the project context index.
+   */
+  renameFile(oldRel: string, newRel: string): void {
+    const oldClean = normalizeRelPath(oldRel);
+    const newClean = normalizeRelPath(newRel);
+    const entry = this.data.files[oldClean];
+    if (entry) {
+      delete this.data.files[oldClean];
+      this.data.files[newClean] = { ...entry, path: newClean };
+      this.data.activeFiles = this.data.activeFiles.map((p) => (p === oldClean ? newClean : p));
+      this.data.recentEdits = this.data.recentEdits.map((e) =>
+        e.path === oldClean ? { ...e, path: newClean } : e
+      );
       this.computeTopDirectories();
       this.data.lastUpdatedAt = Date.now();
       this.scheduleSave();
@@ -490,12 +515,23 @@ export class ProjectContextManager {
       }
     }
 
+    // Extract verified facts from successful and failed tool executions
+    const verifiedToolOutcomes: string[] = [];
+    for (const t of input.toolsUsed) {
+      const target = (t.args.path ?? t.args.file_path ?? t.args.from ?? "") as string;
+      if (t.ok) {
+        verifiedToolOutcomes.push(`Verified ${t.name}: ${target}`);
+      } else {
+        verifiedToolOutcomes.push(`Attempted ${t.name} (failed): ${target}`);
+      }
+    }
+
     // Extract concise findings from the assistant response (first 2-3 bullet points or sentences)
-    const findings = extractKeyPoints(input.assistantResponse, 4);
+    const findings = extractKeyPoints(input.assistantResponse, 3);
     const prevFindings = this.data.latestHandoff?.keyFindings ?? [];
-    const mergedFindings = [...findings, ...prevFindings]
+    const mergedFindings = [...verifiedToolOutcomes, ...findings, ...prevFindings]
       .filter((v, i, a) => a.indexOf(v) === i)
-      .slice(0, 6);
+      .slice(0, 8);
 
     this.data.latestHandoff = {
       fromModel: input.fromModel,
@@ -1049,8 +1085,15 @@ export class ProjectContextManager {
   async saveToDisk(): Promise<void> {
     if (!this.storageFilePath) return;
     try {
+      // Bound memory and persisted fields
+      if (this.data.notes.length > 50) this.data.notes = this.data.notes.slice(-50);
+      if (this.data.recentEdits.length > 20) this.data.recentEdits = this.data.recentEdits.slice(-20);
+      if (this.data.activeFiles.length > 15) this.data.activeFiles = this.data.activeFiles.slice(-15);
+
       await fs.mkdir(path.dirname(this.storageFilePath), { recursive: true });
-      await fs.writeFile(this.storageFilePath, JSON.stringify(this.data), "utf8");
+      const tmpPath = `${this.storageFilePath}.${randomUUID()}.tmp`;
+      await fs.writeFile(tmpPath, JSON.stringify(this.data), "utf8");
+      await fs.rename(tmpPath, this.storageFilePath);
     } catch {
       // ignore disk write errors
     }

@@ -37,6 +37,9 @@ export interface AutoModeInput {
   benchByModel?: Map<string, BenchResult>;
   pinnedModel?: string;
   previousModel?: string;
+  adaptiveEnabled?: boolean;
+  localOnly?: boolean;
+  allowCloudEscalation?: boolean;
 }
 
 function classifyHardwareFit(
@@ -58,20 +61,27 @@ export function rankModels(
   models: ModelInfo[],
   complexity: ComplexityAssessment,
   benchByModel?: Map<string, BenchResult>,
-  machine?: MachineProfile | null
+  machine?: MachineProfile | null,
+  options?: { localOnly?: boolean; previousModel?: string }
 ): ModelScore[] {
   const task = complexity.task ?? analyzeTask("", "agent");
-  const tpsValues = [...(benchByModel?.values() ?? [])].map((b) => b.tokensPerSec).filter((v) => v > 0);
+  const tpsValues = [...(benchByModel?.values() ?? [])]
+    .filter((b) => (b.methodologyVersion ?? 0) >= 1 && (Date.now() - b.ranAt <= 30 * 86_400_000))
+    .map((b) => b.tokensPerSec)
+    .filter((v) => v > 0);
   const maxTps = Math.max(...tpsValues, 1);
   const idealReasoning = task.reasoning === "high" ? 0.85 : task.reasoning === "medium" ? 0.65 : 0.45;
   const idealTool = task.scope === "single_file" && task.verification.length === 0 ? 0.55 : 0.75;
 
   return models
     .map((m) => {
-      const bench = benchByModel?.get(m.name);
+      const rawBench = benchByModel?.get(m.name);
+      const bench = rawBench && (rawBench.methodologyVersion ?? 0) >= 1 && (Date.now() - rawBench.ranAt <= 30 * 86_400_000)
+        ? rawBench
+        : undefined;
       const caps = capabilityForModel(m, bench);
       const ctx = m.contextLength ?? 8192;
-      const fits = ctx >= complexity.minContextTokens;
+      let fits = ctx >= complexity.minContextTokens;
       const local = isLocalModel(m);
       const hwFit = classifyHardwareFit(m, machine);
       const pricing = local ? { inputPerMillion: 0, outputPerMillion: 0 } : getModelPricing(m.name);
@@ -79,6 +89,13 @@ export function rankModels(
 
       let score = 0;
       const reasons: string[] = [];
+
+      // Privacy / local-only constraint
+      if (options?.localOnly && !local) {
+        fits = false;
+        reasons.push("privacy: local-only constraint");
+        score -= 200;
+      }
 
       // 1. Task complexity signal
       reasons.push(`complexity:${complexity.level}`);
@@ -126,6 +143,10 @@ export function rankModels(
         reasons.push("local ($0)");
       } else {
         reasons.push(`cloud ($${estimatedCostPer1MUsd.toFixed(2)}/1M)`);
+        if (complexity.level === "simple" && estimatedCostPer1MUsd > 10) {
+          score -= 15;
+          reasons.push("cost-inefficient for simple task");
+        }
       }
       if (bench?.capabilityProfile) reasons.push("bench-profiled");
 
@@ -146,15 +167,46 @@ export function rankModels(
         signals,
       };
     })
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => {
+      const diff = b.score - a.score;
+      if (Math.abs(diff) > 0.001) return diff;
+      if (options?.previousModel) {
+        if (a.model === options.previousModel) return -1;
+        if (b.model === options.previousModel) return 1;
+      }
+      return a.model.localeCompare(b.model);
+    });
 }
 
 export function decideModel(input: AutoModeInput): AutoDecision {
   const promptTokens = estimateTokens(input.prompt ?? "");
   const task = analyzeTask(input.prompt, input.mode, input.attachmentCount ?? 0);
   const complexity = toComplexity(task, promptTokens);
-  const scores = rankModels(input.models, complexity, input.benchByModel, input.machine);
+  const scores = rankModels(input.models, complexity, input.benchByModel, input.machine, {
+    localOnly: input.localOnly,
+    previousModel: input.previousModel,
+  });
   const hasLocalModels = input.models.some((m) => isLocalModel(m));
+
+  // Adaptive-disabled mode preserves user selection directly
+  if (input.adaptiveEnabled === false) {
+    const prev = input.previousModel && input.models.find((m) => m.name === input.previousModel);
+    const chosen = prev ? prev.name : (input.pinnedModel ?? input.models[0]?.name ?? "");
+    const chosenScore = scores.find((s) => s.model === chosen);
+    const fallbacks = scores.filter((s) => s.model !== chosen && s.fits).map((s) => s.model);
+    return {
+      chosenModel: chosen,
+      auto: false,
+      pinned: !!input.pinnedModel,
+      complexity,
+      scores,
+      signals: chosenScore?.signals,
+      fallbackModels: fallbacks,
+      cloudEscalated: false,
+      previousModel: input.previousModel,
+      reason: `Adaptive disabled: preserving user-selected model ${chosen}.`,
+    };
+  }
 
   const pinnedExists = !!input.pinnedModel && input.models.some((m) => m.name === input.pinnedModel);
   if (pinnedExists) {
@@ -211,6 +263,10 @@ export function decideModel(input: AutoModeInput): AutoDecision {
     escalationNotice = `Auto-routed model change: ${input.previousModel} → ${best.model} (${complexity.level} task).`;
   }
 
+  const reason = !best.fits
+    ? `No model met context headroom for ${task.scope} (${complexity.minContextTokens.toLocaleString()} tokens); selected best available candidate ${best.model}.`
+    : `${best.model} selected for ${task.scope}/${task.reasoning} work; ${best.reasons.slice(0, 4).join(", ")}.`;
+
   return {
     chosenModel: best.model,
     auto: true,
@@ -222,7 +278,7 @@ export function decideModel(input: AutoModeInput): AutoDecision {
     cloudEscalated,
     previousModel: input.previousModel,
     escalationNotice,
-    reason: `${best.model} selected for ${task.scope}/${task.reasoning} work; ${best.reasons.slice(0, 4).join(", ")}.`,
+    reason,
   };
 }
 

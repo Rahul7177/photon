@@ -39,12 +39,59 @@ const MIN_CONNECT_TIMEOUT_MS = 15_000;
  *  OLLAMA_CONTEXT_LENGTH env var (e.g. 131072) and triggering a cold reload. */
 const SAFE_FALLBACK_CTX = 8192;
 
+export type ModelLifecycleState =
+  | "daemon_unreachable"
+  | "not_installed"
+  | "installed"
+  | "loaded"
+  | "ready";
+
+export function isLocalEndpoint(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
+export function validateClientOptions(opts: OllamaClientOptions): OllamaClientOptions {
+  const timeoutMs = Math.max(1000, opts.timeoutMs ?? 60_000);
+  const connectTimeoutMs = Math.max(
+    MIN_CONNECT_TIMEOUT_MS,
+    opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
+  );
+  let keepAlive = opts.keepAlive;
+  if (keepAlive !== undefined) {
+    const trimmed = String(keepAlive).trim();
+    if (!/^-?\d+(?:[mshd])?$/i.test(trimmed)) {
+      keepAlive = "5m"; // fallback to default on invalid syntax
+    }
+  }
+  return { ...opts, timeoutMs, connectTimeoutMs, keepAlive };
+}
+
 /**
  * Minimal, dependency-free client for a local Ollama server.
  * Uses the global fetch (Node 18+/20+) and streams NDJSON responses.
  */
 export class OllamaClient {
-  constructor(private opts: OllamaClientOptions) {}
+  private opts: OllamaClientOptions;
+  private activeStreams = 0;
+  private activeTurnModel: string | null = null;
+
+  constructor(opts: OllamaClientOptions) {
+    this.opts = validateClientOptions(opts);
+  }
+
+  getActiveTurnModel(): string | null {
+    return this.activeTurnModel;
+  }
+
+  isTurnActive(): boolean {
+    return this.activeStreams > 0;
+  }
 
   /** Last num_ctx used per model. Ollama reloads a model whenever num_ctx
    *  differs from the loaded runner's, so every request to a model must agree. */
@@ -71,7 +118,7 @@ export class OllamaClient {
   }
 
   update(opts: Partial<OllamaClientOptions>) {
-    this.opts = { ...this.opts, ...opts };
+    this.opts = validateClientOptions({ ...this.opts, ...opts });
   }
 
   /** Cheap reachability probe used on activation and by diagnostics. */
@@ -134,8 +181,11 @@ export class OllamaClient {
     }
   }
 
-  /** Explicitly unload a model from GPU/RAM (`keep_alive: 0`). */
-  async unloadModel(model: string): Promise<void> {
+  /** Explicitly unload a model from GPU/RAM (`keep_alive: 0`). Blocked if model is active in an ongoing turn. */
+  async unloadModel(model: string): Promise<boolean> {
+    if (this.activeStreams > 0 && this.activeTurnModel === model) {
+      return false;
+    }
     const res = await this.fetch(
       "/api/chat",
       {
@@ -146,6 +196,7 @@ export class OllamaClient {
     );
     await res.body?.cancel().catch(() => undefined);
     this.lastCtx.delete(model);
+    return true;
   }
 
   /** Stream a `POST /api/pull` download for a model name, reporting progress. */
@@ -254,23 +305,32 @@ export class OllamaClient {
     req: OllamaChatRequest,
     signal?: AbortSignal
   ): AsyncGenerator<OllamaChatChunk, void, unknown> {
-    // Ollama may evict/restart the model runner between turns (idle unload,
-    // VRAM pressure, runner crash) -> 5xx or an empty stream with no reply.
-    // Retry transparently (the retry reloads the model) if nothing was yielded.
-    const MAX_RETRIES = 2;
-    for (let attempt = 0; ; attempt++) {
-      let yielded = false;
-      try {
-        for await (const chunk of this.chatStreamOnce(req, signal)) {
-          yielded = true;
-          yield chunk;
+    this.activeStreams++;
+    this.activeTurnModel = req.model;
+    try {
+      // Ollama may evict/restart the model runner between turns (idle unload,
+      // VRAM pressure, runner crash) -> 5xx or an empty stream with no reply.
+      // Retry transparently (the retry reloads the model) if nothing was yielded.
+      const MAX_RETRIES = 2;
+      for (let attempt = 0; ; attempt++) {
+        let yielded = false;
+        try {
+          for await (const chunk of this.chatStreamOnce(req, signal)) {
+            yielded = true;
+            yield chunk;
+          }
+          if (yielded || signal?.aborted || attempt >= MAX_RETRIES) return;
+        } catch (err) {
+          const retryable = err instanceof OllamaError && /failed \(5\d\d\)/.test(err.message);
+          if (yielded || signal?.aborted || !retryable || attempt >= MAX_RETRIES) throw err;
         }
-        if (yielded || signal?.aborted || attempt >= MAX_RETRIES) return;
-      } catch (err) {
-        const retryable = err instanceof OllamaError && /failed \(5\d\d\)/.test(err.message);
-        if (yielded || signal?.aborted || !retryable || attempt >= MAX_RETRIES) throw err;
+        await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
       }
-      await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+    } finally {
+      this.activeStreams = Math.max(0, this.activeStreams - 1);
+      if (this.activeStreams === 0) {
+        this.activeTurnModel = null;
+      }
     }
   }
 
@@ -396,9 +456,13 @@ export class OllamaClient {
 
   /**
    * Best-effort background warmup: loads `model` into memory now so the first
-   * real turn doesn't pay the cold load.
+   * real turn doesn't pay the cold load. Will NOT evict a model used by an active turn.
    */
-  async warmup(model: string, timeoutMs?: number, numCtx?: number): Promise<void> {
+  async warmup(model: string, timeoutMs?: number, numCtx?: number): Promise<boolean> {
+    if (this.activeStreams > 0 && this.activeTurnModel && this.activeTurnModel !== model) {
+      // Preload must not evict a model used by an active turn!
+      return false;
+    }
     const ms = Math.max(timeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS, MIN_CONNECT_TIMEOUT_MS);
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), ms);
@@ -419,6 +483,7 @@ export class OllamaClient {
       });
       await res.body?.cancel().catch(() => undefined);
       if (!res.ok) throw new OllamaError(`Warmup for "${model}" failed (${res.status}).`);
+      return true;
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
         throw new OllamaError(`Warmup for "${model}" timed out after ${Math.round(ms / 1000)}s.`);
@@ -427,6 +492,31 @@ export class OllamaClient {
     } finally {
       clearTimeout(t);
     }
+  }
+
+  /**
+   * Distinguish daemon reachable, model installed, model loaded, and generation ready.
+   */
+  async getModelLifecycleState(model: string): Promise<ModelLifecycleState> {
+    const reachable = await this.ping();
+    if (!reachable) return "daemon_unreachable";
+
+    const tags = await this.listModels().catch(() => ({ models: [] }));
+    const norm = model.toLowerCase();
+    const installed = tags.models.some((m) => {
+      const mn = m.name.toLowerCase();
+      return mn === norm || mn.startsWith(`${norm}:`) || norm.startsWith(`${mn}:`);
+    });
+    if (!installed) return "not_installed";
+
+    const running = await this.listRunning().catch(() => []);
+    const loaded = running.some((m) => {
+      const mn = (m.name ?? "").toLowerCase();
+      return mn === norm || mn.startsWith(`${norm}:`) || norm.startsWith(`${mn}:`);
+    });
+    if (!loaded) return "installed";
+
+    return "loaded";
   }
 
   /** Total-timeout fetch for the small, quick JSON endpoints. */

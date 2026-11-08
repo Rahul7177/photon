@@ -1,9 +1,12 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
 import type { BenchResult, BenchTaskOutcome, ModelCapabilityProfile, ToolSpec } from "../../shared/types";
 import type { LLMProvider, LLMChatChunk, LLMMessage } from "../llm/types";
 import { parsePhotonBlocks } from "../protocol/parse";
 import { estimateTokens } from "../adaptive/tokens";
 
-export const BENCH_VERSION = 3;
+export const BENCH_VERSION = 4;
 const BENCH_OPTS = { temperature: 0, top_p: 1, num_ctx: 4096, num_predict: 260, seed: 7 };
 
 const PROBE_READ_TOOL: ToolSpec = {
@@ -200,6 +203,298 @@ export function compareRoutingVsBaseline(
   };
 }
 
+/**
+ * Calculates statistical percentiles (p50, p90, p95, p99), mean, variance, min, max.
+ */
+export function computePercentiles(samples: number[]): {
+  p50: number;
+  p90: number;
+  p95: number;
+  p99: number;
+  mean: number;
+  variance: number;
+  min: number;
+  max: number;
+} {
+  if (samples.length === 0) {
+    return { p50: 0, p90: 0, p95: 0, p99: 0, mean: 0, variance: 0, min: 0, max: 0 };
+  }
+  const sorted = [...samples].sort((a, b) => a - b);
+  const min = sorted[0];
+  const max = sorted[sorted.length - 1];
+  const sum = sorted.reduce((acc, val) => acc + val, 0);
+  const mean = sum / sorted.length;
+  const variance =
+    sorted.reduce((acc, val) => acc + Math.pow(val - mean, 2), 0) / sorted.length;
+
+  const getPercentile = (pct: number): number => {
+    const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((pct / 100) * sorted.length) - 1));
+    return sorted[idx];
+  };
+
+  return {
+    p50: Math.round(getPercentile(50) * 100) / 100,
+    p90: Math.round(getPercentile(90) * 100) / 100,
+    p95: Math.round(getPercentile(95) * 100) / 100,
+    p99: Math.round(getPercentile(99) * 100) / 100,
+    mean: Math.round(mean * 100) / 100,
+    variance: Math.round(variance * 100) / 100,
+    min,
+    max,
+  };
+}
+
+/**
+ * Calculates the weighted composite score for a benchmark result.
+ * Composite weighting:
+ * - Speed (normalized against 80 tok/s): 25%
+ * - Tool Calling Reliability: 25%
+ * - Algorithmic Reasoning: 25%
+ * - Coding Outcome Tasks: 25%
+ */
+export function calculateCompositeBenchmarkScore(result: BenchResult): {
+  compositeScore: number;
+  breakdown: {
+    speedScore: number;
+    toolCallingScore: number;
+    reasoningScore: number;
+    codingOutcomeScore: number;
+  };
+  explanation: string;
+} {
+  const speedScore = Math.min(1.0, Math.max(0, result.tokensPerSec / 80));
+  const toolCallingScore = Math.min(1.0, Math.max(0, result.toolCallReliability));
+  const reasoningScore = result.reasoningPass ? 1.0 : 0.0;
+
+  const codingTaskIds = new Set(["tool_selection", "recovery", "edit", "verification", "context"]);
+  const codingTasks = (result.tasks ?? []).filter((t) => codingTaskIds.has(t.id));
+  const codingOutcomeScore =
+    codingTasks.length > 0
+      ? codingTasks.filter((t) => t.passed).length / codingTasks.length
+      : 0.5;
+
+  const compositeScore =
+    Math.round(
+      (0.25 * speedScore + 0.25 * toolCallingScore + 0.25 * reasoningScore + 0.25 * codingOutcomeScore) *
+        1000
+    ) / 1000;
+
+  const explanation =
+    `Composite Score ${Math.round(compositeScore * 100)}%: ` +
+    `Speed (25% weight): ${Math.round(speedScore * 100)}% (${result.tokensPerSec} tok/s), ` +
+    `Tool Calling (25% weight): ${Math.round(toolCallingScore * 100)}%, ` +
+    `Reasoning (25% weight): ${Math.round(reasoningScore * 100)}%, ` +
+    `Coding Tasks (25% weight): ${Math.round(codingOutcomeScore * 100)}%.`;
+
+  return {
+    compositeScore,
+    breakdown: {
+      speedScore: Math.round(speedScore * 100) / 100,
+      toolCallingScore: Math.round(toolCallingScore * 100) / 100,
+      reasoningScore: Math.round(reasoningScore * 100) / 100,
+      codingOutcomeScore: Math.round(codingOutcomeScore * 100) / 100,
+    },
+    explanation,
+  };
+}
+
+export interface RepoTaskOptions {
+  signal?: AbortSignal;
+  attemptWrongFile?: boolean;
+  attemptExtraneousEdit?: boolean;
+  attemptPartialPatch?: boolean;
+}
+
+export interface RepoTaskOutcome {
+  taskCompleted: boolean;
+  inspectPassed: boolean;
+  editApplied: boolean;
+  testPassed: boolean;
+  noExtraneousEdits: boolean;
+  detail: string;
+  cleanedUp: boolean;
+}
+
+/**
+ * Executes a deterministic end-to-end repository task inside an isolated disposable
+ * workspace in the OS temporary directory (NEVER in the user's real project).
+ * Evaluates the full lifecycle: inspect -> edit -> build/test -> verify postconditions.
+ * Explicitly guards against wrong-file edits, partial patches, and extraneous destructive changes.
+ */
+export function evaluateRepoTaskInDisposableWorkspace(
+  taskRunner: (repoDir: string) => {
+    inspected?: boolean;
+    toolCalls?: Array<{ name: string; args: Record<string, unknown> }>;
+    editedPath?: string;
+    oldStr?: string;
+    newStr?: string;
+  },
+  options: RepoTaskOptions = {}
+): RepoTaskOutcome {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "photon-bench-repo-"));
+
+  try {
+    if (options.signal?.aborted) {
+      return {
+        taskCompleted: false,
+        inspectPassed: false,
+        editApplied: false,
+        testPassed: false,
+        noExtraneousEdits: true,
+        detail: "Benchmark task cancelled before execution",
+        cleanedUp: false,
+      };
+    }
+
+    // Initialize disposable workspace structure
+    const srcDir = path.join(repoDir, "src");
+    const testDir = path.join(repoDir, "test");
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.mkdirSync(testDir, { recursive: true });
+
+    // Target file to fix
+    const targetFilePath = path.join(srcDir, "pricing.ts");
+    const initialTargetContent =
+      `export function calculatePrice(base: number, taxRate: number): number {\n` +
+      `  return base + base * taxRate;\n` +
+      `}\n` +
+      `export function calculateDiscount(base: number, discountRate: number): number {\n` +
+      `  return base + base * discountRate;\n` + // Bug: plus instead of minus
+      `}\n`;
+    fs.writeFileSync(targetFilePath, initialTargetContent, "utf8");
+
+    // Unrelated control file to ensure no extraneous modifications
+    const controlFilePath = path.join(srcDir, "constants.ts");
+    const initialControlContent = `export const APP_ID = "photon-core-v1";\nexport const MAX_RETRY = 5;\n`;
+    fs.writeFileSync(controlFilePath, initialControlContent, "utf8");
+
+    // Run the candidate's action
+    const actions = taskRunner(repoDir);
+
+    const inspectPassed = Boolean(actions.inspected);
+
+    // Apply the candidate's edit
+    let editApplied = false;
+    let editError = "";
+
+    const candidatePath = actions.editedPath || "src/pricing.ts";
+    const fullCandidatePath = path.resolve(repoDir, candidatePath);
+
+    // 1. Safety check: target must be inside disposable repoDir
+    const rel = path.relative(repoDir, fullCandidatePath);
+    const escapes = rel.startsWith("..") || path.isAbsolute(rel);
+
+    if (escapes || options.attemptWrongFile || candidatePath.includes("other.ts")) {
+      editError = `Rejected: attempt to edit wrong file or escape repository boundary (${candidatePath})`;
+    } else if (!fs.existsSync(fullCandidatePath)) {
+      editError = `Rejected: target file does not exist (${candidatePath})`;
+    } else {
+      const currentContent = fs.readFileSync(fullCandidatePath, "utf8");
+      const oldStr = actions.oldStr ?? "";
+      const newStr = actions.newStr ?? "";
+
+      if (options.attemptPartialPatch || !currentContent.includes(oldStr)) {
+        editError = `Rejected: exact old_str invariant not found in target file`;
+      } else {
+        const updated = currentContent.replace(oldStr, newStr);
+        fs.writeFileSync(fullCandidatePath, updated, "utf8");
+        editApplied = true;
+      }
+    }
+
+    // 2. Extraneous edit check: ensure constants.ts was untouched
+    const currentControl = fs.readFileSync(controlFilePath, "utf8");
+    const noExtraneousEdits = !options.attemptExtraneousEdit && currentControl === initialControlContent;
+
+    // 3. Postcondition test: test invariant
+    let testPassed = false;
+    if (editApplied && noExtraneousEdits) {
+      const updatedTarget = fs.readFileSync(targetFilePath, "utf8");
+      // Objective check: discount function must subtract instead of add
+      const fixedDiscount = /return\s+base\s*-\s*base\s*\*\s*discountRate|base\s*\*\s*\(\s*1\s*-\s*discountRate\s*\)/.test(
+        updatedTarget
+      );
+      // Invariant check: calculatePrice must remain untouched
+      const pricePreserved = /return\s+base\s*\+\s*base\s*\*\s*taxRate/.test(updatedTarget);
+      testPassed = fixedDiscount && pricePreserved;
+    }
+
+    const taskCompleted = inspectPassed && editApplied && testPassed && noExtraneousEdits;
+    const detail = taskCompleted
+      ? "Repository task successfully completed: inspect -> edit -> test -> verified in disposable sandbox"
+      : editError ||
+        (!noExtraneousEdits
+          ? "Extraneous file modified during task"
+          : "Postcondition test failed: patch did not resolve bug or regressed invariants");
+
+    return {
+      taskCompleted,
+      inspectPassed,
+      editApplied,
+      testPassed,
+      noExtraneousEdits,
+      detail,
+      cleanedUp: true,
+    };
+  } finally {
+    try {
+      fs.rmSync(repoDir, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
+/**
+ * Measures throughput across multiple repeated trials and calculates variance and percentiles.
+ */
+export async function measureThroughputWithTrials(
+  client: LLMProvider,
+  model: string,
+  trials = 3,
+  signal?: AbortSignal
+): Promise<{
+  tokensPerSec: number;
+  firstTokenMs: number;
+  variance: number;
+  p50: number;
+  p95: number;
+  samples: number[];
+}> {
+  const samples: number[] = [];
+  const firstTokenSamples: number[] = [];
+
+  for (let i = 0; i < trials; i++) {
+    if (signal?.aborted) break;
+    const res = await generate(
+      client,
+      model,
+      [
+        {
+          role: "user",
+          content:
+            "Write a TypeScript function add(a: number, b: number): number that returns the sum. Code only.",
+        },
+      ],
+      signal
+    );
+    if (res.tokensPerSec > 0) {
+      samples.push(res.tokensPerSec);
+      firstTokenSamples.push(res.firstTokenMs);
+    }
+  }
+
+  const stats = computePercentiles(samples);
+  const ftStats = computePercentiles(firstTokenSamples);
+
+  return {
+    tokensPerSec: stats.mean,
+    firstTokenMs: ftStats.mean,
+    variance: stats.variance,
+    p50: stats.p50,
+    p95: stats.p95,
+    samples,
+  };
+}
+
 export async function runBench(client: LLMProvider, model: string, opts: BenchOptions): Promise<BenchResult> {
   const tasks: BenchTaskOutcome[] = [];
   opts.onProgress?.("Measuring throughput and latency…");
@@ -212,7 +507,7 @@ export async function runBench(client: LLMProvider, model: string, opts: BenchOp
   tasks.push({
     id: "throughput",
     passed: speed.tokensPerSec > 0,
-    detail: `${Math.round(speed.tokensPerSec)} tok/s, first token ${Math.round(speed.firstTokenMs)} ms`,
+    detail: `capability_probe:throughput: ${Math.round(speed.tokensPerSec)} tok/s, first token ${Math.round(speed.firstTokenMs)} ms`,
   });
 
   opts.onProgress?.("Measuring tool-call reliability…");
@@ -236,8 +531,8 @@ export async function runBench(client: LLMProvider, model: string, opts: BenchOp
     }
   }
   const toolReliability = toolPasses / TOOLCALL_ATTEMPTS;
-  tasks.push({ id: "toolcall", passed: toolReliability >= 0.67, detail: `${toolPasses}/${TOOLCALL_ATTEMPTS} well-formed calls` });
-  tasks.push({ id: "schema", passed: toolReliability >= 0.67, detail: `schema adherence ${Math.round(toolReliability * 100)}%` });
+  tasks.push({ id: "toolcall", passed: toolReliability >= 0.67, detail: `capability_probe:toolcall: ${toolPasses}/${TOOLCALL_ATTEMPTS} well-formed calls` });
+  tasks.push({ id: "schema", passed: toolReliability >= 0.67, detail: `capability_probe:schema: adherence ${Math.round(toolReliability * 100)}%` });
 
   opts.onProgress?.("Checking file & tool selection and recovery…");
   const select = await generate(
@@ -265,9 +560,9 @@ export async function runBench(client: LLMProvider, model: string, opts: BenchOp
     passed: selectionPass,
     detail: selectionPass
       ? selectedRightFile
-        ? "selected read/search tool + correct file (src/config/parser.ts)"
-        : "selected a read/search tool"
-      : "selected an unsafe or invalid tool",
+        ? "capability_probe:selection: selected read/search tool + correct file (src/config/parser.ts)"
+        : "capability_probe:selection: selected a read/search tool"
+      : "capability_probe:selection: selected an unsafe or invalid tool",
   });
 
   const recover = await generate(
@@ -292,7 +587,7 @@ export async function runBench(client: LLMProvider, model: string, opts: BenchOp
   tasks.push({
     id: "recovery",
     passed: recoveryPass,
-    detail: recoveryPass ? "selected search/find recovery instead of repeating failed read" : "did not choose search/re-read recovery",
+    detail: recoveryPass ? "capability_probe:recovery: selected search/find recovery" : "capability_probe:recovery: did not choose search/re-read recovery",
   });
 
   opts.onProgress?.("Checking coding patch correctness and verification…");
@@ -313,7 +608,7 @@ export async function runBench(client: LLMProvider, model: string, opts: BenchOp
   );
   const patchCheck = evaluateCodingPatchOutput(edit.text);
   const editPass = patchCheck.passed;
-  tasks.push({ id: "edit", passed: editPass, detail: patchCheck.detail });
+  tasks.push({ id: "edit", passed: editPass, detail: `capability_probe:patch: ${patchCheck.detail}` });
 
   const verify = await generate(
     client,
@@ -333,7 +628,7 @@ export async function runBench(client: LLMProvider, model: string, opts: BenchOp
   tasks.push({
     id: "verification",
     passed: verificationPass,
-    detail: verificationPass ? "selected an objective verification check" : "did not select verification",
+    detail: verificationPass ? "capability_probe:verification: selected an objective verification check" : "capability_probe:verification: did not select verification",
   });
 
   opts.onProgress?.("Checking multi-step coding context retention…");
@@ -351,7 +646,7 @@ export async function runBench(client: LLMProvider, model: string, opts: BenchOp
   tasks.push({
     id: "context",
     passed: contextPass,
-    detail: contextPass ? "retained multi-turn coding state" : "lost prior coding state",
+    detail: contextPass ? "capability_probe:context: retained multi-turn coding state" : "capability_probe:context: lost prior coding state",
   });
 
   opts.onProgress?.("Checking coding & algorithmic reasoning…");
@@ -370,7 +665,7 @@ export async function runBench(client: LLMProvider, model: string, opts: BenchOp
   tasks.push({
     id: "reasoning",
     passed: reasoningPass,
-    detail: reasoningPass ? "correct (6)" : `unexpected: "${reason.text.trim().slice(0, 40)}"`,
+    detail: reasoningPass ? "capability_probe:reasoning: correct (6)" : `capability_probe:reasoning: unexpected: "${reason.text.trim().slice(0, 40)}"`,
   });
 
   const codingOutcomeComposite =

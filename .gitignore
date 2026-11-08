@@ -6,5 +6,9 @@ out/
 *.log
 deepseek-harness/
 .vscode/
-.photon/
+.photon/*
+!.photon/config.json
+!.photon/config.yaml
+!.photon/config.yml
+!.photon/mcp.json
 *.tmp

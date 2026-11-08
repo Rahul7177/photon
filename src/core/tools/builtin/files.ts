@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ToolCall } from "../../../shared/types";
-import { resolveInWorkspace } from "../paths";
+import { resolveInWorkspace, atomicWriteFile } from "../paths";
 import { clamp, clampToolResult, fail, ok, toolError, type Tool } from "../types";
 import { getProjectContextManager } from "../../context/projectContext";
 
@@ -368,8 +368,11 @@ export const readFileTool: Tool = {
       if (st && st.size > MAX_READ_BYTES) {
         return toolError("invalid_args", `"${rel}" is ${(st.size / 1024 / 1024).toFixed(1)}MB — too large to read fully. Pass start_line/end_line to read a range.`, { recovery: { action: "reread" } });
       }
-      const raw = await fs.readFile(r.abs, "utf8");
+      let raw = await fs.readFile(r.abs, "utf8");
       if (raw.includes("\0")) return toolError("invalid_args", `"${rel}" looks like a binary file — refusing to dump it as text.`, { recovery: { action: "reread" } });
+      if (raw.startsWith("\uFEFF")) {
+        raw = raw.slice(1); // Strip UTF-8 BOM
+      }
       void ctxMgr?.recordFileRead(rel);
 
       const lines = raw.split("\n");
@@ -462,7 +465,7 @@ export const writeFileTool: Tool = {
     // existed file to allow overwrite"), which silently contradicted the
     // tool's own contract ("Fails if the file already exists") and let a
     // model overwrite files it didn't mean to touch. Restored.
-    const existed = await fs.stat(r.abs).then(() => true).catch(() => false);
+    const existed = await fs.lstat(r.abs).then(() => true).catch(() => false);
     if (existed) {
       return toolError(
         "conflict",
@@ -475,12 +478,17 @@ export const writeFileTool: Tool = {
     if (!approved) return toolError("permission_denied", "User declined the file write.");
     try {
       await ctx.checkpointTracker?.recordBeforeChange(rel);
-      await fs.mkdir(path.dirname(r.abs), { recursive: true });
-      await fs.writeFile(r.abs, content, "utf8");
+      await atomicWriteFile(ctx.workspaceRoot!, rel, content);
       const lines = content.split("\n").length;
       void getProjectContextManager(ctx.workspaceRoot)?.recordFileEdit(rel, `Created file (${lines} lines)`);
       return ok(`Created ${rel} — ${lines} line${lines === 1 ? "" : "s"}, ${content.length} bytes.`);
-    } catch (e) {
+    } catch (e: any) {
+      if (e?.code === "EACCES" || e?.code === "EPERM") {
+        return toolError("permission_denied", `Permission denied creating "${rel}": target path is read-only or permission was denied.`);
+      }
+      if (e?.code === "EBUSY") {
+        return toolError("execution_error", `File is locked by another process: "${rel}".`);
+      }
       return toolError("execution_error", `Could not write "${rel}": ${(e as Error).message}`);
     }
   },
@@ -532,8 +540,13 @@ export const editFileTool: Tool = {
     const append = args.append === true;
 
     let original: string | undefined = undefined;
+    let hasBom = false;
     try {
       original = await fs.readFile(r.abs, "utf8");
+      if (original.startsWith("\uFEFF")) {
+        hasBom = true;
+        original = original.slice(1);
+      }
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
       if (err?.code === "ENOENT") {
@@ -543,6 +556,10 @@ export const editFileTool: Tool = {
           if (!("error" in alt)) {
             try {
               original = await fs.readFile(alt.abs, "utf8");
+              if (original.startsWith("\uFEFF")) {
+                hasBom = true;
+                original = original.slice(1);
+              }
               rel = smart.resolved;
               r = alt;
             } catch {
@@ -560,6 +577,8 @@ export const editFileTool: Tool = {
         }
       } else if (err?.code === "EISDIR") {
         return toolError("invalid_args", `"${rel}" is a directory. Use list_dir on it.`, { recovery: { action: "reread" } });
+      } else if (err?.code === "EACCES" || err?.code === "EPERM") {
+        return toolError("permission_denied", `Permission denied reading "${rel}": file is read-only or permission was denied.`);
       } else {
         return toolError("execution_error", `Could not read "${rel}": ${err.message}`);
       }
@@ -577,10 +596,15 @@ export const editFileTool: Tool = {
       const approved = await ctx.requestApproval(mkCall("edit_file", args, ctx.pendingCallId));
       if (!approved) return toolError("permission_denied", "User declined the edit.");
       try {
+        const recheck = resolveInWorkspace(ctx.workspaceRoot, rel);
+        if ("error" in recheck) return toolError("not_found", recheck.error);
         const sep = original.length === 0 || original.endsWith("\n") ? "" : "\n";
-        await fs.appendFile(r.abs, sep + newStr, "utf8");
+        await fs.appendFile(recheck.abs, sep + newStr, "utf8");
         return ok(`Appended to ${rel}.`);
-      } catch (e) {
+      } catch (e: any) {
+        if (e?.code === "EACCES" || e?.code === "EPERM") {
+          return toolError("permission_denied", `Permission denied appending to "${rel}": file is read-only.`);
+        }
         return toolError("execution_error", `Could not append to "${rel}": ${(e as Error).message}`);
       }
     }
@@ -606,10 +630,17 @@ export const editFileTool: Tool = {
       if (!approved) return toolError("permission_denied", "User declined the edit.");
       try {
         await ctx.checkpointTracker?.recordBeforeChange(rel);
-        await fs.writeFile(r.abs, newStr, "utf8");
+        const toWrite = hasBom ? "\uFEFF" + newStr : newStr;
+        await atomicWriteFile(ctx.workspaceRoot!, rel, toWrite);
         const lines = newStr.split("\n").length;
         return ok(`Replaced ${rel} (whole file, ${lines} line${lines === 1 ? "" : "s"}).`);
-      } catch (e) {
+      } catch (e: any) {
+        if (e?.code === "EACCES" || e?.code === "EPERM") {
+          return toolError("permission_denied", `Permission denied modifying "${rel}": file is read-only.`);
+        }
+        if (e?.code === "EBUSY") {
+          return toolError("execution_error", `File is locked by another process: "${rel}".`);
+        }
         return toolError("execution_error", `Could not write "${rel}": ${(e as Error).message}`);
       }
     }
@@ -629,7 +660,8 @@ export const editFileTool: Tool = {
     if (!approved) return toolError("permission_denied", "User declined the edit.");
     try {
       await ctx.checkpointTracker?.recordBeforeChange(rel);
-      await fs.writeFile(r.abs, result.text, "utf8");
+      const toWrite = hasBom ? "\uFEFF" + result.text : result.text;
+      await atomicWriteFile(ctx.workspaceRoot!, rel, toWrite);
       const startLine = original.slice(0, result.firstIndex).split("\n").length;
       const newLines = result.text.split("\n").length;
       const oldLines = original.split("\n").length;
@@ -641,7 +673,13 @@ export const editFileTool: Tool = {
       return ok(
         `Edited ${rel} at line ~${startLine}${result.count > 1 ? ` (${result.count} occurrences)` : ""}. File is now ${newLines} line${newLines === 1 ? "" : "s"}${delta !== 0 ? ` (${delta > 0 ? "+" : ""}${delta})` : ""}.`
       );
-    } catch (e) {
+    } catch (e: any) {
+      if (e?.code === "EACCES" || e?.code === "EPERM") {
+        return toolError("permission_denied", `Permission denied modifying "${rel}": file is read-only.`);
+      }
+      if (e?.code === "EBUSY") {
+        return toolError("execution_error", `File is locked by another process: "${rel}".`);
+      }
       return toolError("execution_error", `Could not write "${rel}": ${(e as Error).message}`);
     }
   },
@@ -666,27 +704,42 @@ export const appendFileTool: Tool = {
     example: "```tool\nTOOL_NAME: append_file\nBEGIN_ARG: path\ntemp.md\nEND_ARG\nBEGIN_ARG: content\nA new paragraph.\nEND_ARG\n```",
   },
   async execute(args, ctx) {
-    const resolved = resolveInWorkspace(ctx.workspaceRoot, String(args.path ?? ""));
+    const rel = String(args.path ?? "");
+    const resolved = resolveInWorkspace(ctx.workspaceRoot, rel);
     if ("error" in resolved) return toolError("invalid_args", resolved.error);
     const content = cleanIncomingText(String(args.content ?? ""));
     if (isParserArtifact(content)) return toolError("invalid_args", "content is missing. Existing content was preserved.");
     let original: string;
     try {
-      const info = await fs.stat(resolved.abs);
-      if (info.isDirectory()) return toolError("invalid_args", `"${String(args.path)}" is a directory. Use list_dir instead.`);
+      const info = await fs.lstat(resolved.abs);
+      if (info.isDirectory()) return toolError("invalid_args", `"${rel}" is a directory. Use list_dir instead.`);
+      if (info.isSymbolicLink()) {
+        const real = await fs.realpath(resolved.abs);
+        if ("error" in resolveInWorkspace(ctx.workspaceRoot, real)) {
+          return toolError("invalid_args", `Target is a symlink pointing outside the workspace.`);
+        }
+      }
       original = await fs.readFile(resolved.abs, "utf8");
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "ENOENT") return toolError("not_found", `${await notFoundMessage(ctx.workspaceRoot, String(args.path))} Use write_file only for a new file.`, { recovery: { action: "search" } });
-      return toolError("execution_error", `Could not read "${String(args.path)}": ${(e as Error).message}`);
+      const err = e as NodeJS.ErrnoException;
+      if (err.code === "ENOENT") return toolError("not_found", `${await notFoundMessage(ctx.workspaceRoot, rel)} Use write_file only for a new file.`, { recovery: { action: "search" } });
+      if (err.code === "EACCES" || err.code === "EPERM") return toolError("permission_denied", `Permission denied reading "${rel}": file is read-only.`);
+      return toolError("execution_error", `Could not read "${rel}": ${err.message}`);
     }
     if (!await ctx.requestApproval(mkCall("append_file", args, ctx.pendingCallId))) return toolError("permission_denied", "User declined the append.");
     const separator = original.length && !original.endsWith("\n") ? "\n" : "";
     try {
-      await ctx.checkpointTracker?.recordBeforeChange(String(args.path));
-      await fs.appendFile(resolved.abs, separator + content, "utf8");
-      return ok(`Appended content to ${String(args.path)}. Existing content was preserved.`);
-    } catch (e) {
-      return toolError("execution_error", `Could not append to "${String(args.path)}": ${(e as Error).message}`);
+      // Revalidate path immediately before mutation to prevent symlink TOCTOU
+      const recheck = resolveInWorkspace(ctx.workspaceRoot, rel);
+      if ("error" in recheck) return toolError("invalid_args", recheck.error);
+
+      await ctx.checkpointTracker?.recordBeforeChange(rel);
+      await fs.appendFile(recheck.abs, separator + content, "utf8");
+      return ok(`Appended content to ${rel}. Existing content was preserved.`);
+    } catch (e: any) {
+      if (e?.code === "EACCES" || e?.code === "EPERM") return toolError("permission_denied", `Permission denied appending to "${rel}": file is read-only.`);
+      if (e?.code === "EBUSY") return toolError("execution_error", `File is locked by another process: "${rel}".`);
+      return toolError("execution_error", `Could not append to "${rel}": ${(e as Error).message}`);
     }
   },
 };
@@ -712,27 +765,50 @@ export const movePathTool: Tool = {
     if ("error" in src) return toolError("not_found", src.error);
     const dst = resolveInWorkspace(ctx.workspaceRoot, toRel);
     if ("error" in dst) return toolError("not_found", dst.error);
-    const srcStat = await fs.stat(src.abs).catch(() => null);
+
+    const srcStat = await fs.lstat(src.abs).catch(() => null);
     if (!srcStat) return toolError("not_found", await notFoundMessage(ctx.workspaceRoot, fromRel));
-    if (await fs.stat(dst.abs).catch(() => null)) {
+
+    // Catch existing files, directories, and broken symlinks to prevent silent overwrites
+    if (await fs.lstat(dst.abs).catch(() => null)) {
       return toolError("conflict", `"${toRel}" already exists — pick a different destination.`);
     }
+
     const approved = await ctx.requestApproval(mkCall("move_path", args, ctx.pendingCallId));
     if (!approved) return toolError("permission_denied", "User declined the move.");
     try {
+      // Revalidate immediately before mutation to eliminate symlink TOCTOU races
+      const recheckSrc = resolveInWorkspace(ctx.workspaceRoot, fromRel);
+      if ("error" in recheckSrc) return toolError("not_found", recheckSrc.error);
+      const recheckDst = resolveInWorkspace(ctx.workspaceRoot, toRel);
+      if ("error" in recheckDst) return toolError("not_found", recheckDst.error);
+
+      if (await fs.lstat(recheckDst.abs).catch(() => null)) {
+        return toolError("conflict", `"${toRel}" was created while approval was pending — pick a different destination.`);
+      }
+
       await ctx.checkpointTracker?.recordBeforeChange(fromRel);
       await ctx.checkpointTracker?.recordBeforeChange(toRel);
-      await fs.mkdir(path.dirname(dst.abs), { recursive: true });
-      await fs.rename(src.abs, dst.abs);
+      await fs.mkdir(path.dirname(recheckDst.abs), { recursive: true });
+      await fs.rename(recheckSrc.abs, recheckDst.abs);
       return ok(`Moved ${fromRel} → ${toRel}.`);
-    } catch (e) {
-      try {
-        await fs.cp(src.abs, dst.abs, { recursive: true });
-        await fs.rm(src.abs, { recursive: true });
-        return ok(`Moved ${fromRel} → ${toRel}.`);
-      } catch (e2) {
-        return toolError("execution_error", `Could not move "${fromRel}" to "${toRel}": ${(e2 as Error).message}`);
+    } catch (e: any) {
+      if (e?.code === "EXDEV") {
+        try {
+          await fs.cp(src.abs, dst.abs, { recursive: true });
+          await fs.rm(src.abs, { recursive: true });
+          return ok(`Moved ${fromRel} → ${toRel}.`);
+        } catch (e2) {
+          return toolError("execution_error", `Could not move "${fromRel}" to "${toRel}": ${(e2 as Error).message}`);
+        }
       }
+      if (e?.code === "EACCES" || e?.code === "EPERM") {
+        return toolError("permission_denied", `Permission denied moving "${fromRel}" to "${toRel}".`);
+      }
+      if (e?.code === "EBUSY") {
+        return toolError("execution_error", `File or directory is locked by another process.`);
+      }
+      return toolError("execution_error", `Could not move "${fromRel}" to "${toRel}": ${(e as Error).message}`);
     }
   },
 };

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 /**
  * Runtime Error Classification, Failure Recovery, and Tool-Failure Guardrails (P1 Item 6).
  *
@@ -37,6 +39,114 @@ export interface ClassifiedRuntimeError {
   rawMessage: string;
 }
 
+export function redactSecretsFromError(msg: string): string {
+  if (!msg) return "";
+  return msg
+    .replace(/(?:sk-[a-zA-Z0-9_\-\.]{12,})/gi, "[REDACTED_KEY]")
+    .replace(/(?:key|token|secret|password|bearer|auth[a-z_-]*)\s*[:=]\s*['"]?[a-zA-Z0-9_\-\.]{8,}['"]?/gi, (match) => {
+      const parts = match.split(/[:=]/);
+      return `${parts[0]}: [REDACTED]`;
+    })
+    .replace(/Bearer\s+[a-zA-Z0-9_\-\.]{8,}/gi, "Bearer [REDACTED]");
+}
+
+export function extractRetryAfter(err: unknown, rawMessage: string): number | undefined {
+  if (err && typeof err === "object") {
+    const headers =
+      (err as { headers?: Record<string, string> | { get?: (k: string) => string | null } }).headers ??
+      (err as { response?: { headers?: Record<string, string> | { get?: (k: string) => string | null } } }).response?.headers;
+
+    let headerVal: string | null | undefined;
+    if (headers) {
+      if (typeof (headers as { get?: unknown }).get === "function") {
+        headerVal = (headers as { get: (k: string) => string | null }).get("retry-after");
+      } else if (typeof headers === "object") {
+        headerVal = (headers as Record<string, string>)["retry-after"] ?? (headers as Record<string, string>)["Retry-After"];
+      }
+    }
+    if (headerVal) {
+      const sec = parseFloat(headerVal);
+      if (!isNaN(sec) && sec >= 0) return sec * 1000;
+      const parsedDate = Date.parse(headerVal);
+      if (!isNaN(parsedDate) && parsedDate > Date.now()) return parsedDate - Date.now();
+    }
+
+    const explicitRetryAfter = (err as { retryAfter?: number }).retryAfter;
+    if (typeof explicitRetryAfter === "number" && explicitRetryAfter > 0) {
+      return explicitRetryAfter <= 3600 ? explicitRetryAfter * 1000 : explicitRetryAfter;
+    }
+  }
+
+  const m =
+    rawMessage.match(/(?:retry-after|retry in|try again in|wait)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*(s|sec|seconds|ms)?/i) ??
+    rawMessage.match(/\b(?:after|in)\s+(\d+(?:\.\d+)?)\s*(s|sec|seconds)\b/i);
+  if (m) {
+    const val = parseFloat(m[1]);
+    const unit = m[2]?.toLowerCase();
+    if (!isNaN(val) && val > 0) {
+      if (unit === "ms") return val;
+      return val * 1000;
+    }
+  }
+  return undefined;
+}
+
+export interface ShouldRetryOpts {
+  sideEffectsOccurred?: boolean;
+  streamRetries: number;
+  maxRetries: number;
+  hasContent: boolean;
+  toolCallsCount: number;
+}
+
+/**
+ * Determines whether a stream failure should be retried.
+ * Retrying is strictly prohibited if any side effects have occurred, if partial
+ * text was already emitted to the user, or if tool calls are pending.
+ */
+export function shouldRetryStep(
+  classified: ClassifiedRuntimeError,
+  opts: ShouldRetryOpts
+): { shouldRetry: boolean; reason?: string } {
+  if (!classified.retryable) {
+    return { shouldRetry: false, reason: "Error is not classified as retryable" };
+  }
+  if (opts.sideEffectsOccurred) {
+    return { shouldRetry: false, reason: "Side effects or mutations have already occurred in this turn/step" };
+  }
+  if (opts.streamRetries >= opts.maxRetries) {
+    return { shouldRetry: false, reason: `Exceeded maximum retries (${opts.maxRetries})` };
+  }
+  if (opts.hasContent) {
+    return { shouldRetry: false, reason: "Model already emitted partial assistant text content" };
+  }
+  if (opts.toolCallsCount > 0) {
+    return { shouldRetry: false, reason: "Tool calls were already parsed or underway" };
+  }
+  return { shouldRetry: true };
+}
+
+/**
+ * Await backoff delay while remaining responsive to user cancellation.
+ * Resolves false if cancelled during backoff.
+ */
+export async function waitWithBackoff(backoffMs: number, signal?: AbortSignal): Promise<boolean> {
+  if (backoffMs <= 0) return !signal?.aborted;
+  if (signal?.aborted) return false;
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener("abort", onAbort);
+      resolve(!signal?.aborted);
+    }, backoffMs);
+    const onAbort = () => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+      resolve(false);
+    };
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 /**
  * Classify any error thrown during model streaming or provider requests.
  */
@@ -44,12 +154,21 @@ export function classifyRuntimeError(
   err: unknown,
   signal?: AbortSignal
 ): ClassifiedRuntimeError {
-  const rawMessage =
+  const unredacted =
     err instanceof Error ? err.message : typeof err === "string" ? err : String(err ?? "Unknown error");
+  const rawMessage = redactSecretsFromError(unredacted);
   const name = err instanceof Error ? err.name : "";
   const status = typeof (err as { status?: unknown })?.status === "number"
     ? ((err as { status: number }).status)
     : extractHttpStatus(rawMessage);
+
+  const retryAfterMs = extractRetryAfter(err, rawMessage);
+  const boundedBackoff = (fallbackMs: number): number => {
+    if (retryAfterMs !== undefined) {
+      return Math.min(30_000, Math.max(500, Math.round(retryAfterMs)));
+    }
+    return Math.min(30_000, Math.max(500, Math.round(fallbackMs)));
+  };
 
   // 1. User cancellation / AbortSignal
   if (signal?.aborted || name === "AbortError" || /\baborted\b/i.test(rawMessage)) {
@@ -73,7 +192,23 @@ export function classifyRuntimeError(
     };
   }
 
-  // 3. Authentication & Permission errors (Permanent — never retry)
+  // 3. Permanent quota, billing, balance exhaustion (Permanent — NEVER retry)
+  const isPermanentBilling =
+    status === 402 ||
+    /\b(?:billing|insufficient_quota|exceeded your current quota|plan and billing|quota exceeded|credit_balance_too_low|balance is too low|payment required|spending limit|account suspended)\b/i.test(
+      rawMessage
+    );
+  if (isPermanentBilling) {
+    return {
+      category: "rate_limit",
+      retryable: false,
+      backoffMs: 0,
+      userMessage: `Provider quota exhausted: ${rawMessage}. Check your provider billing settings.`,
+      rawMessage,
+    };
+  }
+
+  // 4. Authentication & Permission errors (Permanent — never retry)
   if (
     status === 401 ||
     status === 403 ||
@@ -90,7 +225,7 @@ export function classifyRuntimeError(
     };
   }
 
-  // 4. Permanent configuration / validation / model-not-found errors (Permanent — never retry)
+  // 5. Permanent configuration / validation / model-not-found errors (Permanent — never retry)
   if (
     status === 400 ||
     status === 404 ||
@@ -108,26 +243,21 @@ export function classifyRuntimeError(
     };
   }
 
-  // 5. Rate limits (HTTP 429) — retryable unless permanent billing/quota exhaustion
+  // 6. Rate limits (HTTP 429) — transient rate limit with bounded backoff
   if (
     status === 429 ||
     /\b(?:rate[_\s-]?limit|too many requests|resource_exhausted|quota)\b/i.test(rawMessage)
   ) {
-    const isPermanentBilling = /\b(?:billing|insufficient_quota|exceeded your current quota|plan and billing)\b/i.test(
-      rawMessage
-    );
     return {
       category: "rate_limit",
-      retryable: !isPermanentBilling,
-      backoffMs: 1200,
-      userMessage: isPermanentBilling
-        ? `Provider quota exhausted: ${rawMessage}. Check your provider billing settings.`
-        : `Rate limit reached: ${rawMessage}. Please wait a moment and try again.`,
+      retryable: true,
+      backoffMs: boundedBackoff(1500),
+      userMessage: `Rate limit reached: ${rawMessage}. Please wait a moment and try again.`,
       rawMessage,
     };
   }
 
-  // 6. Local runtime crashes (Ollama runner crash / out-of-memory / daemon stopped)
+  // 7. Local runtime crashes (Ollama runner crash / out-of-memory / daemon stopped)
   if (
     /\b(?:llama runner process has terminated|runner process|out of memory|cuda error|ggml_assert|ollama.*not reachable|econnrefused.*11434)\b/i.test(
       rawMessage
@@ -137,7 +267,7 @@ export function classifyRuntimeError(
     return {
       category: "local_runtime_crash",
       retryable: !isOom,
-      backoffMs: 800,
+      backoffMs: isOom ? 0 : boundedBackoff(800),
       userMessage: isOom
         ? `Local model ran out of memory: ${rawMessage}. Try reducing the context window or selecting a smaller model.`
         : `Local runtime error: ${rawMessage}`,
@@ -145,7 +275,7 @@ export function classifyRuntimeError(
     };
   }
 
-  // 7. Timeouts & stalled streams (Transient — safe to retry if no partial output/side-effects)
+  // 8. Timeouts & stalled streams (Transient — safe to retry if no partial output/side-effects)
   if (
     status === 408 ||
     status === 504 ||
@@ -157,13 +287,13 @@ export function classifyRuntimeError(
     return {
       category: "timeout",
       retryable: true,
-      backoffMs: 700,
+      backoffMs: boundedBackoff(1000),
       userMessage: `Request timed out: ${rawMessage}`,
       rawMessage,
     };
   }
 
-  // 8. Transient network / gateway errors (HTTP 500/502/503, ECONNRESET, fetch failed)
+  // 9. Transient network / gateway errors (HTTP 500/502/503, ECONNRESET, fetch failed)
   if (
     status === 500 ||
     status === 502 ||
@@ -175,13 +305,13 @@ export function classifyRuntimeError(
     return {
       category: "network",
       retryable: true,
-      backoffMs: 700,
+      backoffMs: boundedBackoff(1000),
       userMessage: `Network or provider error: ${rawMessage}`,
       rawMessage,
     };
   }
 
-  // 9. Unknown / unclassified error — do not blindly retry
+  // 10. Unknown / unclassified error — do not blindly retry
   return {
     category: "unknown",
     retryable: false,
@@ -253,6 +383,14 @@ export function sanitizeToolPairing(messages: import("../llm/types").LLMMessage[
     }
 
     if (m.role === "assistant" && m.tool_calls && m.tool_calls.length > 0) {
+      // Ensure all tool_calls have unique non-empty IDs to prevent provider API schema rejection
+      const seenIds = new Set<string>();
+      for (const tc of m.tool_calls) {
+        if (!tc.id || seenIds.has(tc.id)) {
+          tc.id = randomUUID();
+        }
+        seenIds.add(tc.id);
+      }
       out.push(m);
       // Collect all following tool responses for this assistant message
       const toolIds = new Set(m.tool_calls.map((tc) => tc.id).filter(Boolean));
@@ -269,14 +407,15 @@ export function sanitizeToolPairing(messages: import("../llm/types").LLMMessage[
       }
       i = j - 1; // Advance past the processed tool messages
 
-      // If any tool_calls were not responded to, insert synthesized fallback tool outcomes
+      // If any tool_calls were not responded to, insert synthesized fallback tool outcomes.
+      // Unknown outcome must never be represented as successful or completed.
       for (const tc of m.tool_calls) {
         if (tc.id && !answeredIds.has(tc.id)) {
           out.push({
             role: "tool",
             tool_call_id: tc.id,
             name: tc.function.name,
-            content: `[TOOL_OUTCOME: "${tc.function.name}" completed or output omitted to fit context window]`,
+            content: `[TOOL_ERROR: "${tc.function.name}" execution outcome unavailable or omitted from context window — action was NOT confirmed and must NOT be assumed successful]`,
           });
         }
       }

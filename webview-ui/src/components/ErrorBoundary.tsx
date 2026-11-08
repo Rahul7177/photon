@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { sanitizeErrorMessage } from "./ErrorBanner";
 
 interface State {
   error: Error | null;
@@ -23,16 +24,32 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
 
   render() {
     if (this.state.error) {
+      const sanitized = sanitizeErrorMessage(this.state.error.message);
       return (
         <div className="app">
-          <div className="banner error-banner" style={{ margin: 16 }}>
+          <div className="banner error-banner" role="alert" style={{ margin: 16 }}>
             <span className="error-text">
-              Something went wrong rendering the view. {this.state.error.message}
+              Something went wrong rendering the view: {sanitized}
             </span>
           </div>
-          <div style={{ padding: "0 16px" }}>
-            <button className="btn primary" onClick={() => this.setState({ error: null })}>
+          <div style={{ padding: "0 16px", display: "flex", gap: 8 }}>
+            <button
+              type="button"
+              className="btn primary"
+              onClick={() => this.setState({ error: null })}
+            >
               Reload view
+            </button>
+            <button
+              type="button"
+              className="btn ghost"
+              onClick={() => {
+                if (typeof window !== "undefined") {
+                  window.location.reload();
+                }
+              }}
+            >
+              Hard refresh
             </button>
           </div>
         </div>

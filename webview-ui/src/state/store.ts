@@ -190,19 +190,39 @@ export function reducer(state: AppState, msg: Action): AppState {
     case "messageDone": return { ...state, messages: state.messages.map((m) => m.id === msg.payload.id ? { ...m, streaming: false } : m) };
     case "messageRemoved": return { ...state, messages: state.messages.filter((m) => m.id !== msg.payload.id) };
     case "toolUpdate": {
-      const clearedApproval = state.pendingApproval?.id === msg.payload.call.id && ["done", "error", "denied"].includes(msg.payload.call.status) ? null : state.pendingApproval;
-      if (!state.messages.some((m) => m.id === msg.payload.messageId)) {
-        if (state.messages.length > 500) return { ...state, pendingApproval: clearedApproval };
+      const clearedApproval =
+        state.pendingApproval?.id === msg.payload.call.id &&
+        ["done", "error", "denied", "cancelled"].includes(msg.payload.call.status)
+          ? null
+          : state.pendingApproval;
+      const existing = state.messages.find((m) => m.id === msg.payload.messageId);
+      if (!existing) {
+        const isCurrentTurn = state.status !== "idle" || state.pendingApproval?.id === msg.payload.call.id;
+        if (!isCurrentTurn || state.messages.length >= 500) {
+          return { ...state, pendingApproval: clearedApproval };
+        }
         return {
           ...state,
           pendingApproval: clearedApproval,
-          messages: [...state.messages, { id: msg.payload.messageId, role: "assistant", content: "", toolCalls: [msg.payload.call], createdAt: Date.now(), streaming: true } as ChatMessage],
+          messages: [
+            ...state.messages,
+            {
+              id: msg.payload.messageId,
+              role: "assistant",
+              content: "",
+              toolCalls: [msg.payload.call],
+              createdAt: Date.now(),
+              streaming: true,
+            } as ChatMessage,
+          ],
         };
       }
       return {
         ...state,
         pendingApproval: clearedApproval,
-        messages: state.messages.map((m) => m.id === msg.payload.messageId ? applyToolUpdate(m, msg.payload.call) : m),
+        messages: state.messages.map((m) =>
+          m.id === msg.payload.messageId ? applyToolUpdate(m, msg.payload.call) : m
+        ),
       };
     }
     case "toolApprovalRequest": return { ...state, pendingApproval: msg.payload.call };
@@ -312,9 +332,8 @@ function modelTestKey(providerId: string, modelName: string): string { return mo
 function upsertLive(list: ChatMessage[], m: ChatMessage): ChatMessage[] {
   const index = list.findIndex((message) => message.id === m.id);
   if (index < 0) {
-    // Also guard against double-appends from concurrent turns or duplicate user messages with distinct IDs
-    // but identical user content submitted at the same second.
-    return [...list, m];
+    const next = [...list, m];
+    return next.length > 500 ? next.slice(-500) : next;
   }
   const next = [...list];
   next[index] = {

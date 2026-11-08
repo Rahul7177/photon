@@ -24,7 +24,12 @@ export function post(msg: ViewMessage): void {
 
 export function onHostMessage(handler: (msg: HostMessage) => void): () => void {
   if (typeof window === "undefined") return () => {};
-  const listener = (e: MessageEvent) => handler(e.data as HostMessage);
+  const listener = (e: MessageEvent) => {
+    if (!e.data || typeof e.data !== "object" || typeof (e.data as any).type !== "string") {
+      return;
+    }
+    handler(e.data as HostMessage);
+  };
   window.addEventListener("message", listener);
   return () => window.removeEventListener("message", listener);
 }

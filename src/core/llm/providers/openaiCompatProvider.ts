@@ -2,6 +2,7 @@ import { parseEffectiveParams, classifyModel } from "../../adaptive/modelProfile
 import type { ModelInfo, ThinkingLevel } from "../../../shared/types";
 import type { LLMChatChunk, LLMChatRequest, LLMProvider, ProviderModel } from "../types";
 import { fetchWithRetry, streamSse, tryJson } from "../sse";
+import { classifyHttpError, redactSecrets } from "../errors";
 
 export interface OpenAICompatConfig {
   id: string;
@@ -111,7 +112,7 @@ export class OpenAICompatProvider implements LLMProvider {
     );
     if (!res.ok) {
       const detail = await res.text().catch(() => "");
-      throw new Error(`${this.label} model list failed (${res.status}). ${detail.slice(0, 500)}`.trim());
+      throw classifyHttpError(this.label, res.status, detail, res.headers, [this.apiKey]);
     }
     const json = (await res.json()) as { data?: { id: string; context_length?: number; created?: number }[] };
     const models = json.data ?? [];
@@ -231,7 +232,7 @@ export class OpenAICompatProvider implements LLMProvider {
     );
     if (!res.ok || !res.body) {
       const detail = await res.text().catch(() => "");
-      throw new Error(`${this.label} /chat/completions failed (${res.status}). ${detail.slice(0, 500)}`.trim());
+      throw classifyHttpError(this.label, res.status, detail, res.headers, [this.apiKey]);
     }
 
     let finishReason: string | undefined;
@@ -264,6 +265,11 @@ export class OpenAICompatProvider implements LLMProvider {
         }[];
       }>(payload);
       if (!json) continue;
+      if ((json as any).error) {
+        const errObj = (json as any).error;
+        const msg = typeof errObj === "string" ? errObj : (errObj.message || JSON.stringify(errObj));
+        throw classifyHttpError(this.label, 400, msg, undefined, [this.apiKey]);
+      }
       if (json.usage) {
         if (json.usage.prompt_tokens !== undefined) inputTokens = json.usage.prompt_tokens;
         if (json.usage.completion_tokens !== undefined) outputTokens = json.usage.completion_tokens;

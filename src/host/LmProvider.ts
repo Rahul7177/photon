@@ -27,8 +27,9 @@ export function registerChatParticipant(
     const attachments: Attachment[] = [];
     const skipped: string[] = [];
     for (const ref of request.references ?? []) {
-      const value = (ref as any).value;
-      const refName = (ref as any).name ?? "attachment";
+      const refObj = ref as { value?: unknown; name?: string };
+      const value = refObj.value;
+      const refName = refObj.name ?? "attachment";
 
       if (typeof value === "string") {
         attachments.push({
@@ -58,8 +59,8 @@ export function registerChatParticipant(
           ? value
           : value instanceof vscode.Location
             ? value.uri
-            : (value as any)?.uri instanceof vscode.Uri
-              ? (value as any).uri
+            : (value && typeof value === "object" && "uri" in value && (value as { uri: unknown }).uri instanceof vscode.Uri)
+              ? (value as { uri: vscode.Uri }).uri
               : undefined;
       if (!uri) continue;
       try {

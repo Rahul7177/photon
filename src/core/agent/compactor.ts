@@ -5,6 +5,7 @@ import {
   estimateTokens,
   estimateMessagesTokens,
 } from "../adaptive/tokens";
+import { redactSecretsFromError } from "./errorRecovery";
 
 export interface CompactionCandidateSet {
   anchor: ChatMessage | null;
@@ -207,9 +208,11 @@ export function mapToolStatusToCompactionStatus(
  */
 export function extractStructuredCompactionData(messages: ChatMessage[]) {
   const userDirectives: string[] = [];
+  const userConstraints: string[] = [];
   const filesModified = new Map<string, string[]>();
   const filesInspected = new Set<string>();
   const toolFindings: string[] = [];
+  const negativeFindings: string[] = [];
   const commandsRun: Array<{
     command: string;
     status: CompactionCommandStatus;
@@ -225,14 +228,17 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
       msg.content.includes("[Context Compaction Summary]") ||
       msg.notice?.includes("Context compacted")
     ) {
-      existingSummarySections.push(
+      const cleanSummary = redactSecretsFromError(
         msg.content.replace(/^⚡\s*\*\*\[Context Compaction Summary\]\*\*\s*/i, "").trim()
       );
+      if (cleanSummary && !existingSummarySections.includes(cleanSummary)) {
+        existingSummarySections.push(cleanSummary);
+      }
       continue;
     }
 
     if (msg.role === "user") {
-      const clean = msg.content.trim();
+      const clean = redactSecretsFromError(msg.content.trim());
       if (isToolResultMessage(msg)) {
         // Extract concise tool result facts
         const snippet = clean.replace(/\s+/g, " ").slice(0, 140);
@@ -244,11 +250,17 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
         if (!userDirectives.includes(truncated)) {
           userDirectives.push(truncated);
         }
+        if (/\b(?:do not|never|must not|cannot|should not|dont|don't|preserve|keep|avoid|prevent)\b/i.test(clean)) {
+          if (!userConstraints.includes(truncated)) {
+            userConstraints.push(truncated);
+          }
+        }
       }
     }
 
     if (msg.role === "tool" && msg.content) {
-      const snippet = msg.content.trim().replace(/\s+/g, " ").slice(0, 140);
+      const cleanContent = redactSecretsFromError(msg.content.trim());
+      const snippet = cleanContent.replace(/\s+/g, " ").slice(0, 140);
       if (snippet && toolFindings.length < 8) {
         toolFindings.push(snippet);
       }
@@ -257,29 +269,51 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
     for (const call of msg.toolCalls ?? []) {
       const name = call.name;
       const args = call.args || {};
-      const filePath = String(args.path || args.file_path || args.filePath || args.file || "");
+      const metaPath = (call as any).metadata?.path;
+      const filePath =
+        metaPath ||
+        String(args.path || args.file_path || args.filePath || args.file || (name === "move_path" ? args.from : ""));
 
-      if (
+      const isSuccess =
+        call.status === "done" &&
+        !call.error &&
+        !(typeof call.result === "string" && call.result.includes("[TOOL_ERROR"));
+
+      if (name === "move_path") {
+        const fromPath = String(args.from || args.source || filePath);
+        const toPath = String(args.to || args.destination || "");
+        if (isSuccess && fromPath && toPath) {
+          const fromNotes = filesModified.get(fromPath) ?? [];
+          const fromDesc = `Moved to \`${toPath}\``;
+          if (!fromNotes.includes(fromDesc)) fromNotes.push(fromDesc);
+          filesModified.set(fromPath, fromNotes);
+
+          const toNotes = filesModified.get(toPath) ?? [];
+          const toDesc = `Created by moving from \`${fromPath}\``;
+          if (!toNotes.includes(toDesc)) toNotes.push(toDesc);
+          filesModified.set(toPath, toNotes);
+        }
+      } else if (
         name === "replace_in_file" ||
         name === "edit_file" ||
         name === "write_to_file" ||
         name === "write_file" ||
         name === "append_file" ||
-        name === "move_path" ||
         name === "delete_file"
       ) {
-        if (filePath) {
+        if (filePath && isSuccess) {
           const notes = filesModified.get(filePath) ?? [];
+          const linesInfo = (call as any).metadata?.changedLines
+            ? ` (lines ${(call as any).metadata.changedLines.start}-${(call as any).metadata.changedLines.end})`
+            : "";
           const editDesc =
             name === "delete_file"
               ? "Deleted file"
-              : name === "move_path"
-                ? `Moved to ${String(args.to || args.destination || "")}`
-                : args.find || args.old_str
-                  ? `Edited block (${String(args.find || args.old_str).slice(0, 40).trim()}…)`
-                  : name === "write_to_file" || name === "write_file"
-                    ? "Created / overwritten file"
-                    : "Updated file contents";
+              : args.find || args.old_str
+                ? `Edited block (${String(args.find || args.old_str).slice(0, 40).trim()}…)${linesInfo}`
+                : name === "write_to_file" || name === "write_file"
+                  ? `Created / overwritten file${linesInfo}`
+                  : `Updated file contents${linesInfo}`;
           if (!notes.includes(editDesc)) notes.push(editDesc);
           filesModified.set(filePath, notes);
         }
@@ -288,7 +322,8 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
         name === "search_files" ||
         name === "search_code" ||
         name === "find_files" ||
-        name === "list_dir"
+        name === "list_dir" ||
+        name === "code_outline"
       ) {
         if (filePath) filesInspected.add(filePath);
         if (args.pattern) filesInspected.add(`pattern: "${args.pattern}"`);
@@ -299,20 +334,38 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
         name === "bash" ||
         name === "terminal"
       ) {
-        const cmd = String(args.command || args.cmd || "");
+        const cmd = redactSecretsFromError(String(args.command || args.cmd || ""));
         if (cmd) {
           const mappedStatus = mapToolStatusToCompactionStatus(call.status);
           commandsRun.push({
             command: cmd.length > 80 ? cmd.slice(0, 77) + "…" : cmd,
             status: mappedStatus,
             rawStatus: call.status,
-            error: call.error ? String(call.error).slice(0, 80) : undefined,
+            error: call.error ? redactSecretsFromError(String(call.error).slice(0, 80)) : undefined,
           });
         }
       }
 
-      if (call.status === "error" && call.error) {
-        const errNote = `Tool ${name} failed: ${String(call.error).slice(0, 120)}`;
+      // Negative findings (file not found, 0 results)
+      if (call.name === "read_file" && call.error && /ENOENT|not found/i.test(call.error)) {
+        const nf = `File not found: \`${filePath}\``;
+        if (!negativeFindings.includes(nf)) negativeFindings.push(nf);
+      } else if (
+        (call.name === "find_files" || call.name === "search_code") &&
+        call.result &&
+        /no matches|0 results|not found/i.test(call.result)
+      ) {
+        const nf = `Search for "${args.pattern || args.query}" yielded 0 matches`;
+        if (!negativeFindings.includes(nf)) negativeFindings.push(nf);
+      }
+
+      const isToolError =
+        call.status === "error" ||
+        (typeof call.result === "string" && call.result.includes("[TOOL_ERROR"));
+
+      if (isToolError && (call.error || call.result)) {
+        const errDetail = call.error ? String(call.error) : String(call.result);
+        const errNote = `Tool ${name}${filePath ? ` (${filePath})` : ""} failed: ${redactSecretsFromError(errDetail.slice(0, 120))}`;
         if (!unresolvedItems.includes(errNote)) unresolvedItems.push(errNote);
       } else if (
         call.status === "running" ||
@@ -331,8 +384,11 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
       } else if (call.status === "denied") {
         const deniedNote = `Tool ${name}${filePath ? ` (${filePath})` : ""} was denied by user`;
         if (!unresolvedItems.includes(deniedNote)) unresolvedItems.push(deniedNote);
+      } else if ((call.status as string) === "unknown" || !call.status) {
+        const unknownNote = `Tool ${name}${filePath ? ` (${filePath})` : ""} status was unknown`;
+        if (!unresolvedItems.includes(unknownNote)) unresolvedItems.push(unknownNote);
       } else if (call.result && typeof call.result === "string" && toolFindings.length < 8) {
-        const firstLine = call.result.trim().split(/\r?\n/)[0]?.slice(0, 120);
+        const firstLine = redactSecretsFromError(call.result.trim().split(/\r?\n/)[0]?.slice(0, 120));
         if (firstLine) {
           toolFindings.push(`${name}${filePath ? `(${filePath})` : ""}: ${firstLine}`);
         }
@@ -350,7 +406,7 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
           /^(?:Decision|Architecture|Key finding|Root cause|Assumption|Constraint):/i.test(trimmed) ||
           /\b(?:decided to|assumed|chosen because|for backward compatibility)\b/i.test(trimmed)
         ) {
-          const clean = trimmed.replace(/^(?:[-*]|\d+\.)\s+/, "");
+          const clean = redactSecretsFromError(trimmed.replace(/^(?:[-*]|\d+\.)\s+/, ""));
           if (clean.length > 10 && !modelDecisions.includes(clean)) {
             modelDecisions.push(clean.length > 150 ? clean.slice(0, 147) + "…" : clean);
           }
@@ -360,7 +416,7 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
           /^[-*]\s+\[\s\]\s+/.test(trimmed) ||
           /^(?:TODO|Remaining|Unresolved|Open question|Next step):/i.test(trimmed)
         ) {
-          const clean = trimmed.replace(/^[-*]\s+\[\s\]\s+/, "");
+          const clean = redactSecretsFromError(trimmed.replace(/^[-*]\s+\[\s\]\s+/, ""));
           if (clean.length > 5 && !unresolvedItems.includes(clean)) {
             unresolvedItems.push(clean.length > 140 ? clean.slice(0, 137) + "…" : clean);
           }
@@ -369,7 +425,7 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
     }
 
     if (msg.notice && (msg.notice.startsWith("⚠️") || /error|failed/i.test(msg.notice))) {
-      const errStr = msg.notice.slice(0, 120);
+      const errStr = redactSecretsFromError(msg.notice.slice(0, 120));
       if (!unresolvedItems.includes(errStr)) {
         unresolvedItems.push(errStr);
       }
@@ -392,9 +448,11 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
 
   return {
     userDirectives,
+    userConstraints,
     filesModified,
     filesInspected,
     toolFindings,
+    negativeFindings,
     commandsRun,
     modelDecisions,
     unresolvedItems,
@@ -428,36 +486,65 @@ export function buildNativeCompactionSummary(
     sections.push(`### 📌 Compaction Focus\n${focus.trim()}`);
   }
 
-  // 2. Rolled-over History from earlier compactions
+  // 2. Rolled-over History from earlier compactions (deduplicated across repeated compactions)
   if (data.existingSummarySections.length > 0) {
-    sections.push(
-      `### 📜 Prior Compacted History\n${data.existingSummarySections.join("\n\n")}`
-    );
+    const rolledOverLines: string[] = [];
+    const seenLines = new Set<string>();
+    for (const sec of data.existingSummarySections) {
+      for (const line of sec.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("###")) continue;
+        if (!seenLines.has(trimmed)) {
+          seenLines.add(trimmed);
+          rolledOverLines.push(line);
+        }
+      }
+    }
+    if (rolledOverLines.length > 0) {
+      sections.push(
+        `### 📜 Prior Compacted History\n${rolledOverLines.slice(-16).join("\n")}`
+      );
+    }
   }
 
-  // 3. User Directives & Constraints
+  // 3. User Constraints & Preservation Rules (structurally separated)
+  if (data.userConstraints.length > 0) {
+    const list = data.userConstraints
+      .slice(-8)
+      .map((c) => `- ${c}`)
+      .join("\n");
+    sections.push(`### 🚫 Negative & Preservation Constraints\n${list}`);
+  }
+
+  // 4. User Directives & Instructions
   if (data.userDirectives.length > 0) {
     const list = data.userDirectives
-      .slice(-12)
+      .slice(-10)
       .map((d) => `- ${d}`)
       .join("\n");
     sections.push(`### 📝 User Instructions & Constraints\n${list}`);
   }
 
-  // 4. Verified Repository Facts (Files Modified, Inspected, Commands, Tool Results)
+  // 5. Verified Repository Facts (Files Modified, Inspected, Negative Findings, Commands, Tool Results)
   const repoFactLines: string[] = [];
   if (data.filesModified.size > 0) {
-    repoFactLines.push("**Files Modified / Created:**");
+    repoFactLines.push("**Files Modified / Created (Confirmed):**");
     for (const [f, notes] of [...data.filesModified.entries()].slice(-15)) {
       repoFactLines.push(`- \`${f}\`: ${notes.join("; ")}`);
     }
   }
   if (data.filesInspected.size > 0) {
     repoFactLines.push("**Files & Paths Inspected:**");
-    for (const f of [...data.filesInspected].slice(-12)) {
+    for (const f of [...data.filesInspected].slice(-10)) {
       repoFactLines.push(
         f.startsWith("pattern:") || f.startsWith("query:") ? `- ${f}` : `- \`${f}\``
       );
+    }
+  }
+  if (data.negativeFindings.length > 0) {
+    repoFactLines.push("**Negative Findings & Missing Items:**");
+    for (const nf of data.negativeFindings.slice(-6)) {
+      repoFactLines.push(`- ${nf}`);
     }
   }
   if (data.commandsRun.length > 0) {
@@ -500,7 +587,7 @@ export function buildNativeCompactionSummary(
     sections.push(`### ✅ Verified Repository Facts (Ground Truth)\n${repoFactLines.join("\n")}`);
   }
 
-  // 5. Model Decisions & Working Assumptions (distinguished from verified repo facts)
+  // 6. Model Decisions & Working Assumptions (distinguished from verified repo facts)
   if (data.modelDecisions.length > 0) {
     const list = data.modelDecisions
       .slice(-8)
@@ -509,10 +596,10 @@ export function buildNativeCompactionSummary(
     sections.push(`### 🧠 Model Decisions & Assumptions (Unverified Claims / Rationale)\n${list}`);
   }
 
-  // 6. Unresolved Questions, Pending Work & Active Errors
+  // 7. Unresolved Questions, Pending Work & Active Errors
   if (data.unresolvedItems.length > 0) {
     const list = data.unresolvedItems
-      .slice(-6)
+      .slice(-8)
       .map((e) => `- ${e}`)
       .join("\n");
     sections.push(`### ⚠️ Unresolved Issues & Pending Items\n${list}`);
@@ -657,6 +744,15 @@ export async function summarizeWithProviderModel(
       finalSummary += `\n\n### 🛠️ Verified Modified Files (Retained)\n${fileLines}`;
     }
 
+    if (data.userConstraints.length > 0) {
+      const missingConstraints = data.userConstraints.filter(
+        (c) => !finalSummary.toLowerCase().includes(c.toLowerCase().slice(0, 30))
+      );
+      if (missingConstraints.length > 0) {
+        finalSummary += `\n\n### 🚫 Preserved User Constraints (Retained)\n${missingConstraints.map((c) => `- ${c}`).join("\n")}`;
+      }
+    }
+
     if (data.unresolvedItems.length > 0) {
       const missingUnresolved = data.unresolvedItems.filter(
         (item) => !finalSummary.includes(item)
@@ -666,7 +762,7 @@ export async function summarizeWithProviderModel(
       }
     }
 
-    return finalSummary;
+    return redactSecretsFromError(finalSummary);
   } catch {
     // Graceful fallback to native compactor on timeout, network error, or crash
     return null;

@@ -28,7 +28,15 @@ export function pruneInlineImages(
       if (keep >= imageCount) return m;
       let toStrip = imageCount - keep;
       const attachments = m.attachments!.map((a) =>
-        a.dataBase64 && toStrip-- > 0 ? { ...a, dataBase64: undefined } : a
+        a.dataBase64 && toStrip-- > 0
+          ? {
+              ...a,
+              dataBase64: undefined,
+              isPruned: true,
+              text:
+                a.text || "[Image pruned from storage to conserve disk space]",
+            }
+          : a
       );
       return { ...m, attachments };
     })
@@ -105,28 +113,78 @@ export function rewindMessagesToCheckpoint(
 
 /**
  * Cap messages kept per session.
- * Before discarding the oldest messages exceeding the cap, we compact them into
- * a structured context digest so task directives and verified repository facts are not lost.
+ * Reserves a slot for the archive digest so the post-cap length is at most maxMessages.
+ * Prevents nested/re-archiving digests across repeated archive cycles, while preserving
+ * the original task objective, user constraints, verified facts, and unresolved items.
  */
 export function enforceSessionMessageCap(
   session: SessionState,
   maxMessages = MAX_SESSION_MESSAGES
 ): boolean {
   if (session.messages.length <= maxMessages) return false;
+  if (maxMessages <= 0) return false;
 
-  const excessCount = session.messages.length - maxMessages;
-  const firstUser = session.messages.find((m) => m.role === "user");
-  const anchorPrompt = firstUser?.content;
+  // Reserve 1 slot for the archive digest message so total messages <= maxMessages
+  const targetRemaining = Math.max(1, maxMessages - 1);
+  const excessCount = session.messages.length - targetRemaining;
+  if (excessCount <= 0) return false;
 
   const toArchive = session.messages.slice(0, excessCount);
   const remaining = session.messages.slice(excessCount);
 
-  // Build compaction summary of the discarded turns so key facts/edits are preserved
-  const summaryContent = buildNativeCompactionSummary(
-    toArchive,
-    "Archived history from earlier turns in this session",
-    anchorPrompt
-  );
+  // Extract prior archive content and original anchor prompt to avoid nesting
+  let priorArchiveSummary = "";
+  let accumulatedMessagesCount = 0;
+  const newTurnsToArchive: ChatMessage[] = [];
+
+  for (const m of toArchive) {
+    if (
+      m.isCompacted ||
+      m.id.startsWith("archive_") ||
+      m.compactStats?.strategy === "session-persistence-archive"
+    ) {
+      accumulatedMessagesCount += m.compactStats?.messagesCount ?? 1;
+      const stripped = m.content.replace(
+        /^⚡ \*\*\[Context Compaction Summary\]\*\* \(Archived session history\)\n\n/,
+        ""
+      );
+      if (stripped.trim()) {
+        priorArchiveSummary = stripped.trim();
+      }
+    } else {
+      newTurnsToArchive.push(m);
+      accumulatedMessagesCount++;
+    }
+  }
+
+  // Preserve original task objective from first user prompt in history or prior summary
+  let anchorPrompt: string | undefined;
+  if (priorArchiveSummary) {
+    const matchObj = priorArchiveSummary.match(/Original objective:\s*(.*?)(?:\n|$)/);
+    if (matchObj) {
+      anchorPrompt = matchObj[1].trim();
+    }
+  }
+  if (!anchorPrompt) {
+    const firstUser = session.messages.find((m) => m.role === "user");
+    anchorPrompt = firstUser?.content;
+  }
+
+  let summaryContent = "";
+  if (newTurnsToArchive.length > 0) {
+    const newSummary = buildNativeCompactionSummary(
+      newTurnsToArchive,
+      "Archived history from earlier turns in this session",
+      anchorPrompt
+    );
+    if (priorArchiveSummary) {
+      summaryContent = `${priorArchiveSummary}\n\n---\n**Later Archived Progress:**\n${newSummary}`;
+    } else {
+      summaryContent = newSummary;
+    }
+  } else {
+    summaryContent = priorArchiveSummary;
+  }
 
   const archiveDigestMessage: ChatMessage = {
     id: `archive_${Date.now()}`,
@@ -134,9 +192,9 @@ export function enforceSessionMessageCap(
     content: `⚡ **[Context Compaction Summary]** (Archived session history)\n\n${summaryContent}`,
     createdAt: Date.now(),
     isCompacted: true,
-    notice: `Context archived: ${toArchive.length} earlier messages folded into digest`,
+    notice: `Context archived: ${accumulatedMessagesCount} earlier messages folded into digest`,
     compactStats: {
-      messagesCount: toArchive.length,
+      messagesCount: accumulatedMessagesCount,
       tokensSaved: 0,
       pctSaved: 0,
       strategy: "session-persistence-archive",
