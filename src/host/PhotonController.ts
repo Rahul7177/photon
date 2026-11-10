@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import {
+  isLocalModel,
   matchInstalledModelName,
   type AdaptivePlan,
   type Attachment,
@@ -13,6 +14,7 @@ import {
   type HardwareMetrics,
   type IndexStatus,
   type IntelligenceSetting,
+  type LocalRuntimeId,
   type MachineProfile,
   type Mode,
   type ModelCapability,
@@ -40,6 +42,7 @@ import { cloudTools, classifyCloudToolPolicy, getCloudToolPolicy, setCloudToolPo
 import { buildCloudSystemPrompt } from "../core/prompts/cloudSystem";
 import { buildWorkspaceMap } from "../core/tools/workspaceMap";
 import { compactSessionMessages, shouldAutoCompact } from "../core/agent/compactor";
+import { estimateMessageTokens } from "../core/adaptive/tokens";
 import { CheckpointManager, getCheckpointManager } from "../core/checkpoints/checkpointManager";
 import type { DiagnosticInfo, ToolContext } from "../core/tools/types";
 import { ProviderManager } from "../core/llm/providerManager";
@@ -53,7 +56,11 @@ import { IndexService } from "./indexService";
 import { ModelConfigStore } from "./modelConfigStore";
 import { getProjectContextManager, ProjectContextManager } from "../core/context/projectContext";
 import { LocalProcessManager, installOptions, type StartableId } from "./localProcessManager";
-import { recommendModels, MODEL_CATALOG } from "../core/adaptive/modelAdvisor";
+import {
+  evaluateBackgroundBenchGuard,
+  MODEL_CATALOG,
+  recommendModels,
+} from "../core/adaptive/modelAdvisor";
 import { scanDiskOllamaModels } from "../core/adaptive/runtimeDetector";
 import { ModelInstaller } from "../core/ollama/modelInstaller";
 import { loadProjectConfig, type ProjectConfig } from "./projectConfig";
@@ -134,6 +141,12 @@ export class PhotonController {
 
   /** Cancels an in-flight benchmark run. */
   private benchAbort?: AbortController;
+  /** Cancels any queued background benchmark loop so new turns never contend for the GPU. */
+  private benchBatchAbort?: AbortController;
+  /** Sticky once a user runs a local model prompt; blocks background auto-bench to keep GPU warm. */
+  private localModelUsed = false;
+  /** True while handlePrompt prepares a turn before createTurnSignal() activates turnCoord. */
+  private turnPreparing = false;
   private reachable = false;
   private rawPost: Post = () => {};
   /** Manages tool execution approval lifecycles and auto-approve state. */
@@ -158,6 +171,18 @@ export class PhotonController {
   private latestHardwareMetrics: HardwareMetrics | null = null;
   /** Models currently loaded in Ollama's memory. */
   private latestOllamaRuntime: OllamaRuntimeModel[] = [];
+  /** Signature of last runtime snapshot so changes trigger fresh validation/recommendations. */
+  private lastRuntimeSig = "";
+  /** Empirical tok/s measured on recent local inference turns (EMA smoothed). */
+  private liveTpsByModel = new Map<string, number>();
+  /** Sticky recommendation query options (goal/ctx/task/runtime/quantization) across refreshes. */
+  private lastRecommendOpts: {
+    goal?: ModelCapability;
+    ctxTokens?: number;
+    taskPrompt?: string;
+    runtime?: LocalRuntimeId;
+    quantization?: string;
+  } = {};
   /** Concurrency guard for hardware sampling. */
   private samplingHardware = false;
   /** Tracks session and cumulative cloud token usage and cost. */
@@ -329,6 +354,7 @@ export class PhotonController {
     this.context.subscriptions.push({
       dispose: () => {
         this.turnCoord.abortTurn();
+        this.benchBatchAbort?.abort();
         this.benchAbort?.abort();
         this.index.dispose();
         this.installer.cancel();
@@ -620,17 +646,45 @@ export class PhotonController {
   }
 
   /** Push recommendations to the webview based on the latest hardware profile & installed models. */
-  private sendRecommendations(goal?: ModelCapability, ctxTokens?: number): void {
+  private sendRecommendations(
+    goal?: ModelCapability,
+    ctxTokens?: number,
+    extra?: { taskPrompt?: string; runtime?: LocalRuntimeId; quantization?: string }
+  ): void {
+    if (goal !== undefined || ctxTokens !== undefined || extra !== undefined) {
+      this.lastRecommendOpts = {
+        goal,
+        ctxTokens,
+        taskPrompt: extra?.taskPrompt,
+        runtime: extra?.runtime,
+        quantization: extra?.quantization,
+      };
+    }
+    const q = this.lastRecommendOpts;
     if (this.machine) this.machine = { ...this.machine, freeRamBytes: os.freemem() };
     const installed = this.models.map((m) => m.name);
+    const activeModel = this.models.find((m) => m.name === (this.plan?.model || this.selectedModel));
+    const inferredRuntime: LocalRuntimeId | undefined =
+      q.runtime ??
+      (activeModel?.provider === "llamacpp" ||
+      activeModel?.provider === "lmstudio" ||
+      activeModel?.provider === "vllm"
+        ? activeModel.provider
+        : undefined);
     this.safePost({
       type: "modelRecommendations",
       payload: recommendModels(this.machine, {
-        goal,
-        ctxTokens,
+        goal: q.goal,
+        ctxTokens: q.ctxTokens,
+        taskPrompt: q.taskPrompt,
+        taskMode: this.mode,
+        runtime: inferredRuntime,
+        quantization: q.quantization,
         installed,
         installedModels: this.models,
         benchmarks: this.benchStore.byModel(),
+        runtimeModels: this.latestOllamaRuntime,
+        liveObservations: this.liveTpsByModel,
       }),
     });
   }
@@ -825,22 +879,61 @@ export class PhotonController {
 
   /* --------------------------- Photon Bench (M7) ------------------------------ */
 
-  /** True while a chat turn is running — bench must not compete for the model. */
+  /** True while a chat turn is preparing or actively running — bench must not compete for the GPU. */
   private turnActive(): boolean {
-    return this.turnCoord.isTurnActive();
+    return this.turnPreparing || this.turnCoord.isTurnActive();
   }
 
-  /** Benchmark any detected LOCAL model that has no stored result. Background + abortable. */
-  private async kickOffBench(): Promise<void> {
-    if (!this.reachable) return;
-    const have = this.benchStore.byModel();
-    // Bench is a local-hardware measurement — Ollama + llama.cpp both local.
-    const todo = this.models.filter((m) => (m.provider === "ollama" || m.provider === "llamacpp") && !have.has(m.name));
-    for (const m of todo) {
-      // Stop the moment a turn starts or the connection drops — don't queue work
-      // that would contend with the user's request for the model.
-      if (!this.reachable || this.turnActive()) return;
-      await this.runBenchFor(m.name);
+  /** Benchmark detected LOCAL models that have no stored result. Skipped once a local model is in use. */
+  private async kickOffBench(manual = false): Promise<void> {
+    const autoRun = vscode.workspace
+      .getConfiguration("photon")
+      .get<boolean>("bench.autoRun", false);
+    const localInUse = this.localModelUsed || this.liveTpsByModel.size > 0;
+    const initGuard = evaluateBackgroundBenchGuard({
+      reachable: this.reachable,
+      manual,
+      autoRunEnabled: autoRun,
+      turnActive: this.turnActive(),
+      localModelUsed: localInUse,
+    });
+    if (!initGuard.allowed) return;
+
+    this.benchBatchAbort?.abort();
+    const batchAbort = new AbortController();
+    this.benchBatchAbort = batchAbort;
+
+    try {
+      const have = this.benchStore.byModel();
+      // Bench is a local-hardware measurement — Ollama + llama.cpp both local.
+      const todo = this.models.filter((m) => (m.provider === "ollama" || m.provider === "llamacpp") && !have.has(m.name));
+      for (const m of todo) {
+        if (batchAbort.signal.aborted) return;
+        const runningModels = !manual
+          ? await this.client
+              .listRunning()
+              .then((ps) => ps.map((r) => ({ name: r.name ?? r.model, vramBytes: r.size_vram ?? 0 })))
+              .catch(() => this.latestOllamaRuntime)
+          : undefined;
+        if (batchAbort.signal.aborted) return;
+
+        const guard = evaluateBackgroundBenchGuard({
+          reachable: this.reachable,
+          manual,
+          autoRunEnabled: autoRun,
+          turnActive: this.turnActive(),
+          localModelUsed: this.localModelUsed || this.liveTpsByModel.size > 0,
+          targetModel: m.name,
+          runningModels,
+        });
+        if (!guard.allowed) {
+          if (guard.reason === "would_evict_loaded_gpu_model") continue;
+          return;
+        }
+        await this.runBenchFor(m.name);
+      }
+    } finally {
+      if (this.benchBatchAbort === batchAbort) this.benchBatchAbort = undefined;
     }
   }
 
@@ -863,6 +956,9 @@ export class PhotonController {
       await this.benchStore.upsert(result);
       this.safePost({ type: "benchStatus", payload: { model, phase: "done" } });
       this.safePost({ type: "benchResults", payload: [...this.benchStore.byModel().values()] });
+      this.recomputePlan();
+      this.pushPlan();
+      this.sendRecommendations();
     } catch (e) {
       if (abort.signal.aborted) return;
       this.safePost({ type: "benchStatus", payload: { model, phase: "error", message: (e as Error).message } });
@@ -943,7 +1039,7 @@ export class PhotonController {
         return;
       case "runBench":
         if (msg.payload.model) await this.runBenchFor(msg.payload.model);
-        else await this.kickOffBench();
+        else await this.kickOffBench(true);
         return;
       case "setIndexingEnabled":
         await vscode.workspace
@@ -1113,7 +1209,11 @@ export class PhotonController {
         await this.detectProviders(true);
         return;
       case "requestRecommendations":
-        this.sendRecommendations(msg.payload?.goal, msg.payload?.ctxTokens);
+        this.sendRecommendations(msg.payload?.goal, msg.payload?.ctxTokens, {
+          taskPrompt: msg.payload?.taskPrompt,
+          runtime: msg.payload?.runtime,
+          quantization: msg.payload?.quantization,
+        });
         return;
       case "startProvider":
         return this.startLocalProvider(msg.payload.id, msg.payload.modelPath);
@@ -1409,8 +1509,14 @@ export class PhotonController {
       return;
     }
 
-    // A running benchmark must not compete with a real turn for the model.
+    // A running benchmark (and any queued background loop) must not compete with a real turn
+    // or evict the user's active local model from GPU VRAM.
+    this.turnPreparing = true;
+    this.benchBatchAbort?.abort();
     this.benchAbort?.abort();
+    if (this.interfaceMode !== "cloud") {
+      this.localModelUsed = true;
+    }
 
     this.safePost({
       type: "status",
@@ -1438,6 +1544,7 @@ export class PhotonController {
       userNumCtx: this.effectiveNumCtx(),
     });
     if (!plan) {
+      this.turnPreparing = false;
       this.safePost({
         type: "error",
         payload: { message: "No usable model/plan. Check that Ollama is running and a model is selected." },
@@ -1485,12 +1592,33 @@ export class PhotonController {
     this.pushPlan();
     this.updateStatusBar();
 
-    // Auto context compaction: if conversation tokens reach >= 75% of the active model's context window,
-    // compact history before running the turn (like GitHub Copilot & Claude Code).
+    // Compact against the *projected* request, not just persisted history.  This
+    // leaves room for the incoming prompt and completion reserve on small
+    // contexts instead of discovering pressure only after the turn is appended.
     const activeCtxWindow = this.getActiveContextLimit(plan.model);
-    if (shouldAutoCompact(this.session.messages, activeCtxWindow, plan.model, 0.75)) {
+    const estFixedOverhead =
+      (this.ctxMgr ? 1500 : 700) +
+      (plan.maxTools > 0 ? Math.min(4000, plan.maxTools * 60) : 400);
+    const incomingTokens = estimateMessageTokens(
+      {
+        id: "pending-context-check",
+        role: "user",
+        content: text,
+        attachments: attachments?.length ? attachments : undefined,
+        createdAt: Date.now(),
+      },
+      plan.model
+    );
+    if (
+      shouldAutoCompact(this.session.messages, activeCtxWindow, plan.model, 0.75, {
+        incomingTokens,
+        fixedOverheadTokens: estFixedOverhead,
+        // fitToWindow reserves this same generation budget before each request.
+        reserveOutputTokens: plan.maxOutputTokens,
+      })
+    ) {
       this.output.appendLine(
-        `[compactor] Context usage >= 75% of ${activeCtxWindow} tokens (model=${plan.model}) — auto-compacting session before turn.`
+        `[compactor] Projected context usage >= 75% of the usable ${activeCtxWindow}-token window (model=${plan.model}) — auto-compacting session before turn.`
       );
       await this.runCompactCommand(undefined, true);
     }
@@ -1515,6 +1643,7 @@ export class PhotonController {
     this.providers.setThinkingLevel((this.thinkingLevel ?? "auto") as any);
 
     const signal = this.turnCoord.createTurnSignal();
+    this.turnPreparing = false;
     this.safePost({ type: "status", payload: { kind: "thinking" } });
 
     const emitter = this.makeEmitter(session);
@@ -1527,6 +1656,7 @@ export class PhotonController {
     } catch (e) {
       this.safePost({ type: "error", payload: { message: (e as Error).message } });
     } finally {
+      this.turnPreparing = false;
       this.turnCoord.finishTurn(signal);
       this.safePost({ type: "status", payload: { kind: "idle" } });
       this.safePost({ type: "generationStats", payload: null });
@@ -1641,7 +1771,7 @@ export class PhotonController {
       if (!result.compacted) {
         if (!isAuto) {
           vscode.window.showInformationMessage(
-            "Photon: Context window is already optimal. Compaction requires at least 4 conversation turns."
+            "Photon: Context window is already clean and compact. More turns are needed before history can be folded."
           );
         }
         return;
@@ -1803,6 +1933,21 @@ export class PhotonController {
       onGenerationStats: (stats) => {
         if (!isLive()) return;
         this.safePost({ type: "generationStats", payload: stats });
+        const activeName = this.plan?.model || session.model || this.selectedModel;
+        const activeInfo = this.models.find((m) => m.name === activeName);
+        if (
+          stats &&
+          stats.tps > 0 &&
+          Number.isFinite(stats.tps) &&
+          stats.totalTokens >= 8 &&
+          activeName &&
+          isLocalModel(activeInfo ?? { name: activeName })
+        ) {
+          const prev = this.liveTpsByModel.get(activeName);
+          const next = prev ? prev * 0.4 + stats.tps * 0.6 : stats.tps;
+          this.liveTpsByModel.set(activeName, Math.round(next * 10) / 10);
+          this.sendRecommendations();
+        }
       },
       onDone: (id, notice) => {
         // Find (don't ensure) — the message may have been cancelled/removed.
@@ -2143,9 +2288,20 @@ export class PhotonController {
         });
         this.latestOllamaRuntime = runtimeModels;
         this.safePost({ type: "ollamaRuntime", payload: runtimeModels });
+        const runtimeSig = runtimeModels
+          .map((r) => `${r.name}:${r.gpuPercent}:${r.contextLength}`)
+          .join("|");
+        if (runtimeSig !== this.lastRuntimeSig) {
+          this.lastRuntimeSig = runtimeSig;
+          this.sendRecommendations();
+        }
       } else {
         this.latestOllamaRuntime = [];
         this.safePost({ type: "ollamaRuntime", payload: [] });
+        if (this.lastRuntimeSig !== "") {
+          this.lastRuntimeSig = "";
+          this.sendRecommendations();
+        }
       }
 
       this.pushCloudUsage();

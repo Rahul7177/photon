@@ -12,10 +12,12 @@ import { executionFingerprint, recoveryDirective, buildVerificationPlan, isFresh
 import {
   classifyRuntimeError,
   formatNativeToolOutcome,
+  isContextOverflowError,
   sanitizeToolPairing,
   shouldRetryStep,
   waitWithBackoff,
 } from "./errorRecovery";
+import { compactSessionMessages } from "./compactor";
 import { ToolPipeline } from "../../photon-core/tools/pipeline";
 import type { LLMProvider } from "../llm/types";
 import type { TodoItem } from "../tools/types";
@@ -149,11 +151,13 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
   const policyStepBudget = plan.executionPolicy?.stepBudget ?? configuredMaxSteps;
   const maxSteps = Math.min(configuredMaxSteps, policyStepBudget);
 
-  const turnStartIndex = session.messages.length;
+  let turnStartIndex = session.messages.length;
   const hasPriorConversation = session.messages.some(
     (m, i) => i < session.messages.length - 1 && !m.hidden && m.role === "assistant" && (m.content.trim().length > 0 || (m.toolCalls?.length ?? 0) > 0)
   );
   let chatBlockNudges = 0;
+  let midTurnCompactions = 0;
+  let overflowCompactions = 0;
 
   let mutationEpoch=0;
   const executed=new Set<string>();
@@ -409,12 +413,42 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
     }
 
     emitter.onPhase("thinking");
-    const history=historyToLLM(session.messages,plan,turnStartIndex);
+    let history=historyToLLM(session.messages,plan,turnStartIndex);
     const toolSchemasTokens = nativeTools && nativeTools.length > 0 ? estimateToolSchemasTokens(nativeTools, plan.model) : 0;
-    const fit=fitToWindow(systemMsg,history,budgetTokens,plan.numCtx,plan.model,{
+    let fit=fitToWindow(systemMsg,history,budgetTokens,plan.numCtx,plan.model,{
       preserveFirstUser: true,
       toolSchemasTokens,
     });
+    const usableBudget = Math.max(512, plan.numCtx - (deps.reserveOutputTokens ?? plan.maxOutputTokens ?? 1000));
+    if (
+      step > 0 &&
+      midTurnCompactions < 2 &&
+      session.messages.length >= 8 &&
+      usableBudget >= 2048 &&
+      (fit.droppedCount > 0 || fit.usage.used >= usableBudget * 0.82)
+    ) {
+      emitter.onPhase("thinking", "Compacting context window");
+      const comp = await compactSessionMessages({
+        messages: session.messages,
+        contextWindow: plan.numCtx,
+        model: plan.model,
+        provider: deps.provider,
+        force: true,
+        keepRecentUserTurns: 1,
+        signal,
+      });
+      if (comp.compacted) {
+        midTurnCompactions++;
+        session.messages = comp.newMessages;
+        turnStartIndex = Math.max(0, session.messages.length - (comp.retained?.recentMessagesKept ?? 0));
+        history = historyToLLM(session.messages, plan, turnStartIndex);
+        fit = fitToWindow(systemMsg, history, budgetTokens, plan.numCtx, plan.model, {
+          preserveFirstUser: true,
+          toolSchemasTokens,
+        });
+        sharedLog(`[compactor] mid-turn compacted session (${comp.strategy}) — saved ~${comp.tokensSaved} tokens.`);
+      }
+    }
     emitter.onUsage(fit.usage);
     const id=currentAssistantId;
     startAssistant(id);
@@ -486,6 +520,32 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
         completeAssistant(id, raw.trim()?"Stopped.":"Stopped before the model replied.");
         commitTurnHandoff("stopped");
         return;
+      }
+      if (
+        isContextOverflowError(e, classified.rawMessage) &&
+        !raw.trim() &&
+        nativeCalls.length === 0 &&
+        overflowCompactions < 2
+      ) {
+        overflowCompactions++;
+        cancelAssistant(id);
+        emitter.onPhase("thinking", "Context overflow — compacting and retrying");
+        const comp = await compactSessionMessages({
+          messages: session.messages,
+          contextWindow: plan.numCtx,
+          model: plan.model,
+          provider: overflowCompactions === 1 ? deps.provider : undefined,
+          force: true,
+          keepRecentUserTurns: 1,
+          signal,
+        });
+        if (comp.compacted) {
+          session.messages = comp.newMessages;
+          turnStartIndex = Math.max(0, session.messages.length - (comp.retained?.recentMessagesKept ?? 0));
+          sharedLog(`[compactor] recovered from context overflow (${comp.strategy}) — retrying step.`);
+          step--;
+          continue;
+        }
       }
       const canRetry = shouldRetryStep(classified, {
         sideEffectsOccurred: mutationEpoch > 0 || toolsRun > 0,

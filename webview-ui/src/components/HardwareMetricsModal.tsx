@@ -296,12 +296,20 @@ export function HardwareMetricsModal({
                   <div className="hw-section-title">Installed Model Compatibility &amp; Speed</div>
                   {localModels.slice(0, 6).map((m) => {
                     const bench = state.benchResults.find((b) => b.model === m.name);
-                    const rec = state.recommendations?.models.find(
-                      (r) => r.name.toLowerCase() === m.name.toLowerCase()
+                    const evalItem = state.recommendations?.evaluatedInstalled?.find(
+                      (e) => e.name.toLowerCase() === m.name.toLowerCase()
                     );
+                    const catalogItem = state.recommendations?.models.find(
+                      (r) =>
+                        r.installedName?.toLowerCase() === m.name.toLowerCase() ||
+                        r.name.toLowerCase() === m.name.toLowerCase()
+                    );
+                    const fit = evalItem?.fit ?? catalogItem?.fit;
+                    const quant = evalItem?.quantization ?? catalogItem?.quantization ?? m.quantization;
+                    const validation = fit?.validation;
                     const estBytes = m.sizeBytes ?? (m.paramsB ? m.paramsB * 0.65 * 1024 ** 3 : 0);
-                    const fitLabel = rec
-                      ? rec.fit.label
+                    const fitLabel = fit
+                      ? fit.label
                       : vramTotal && estBytes > 0 && estBytes <= vramTotal * 0.85
                         ? "Fits in VRAM"
                         : ramTotal > 0 && estBytes > 0 && estBytes <= ramTotal * 0.65
@@ -312,8 +320,22 @@ export function HardwareMetricsModal({
                     return (
                       <div key={m.name} className="hw-model-card">
                         <div className="hw-model-row">
-                          <span className="hw-model-name">{m.name}</span>
-                          {bench ? (
+                          <span className="hw-model-name">
+                            {m.name}
+                            {quant ? ` (${quant.toUpperCase()})` : ""}
+                          </span>
+                          {validation && validation.status !== "unverified" ? (
+                            <span
+                              className={
+                                validation.status === "slower" || validation.status === "more_offload"
+                                  ? "hw-model-meta"
+                                  : "hw-tag-ok"
+                              }
+                              title={validation.detail}
+                            >
+                              {validation.detail}
+                            </span>
+                          ) : bench ? (
                             <span className="hw-tag-ok" title="Measured via Photon Bench on this machine">
                               Measured: {Math.round(bench.tokensPerSec)} tok/s
                             </span>
@@ -324,7 +346,17 @@ export function HardwareMetricsModal({
                         <div className="hw-model-meta">
                           <span>{fitLabel}</span>
                           {m.sizeBytes ? <span>· {fmtGb(m.sizeBytes)}</span> : null}
-                          {m.contextLength ? <span>· {Math.round(m.contextLength / 1024)}k max ctx</span> : null}
+                          {fit?.maxSafeContextTokens ? (
+                            <span>· {Math.round(fit.maxSafeContextTokens / 1024)}k safe ctx</span>
+                          ) : m.contextLength ? (
+                            <span>· {Math.round(m.contextLength / 1024)}k max ctx</span>
+                          ) : null}
+                          {fit?.pressure && fit.pressure !== "low" ? (
+                            <span>· {fit.pressure} pressure</span>
+                          ) : null}
+                          {fit?.runtime && fit.runtime !== "ollama" ? (
+                            <span>· {fit.runtime}</span>
+                          ) : null}
                         </div>
                       </div>
                     );

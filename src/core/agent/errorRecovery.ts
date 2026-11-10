@@ -147,6 +147,20 @@ export async function waitWithBackoff(backoffMs: number, signal?: AbortSignal): 
   });
 }
 
+export function isContextOverflowError(err: unknown, rawMessage?: string): boolean {
+  const msg =
+    rawMessage ??
+    (err instanceof Error ? err.message : typeof err === "string" ? err : String(err ?? ""));
+  const status =
+    typeof (err as { status?: unknown })?.status === "number"
+      ? (err as { status: number }).status
+      : extractHttpStatus(msg);
+  if (status === 413) return true;
+  return /\b(?:context[_\s-]?length[_\s-]?exceeded|maximum context length|prompt is too long|too many tokens|request too large|input length.*exceeds|exceeds (?:the )?(?:maximum )?(?:context|token|input)|context window.*exceeded)\b/i.test(
+    msg
+  );
+}
+
 /**
  * Classify any error thrown during model streaming or provider requests.
  */

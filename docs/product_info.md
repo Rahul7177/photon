@@ -1,238 +1,120 @@
 # Photon — Product Info
 
 ## What Is Photon?
-Photon is a **VS Code extension for agentic coding with small local models** — and with cloud models when you need them. It makes 3–8B models on everyday laptops actually finish multi-file tasks by automatically tuning the prompt, the tools, and the context window to your exact machine and model. No prompt engineering. No context math.
+Photon is a **VS Code extension for local-first agentic coding** — and a **direct BYOK cloud workspace agent** when you switch to Cloud mode. It is built so small 2–8B local models on everyday laptops finish multi-file tasks reliably without manual prompt engineering or context math, while frontier cloud models run at full context with minimal overhead.
 
-**Local-first.** Your code stays on your machine via **Ollama** (`http://localhost:11434`) and **llama.cpp** (`http://localhost:8080` OpenAI-compatible) by default. Add a cloud key only if you want an overflow. No pool-of-free-keys trick — you use only keys you own.
-
----
-
-## The Three Ways to Work
-Switch anytime in the header.
-
-| Mode | What happens | Best for |
-|------|--------------|----------|
-| **Chat** | Pure conversation. No tools. Photon answers with text and code snippets. | Questions, explainers, `let vs const?` |
-| **Plan** | Read-only investigation (`read_file`, `list_dir`, `find_files`, `search_code`). Photon returns a **numbered plan** naming exact files and functions. Nothing is changed. | “Plan the auth refactor” |
-| **Agent** | Photon **edits files and runs commands**, one small verified step at a time, asking before every write/execute. | “Migrate X, fix tests, handle errors” |
-
-Limits: `Chat 1 step / Plan 50 steps / Agent 100 steps`. You can say *continue* if it hits the cap.
+- **Local-first by default:** Runs on your machine via **Ollama** (`http://localhost:11434`) and **llama.cpp** (`http://localhost:8080`, OpenAI-compatible), keeping workspace code local and offline.
+- **Direct BYOK Cloud Engine:** Toggle **Local | Cloud** anytime using keys stored exclusively in VS Code `SecretStorage` — no intermediary proxy or pooled keys.
 
 ---
 
-## How Photon Chooses for You (and Shows Its Work)
+## Interaction Modes & Continuity
 
-### Auto Mode (Recommended)
-Photon classifies your task as **simple / moderate / complex** from words (`refactor, migrate, throughout` vs `explain, summarize`) + file references + estimated steps. Then it ranks every installed model:
+Switch between modes anytime in the composer bar without losing conversation history or **Maintained Project Context**:
 
-**Context fit (dominant) + headroom + measured speed + measured tool reliability + tier match + local preference (tiny bonus) + efficiency.**  
+| Mode | Capabilities & Guardrails | Safety Ceiling | Best For |
+| :--- | :--- | :--- | :--- |
+| **Chat** | **Strictly read-only.** Workspace inspection (`read_file`, `list_dir`, `find_files`, `search_code`, `code_outline`, `get_diagnostics`, `query_project_context`) + web (`web_search`, `web_fetch`). Blocks file edits/commands; outputs full copy-pastable blocks with manual steps and suggests **Agent** mode. | `100` steps | Q&A, code explanations, reviewing changes, drafting files to copy manually |
+| **Plan** | **Read-only interactive planning.** Inspects files first, asks **2–4 focused clarifying questions** when ambiguous, then writes a structured Markdown implementation plan with exact file paths, symbols, and verification steps. | `150` steps | Architecture design, multi-file refactor scoping, clarifying requirements |
+| **Agent** | **Full autonomous execution.** Full read/write/create/append/move/terminal/web + connected **MCP** tools, approval prompts (`autoApprove` optional), diagnostics verification, and per-turn workspace checkpoints. | `200` steps | Implementing features, multi-file edits, running tests/builds, bug fixing |
 
-Scores are weighted constants, not magic — e.g. `toolReliability 22 pts`, `throughput 18`, `contextMisfit -24`. A pinned model always wins, but is still ranked so you see *why* the alternative was skipped. Everything appears in the **Transparency Panel** (`◎` in the header): chosen model, why (signals, required context), top-6 ranked with context warnings, and a one-click **Pin** per project.
-
-### Manual Intelligence
-Override with `Auto / Low / Medium / High / Max` in Settings. Each level is a real knob set:
-
-| Level | Tools exposed | One vs parallel | Output cap | Prompt detail | Map lines | Output budget |
-|-------|---------------|-----------------|------------|---------------|-----------|---------------|
-| Low | 5 | one/turn | 768 | terse, directive | 18 | 4000 |
-| Medium | 8 | one/turn | 2048 | standard | 50 | 8000 |
-| High | 14 | parallel allowed | 4096 | elaborated + multi-file guide | 90 | 16000 |
-| Max | 18 | parallel allowed | 8192 | fully scaffolded | 130 | 32000 |
-
-All temperature/topP are also level-specific (`taskTemp 0.2 → 0.4`, `chatTemp 0.5 → 0.7`).
-
-### The Plan It Builds For You
-From `(machine + model + mode + intelligence)` Photon decides:
-
-* **Context window** — `model.contextLength ?? 8192`, capped by your RAM (`low 8192 / mid 16384 / high 32768` via `PowerShell / nvidia-smi / system_profiler`). Your per-model or global override (`numCtx`) wins over the cap. Visible rationale: *“Capped context to 16k for mid-tier (7GB free); model supports 32k.”*
-* **Tool protocol** — Forgiving **`[TOOL name] arg: value [/TOOL]`** for weak models; tool-trained `medium|large` can auto-upgrade to **native** function calling. Cloud defaults to block unless you opt-in `cloudNativeTools`.
-* **System prompt budget** — `budget = floor(numCtx × 0.16→0.32)`, min 256. Core (identity + mode + tools + formatting) always kept; file map and retrieved code are added only while they fit.
-* **Max output** — `clamp(256 … min(outputCap, numCtx-reserve, numCtx*0.5))`.
-
-You see the whole plan chip in the footer: `high (auto) · block tools · 32,787 ctx` with the full rationale on hover.
+- Switching `Chat → Plan → Agent` or `Local ↔ Cloud` preserves prior turn context (while scrubbing stale internal coaching nudges across protocol boundaries).
 
 ---
 
-## Model Support — See Capabilities Before You Send
+## Dual Execution Architecture: Local vs. Cloud
 
-### Capability Badges (everywhere)
-Next to the context meter, on the model picker, and on every Cloud card:
+### Local Engine (`runUnifiedTurn`) — Adaptive + Inverse Scaffolding
+Rather than starving weak models of tools, Photon grants full tool access (`maxTools = 40` within mode bounds) and scales **cognitive scaffolding inversely** with model capability (`src/core/adaptive/orchestrator.ts`, `src/core/intelligence/policy.ts`):
 
-`◈ Tools` (always, via block) · `◉ Vision` · `♫ Audio` · `▶ Video` · `✦ Think` · `32k ctx`
+| Intelligence Level | `chatTemp` / `taskTemp` | Output Cap | Prompt Budget Fraction | Workspace Map Lines | Ideal Target |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`low`** | `0.25 / 0.15` | `2048` | `20%` | `30` | Large self-sufficient models, simple tasks |
+| **`medium`** | `0.25 / 0.15` | `3072` | `26%` | `60` | Capable models, moderate tasks |
+| **`high`** | `0.20 / 0.10` | `4096` | `34%` | `90` | Mid-sized models (9–20B) or complex/codebase tasks |
+| **`max`** | `0.15 / 0.10` | `4096` | `42%` | `120` | Tiny (`≤4.2B`) & small (`≤8.5B`) models or lower tool reliability (`<0.72`) |
 
-Compact in the header, full in **Settings → Machine & model** and **Composer**. Detected from Ollama `capabilities`/`model_info`/`template` and from name hints, with cloud live-list `inputTokenLimit` passthrough.
+* **Hardware-Aware Context Window (`computeOptimalContextWindow`)**: Profiles RAM, CPU cores, and GPU VRAM (`nvidia-smi` / Windows registry `HardwareInformation.qpMemorySize` / macOS `system_profiler` / Linux `/sys/class/drm`). Reserves a strict **22.5% OS/VS Code RAM safety buffer** and **0.5 GB VRAM**, applies CPU hybrid-offload caps (`16k / 32k / 64k` by core count, `128k` GPU-resident), and snaps down to `[8192 … 262144]`. Minimum local target floor is `min(8192, modelMax)`.
+* **Protocol Auto-Selection (`shouldUseNativeToolProtocol`)**: Uses **native JSON tool calling** when local models declare native tool support (or pass fresh **Photon Bench v4** at `toolCallReliability ≥ 0.80`, `schemaAdherence ≥ 0.82`, `toolCalling ≥ 0.82`); otherwise runs the tolerant **`[TOOL name] … [/TOOL]`** block parser covering `[TOOL]`, `<tool_call>`, Gemma pipe calls, fenced blocks, and balanced JSON objects.
+* See [`docs/ADAPTIVE_INTELLIGENCE.md`](./ADAPTIVE_INTELLIGENCE.md) for exact formulas and scoring weights.
 
-### Local — Ollama + llama.cpp (both first-class)
-* **Ollama** — any `ollama pull`’d model. Photon profiles it: `context_length` from `model_info`, else `num_ctx` from `modelfile`, else family guess (`qwen 32768, llama/gemma 8192, phi 16384`). Tier `tiny <4B / small <8.5B / medium <20B / large`. `keepAlive 30m` so models stay resident between turns.
-* **llama.cpp** — run `llama-server -m model.gguf --port 8080`. Photon hits `http://localhost:8080/v1/models` and **auto-discovers** `llamacpp:*` models — no manual “Add” needed. Appears alongside Ollama under **Local**. No API key required.
-* **Visibility:** `Local` shows `ollama + llamacpp`; `Cloud` hides both. No leaky mixing after the recent picker fix. Short display strips provider prefix (`gemma-4-E4B-it-GGUF:Q4_0 · medium · 7 tok/s`) with full name on hover.
+### Cloud Engine (`runCloudTurn`) — High-Throughput Native Calling
+* Bypasses hardware RAM context caps and gives cloud models their full `contextLength` (`128,000` default, honoring per-model overrides).
+* Request-aware tool surface (`classifyCloudToolPolicy`): `0` tool schemas on standalone opening greetings, `web`-only schemas on pure external-fact questions, read-only + web tools in **Chat/Plan**, and full file/terminal/web + approved MCP tools in **Agent**.
+* Parallel read-only execution waves (`Promise.all` for concurrent `read_file` / search batches), real-time token usage & cost tracking (`CloudUsageTracker`), and automatic blocked-write recovery to Markdown code blocks in Chat mode.
 
-### Cloud — Bring Your Own Key (BYOK)
-Keys live in **VS Code SecretStorage** (`photon.provider.<id>.apiKey`), never in `settings.json`.
-
-| Provider | Endpoint | Live listing | Catalog |
-|----------|----------|--------------|---------|
-| **Gemini** | `generativelanguage.googleapis.com` | `v1beta/models` (`generateContent` filter) | all `generateContent` models |
-| **Claude** | `api.anthropic.com` | `v1/models?limit=100` paginated | all |
-| **OpenAI** | `api.openai.com/v1` | `GET /models` | all |
-| **NVIDIA NIM** | `integrate.api.nvidia.com/v1` | `GET /models` | all |
-| **OpenRouter** | `openrouter.ai/api/v1` + `HTTP-Referer/X-Title` | `GET /models` | all |
-| **OpenCode Zen** | `opencode.ai/zen/v1` | `GET /models` | all |
-| **Blackbox** | `api.blackbox.ai` (`keyInBody`, `Agent-Id`) | **no** live (manual) | 4 curated: `blackboxai-pro (+ plus 128k, vision+think), 1.5-8b, llama-3.3-70b` |
-| **Custom** | any OpenAI-compatible | `GET /models` | inferred tier/cap via regex |
-
-Flow: Enable → paste key → **Refresh** fetches *only* what your key can use → **Test** (tiny `ok` completion, measures `ms`) → **Add to picker** (`globalState photon.customModels`). Remove with `✕`. Custom endpoints are `id` derived from label.
-
-### What Auto Considers When Ranking
-`contextWindow` vs task `minContext (simple 2k / moderate 6k / complex 12k)` plus your machine tier + bench-measured `tok/s` & tool reliability. Local gets +4 `localPreference` tie-break; simple tasks get `efficiency +6` for smaller models that still fit.
+### Auto Mode Routing (`autoMode.ts`) & Photon Bench (`bench.ts`)
+* **Multi-signal scoring (`rankModels`)**: Combines `contextFit (+30)` + `headroom (+6)`, `toolCalling (×18)`, `coding (×14)`, `reasoning (×12)`, `throughput (×12)`, `recovery (×10)`, `verification (×8)`, `tierMatch (×8)`, `localPreference (+3)`, cost penalty (`-15` for expensive cloud on simple tasks), and `localOnly` privacy enforcement (`-200`).
+* **Controlled runtime fallback (`selectFallbackModel`)**: Never silently escalates a local turn to paid cloud APIs without `allowCloudEscalation`.
+* **Photon Bench (`BENCH_VERSION = 4`)**: Measures real throughput (`tok/s`), tool-call schema reliability, coding edits, recovery, verification, and context retention (valid for 30 days). Inspect full rankings & Pin per project in the **Transparency Panel** (`◎`).
 
 ---
 
-## Tools — What Photon Can Do For You
+## Context Compaction & Long-Session Resilience
 
-Weak models get **5 tools**, capable local gets **14**, `max` gets **18**, cloud gets **100**. Filtering is hard-gated by `minTier` and sorted by `priority`.
+Photon implements multi-layered compaction matching cloud-grade coding agents (`src/core/agent/compactor.ts`, `src/core/agent/contextManager.ts`):
 
-**Core workspace (priority order, low → high):**
-
-| Tool | What you see | When it appears | Safety |
-|------|--------------|-----------------|--------|
-| `read_file path, start_line?, end_line?` | File with `0001 │` gutters, `lines 1-600 of 3421 [continues…]`; auto-chunks (`600/1200/2500/4000` lines by capability). | Low+ | read-only |
-| `edit_file path, find!, replace!, replace_all?` | Exact find→replace; tries exact → gutter-stripped → whitespace-trimmed fuzzy; errors if ambiguous. Preserves `EOL`. | Low+ | **asks** |
-| `write_file path, content!` | Full create/overwrite; `Created/Overwrote N lines M bytes` | Low+ | **asks** |
-| `find_files query!` | `vscode.workspace.findFiles` substring or `**/*.test.ts` glob, `cap 25→150` by capability | Low+ | — |
-| `list_dir path?, recursive?` | Sorted dirs-first; recursive BFS depth ≤2 capped 400 | Low+ | — |
-| `search_code query!, is_regex?, case_sensitive?, path?, include? (*.ts), context_lines 0-4` | `N matches in F files` with `bytes` & `depth` guards `4000 files / 512KB / 25 depth`, parallel batches of 4, `15k` clamp | Low+ | — |
-| `get_diagnostics path?, errors_only?` | `ERROR file:line:col [source]: msg` via `vscode.languages.getDiagnostics`, capped `20/50` shown, hard `200` | Low+ | — |
-| `run_command command!, description?, timeout_ms?` | Shell in workspace root, `windowsHide`, `1MB` buffer, timeout `60s` (max 300s cloud is 180/600s), `Exit code N` | Medium+ | **asks** |
-| `move_path from!, to!` | Rename/move, cross-device `cp+rm` fallback | Medium+ | **asks** |
-| `code_outline path!` | Functions/classes/types with line numbers, 200 hits max | Medium+ | — |
-| `todo_write items!` | Checklist `[ ]/[>]/[x]` per line, forgiving (`- ` prefix stripped, unprefixed → pending), persists in `ctx.todos` | Medium+ | — |
-| `think thought!` | Private scratchpad (no output to you) → `Noted. Continue…` | Medium+ | — |
-| `web_search query!` | DuckDuckGo HTML fetch `15s`, `result__a / result__snippet` parse, `max 5→8` by capability; disabled if `webSearch=none` | High+ | — |
-| `web_fetch url! (https?), start_line?` | Fetches page, `htmlToText` strips scripts/nav, `2M` slice, `400` non-empty lines paged | High+ | — |
-
-All tool outputs are **clamped** (`Tools 4k/8k/16k/32k` by capability) with `… [truncated N]` so a huge log never blows your window.
-
-**Cloud-only names for frontier models (same power, familiar names):** `write_to_file`, `replace_in_file`, `execute_command`, `search_files`, `list_files`, `list_code_definition_names`, plus lifecycle `ask_followup_question` and `attempt_completion` (“call when fully done with Markdown summary”) which end the turn without touching the workspace.
-
-**Anything else via MCP:** Any `mcp` server from `.vscode/mcp.json` (`stdio` via `npx/node/python/uvx/bun/deno` allowlist, or `http` `http(s)://`). Its tools become `mcp_<id>_<tool>` (`priority 9`, `minTier medium`, `tags [mcp]`), always require approval, shown as `pending → approved → connected / error / revoked`. Revoke is one click.
+1. **Pre-Turn 75% Auto-Compaction & `/compact [focus]`**: Evaluates projected input (`history + pending user prompt + fixedOverheadTokens + reserveOutputTokens`) against `0.75` of usable window before starting each turn (and via the `Compact` meter button or `/compact [focus]`).
+2. **Proactive Mid-Turn Compaction & Overflow Retry**: During long multi-step turns inside both `runCloudTurn` (`compactMidTurnLLMHistory`) and `runUnifiedTurn` (`compactSessionMessages`), Photon proactively compacts older tool rounds before turns get dropped — and if an API rejects a request for context overflow (`context_length_exceeded` / `413` / `"prompt is too long"`), Photon compacts and retries cleanly instead of failing.
+3. **Hybrid Provider + Ground-Truth Compaction**: Calls a fast provider model (automatically retrying on the active working model if the sibling fails, up to 30s timeout and dynamic 8k–48k char transcript windows) and validates/appends omitted structured facts (`retainMissingStructuredFacts`), backed by deterministic offline `buildNativeCompactionSummary` separating:
+   - Original task anchor & negative user constraints
+   - Verified modified/created/moved files, inspected files, and `ENOENT`/0-match findings
+   - Explicit command execution outcomes (`✓ Completed`, `✗ Failed`, `⏸ Not executed`, `⏳ Awaiting approval`, `⛔ Denied`)
+   - Unverified model assumptions vs. unresolved errors/TODOs
+4. **In-Request Clamping & Persistence Archival**:
+   - `compactCloudHistory` deduplicates repeated `read_file` outputs and compacts stale tool outputs (>2 user turns old).
+   - `fitToWindow` JSON- and line-clamps large tool payloads (`clampStructuredToolResult`) and guarantees `tool_call` / `tool` pairing (`sanitizeToolPairing`).
+   - `enforceSessionMessageCap` archives overflow turns into cumulative digests without losing earlier history across multi-round compactions.
 
 ---
 
-## Context & Performance You Can See
+## Checkpoints & Rollback
 
-**Meter:** `used / window` bar under the chat, amber at `>80%`. `window` is the *effective budget* (`numCtx - reservedOutput 1024`), not the raw window. Tooltip: `System 1.2k + History 2.8k / Budget 7k`. The original task message is **never** dropped.
-
-**Live `tok/s`:** While streaming you see `⚡ 42 tok/s · 128 tok` next to the meter (`accChars/4`, throttled `250ms`). Clears to idle.
-
-**Token math:** Lightweight heuristic `max(chars/4, words×1.3)` including `4` overhead per message + tool-call overhead — good enough for small windows, swappable per-model later.
+* **Pre-mutation snapshots (`CheckpointManager` / `CheckpointCoordinator`)**: Automatically records clean workspace file states before mutating Agent turns commit.
+* **Restore anytime**: Use the inline **Checkpoint Pill** on assistant turns, `/rewind` (instant rollback of the latest edit turn), or `/revert [#N]` / the **Revert Modal** (`RevertModal.tsx`) to restore workspace files with optional chat rewind.
 
 ---
 
-## Workspace Understanding (Offline-First)
+## Model & Provider Ecosystem
 
-Photon watches your workspace and builds a **local vector index** — no network, no server.
+### Local Runtimes (`LocalProviderHub.tsx`, `localProcessManager.ts`, `modelAdvisor.ts`)
+* **Ollama** (`http://localhost:11434`, configurable `keepAlive: "-1"` default, `preloadOnStartup: true`) with live model capability probing (`paramsB` incl. Gemma-4 `:e2b`/`:e4b` MoE effective sizes, quantization, vision/audio/video/thinking/tools).
+* **llama.cpp** (`http://localhost:8080/v1`, toggle `photon.providers.llamacpp.enabled`) with per-model `llama-server` CLI flag generator (`-ngl`, `--fit`, `-np`, `-fa`, `-ctk`, `-ctv`, extra args).
+* **Lifecycle UI**: Hardware-matched model catalog recommendations (`MODEL_CATALOG`), one-click server start/install check, live `ollama pull` progress bars (`PullProgressBar`), and real-time GPU/VRAM/RAM telemetry (`HardwareMetricsModal`).
 
-* **What it indexes:** `**/*.{ts,tsx,js,jsx,py,go,rs,java,c,cs,…}` up to **1500 files × 256KB**, ignoring `node_modules/.git/dist/out/.next/.venv/__pycache__/.turbo/coverage`.
-* **How it chunks:** Sliding window `60 lines` with `12 overlap` (step 48), drops empty chunks, caps `4000 chars` per chunk and **80 per file**.
-* **How it embeds:** Batched `24` texts per `ollama /api/embed` via local `nomic-embed-text` (or your `photon.index.embeddingModel`). Vectors are unit-normalized; store is pure-TS dot-product linear scan, capped **8000 chunks** (fifo drops oldest *file*).
-* **How it helps:** On each agent/plan turn Photon retrieves top **6** chunks (cosine, threshold `0.2`) bounded to **4000 chars**, injected as `Relevant code … path:start-end` into the system prompt. Medium+ only — `low` skips retrieval to save budget.
-* **You see:** `idle / indexing / ready / unavailable / error` with `files, chunks, pending` in Settings, plus a manual **Re-index now**. Persisted to `globalStorage/index-<hash>.json` (workspace path hash) with `dim` validation.
+### Cloud BYOK Providers (`providerCatalogService.ts`)
+API keys are stored encrypted in VS Code `SecretStorage` (`photon.provider.<id>.apiKey`):
 
----
+| Provider | Endpoint / Integration | Features |
+| :--- | :--- | :--- |
+| **Google Gemini** | `generativelanguage.googleapis.com/v1beta` | Live model sync, thinking levels, multimodal inline media |
+| **Anthropic Claude** | `api.anthropic.com/v1/messages` | Ephemeral prompt caching on system & tools, reasoning |
+| **OpenAI** | `api.openai.com/v1` | Live catalog, GPT-4o / o-series reasoning & usage stats |
+| **NVIDIA NIM** | `integrate.api.nvidia.com/v1` | Live catalog, Nemotron & open-weight frontier models |
+| **OpenRouter** | `openrouter.ai/api/v1` | Multi-vendor routing + app headers |
+| **OpenCode Zen** | `opencode.ai/zen/v1` | Live model listing & OpenAI-compat streaming |
+| **Blackbox AI** | `api.blackbox.ai` (`keyInBody`) | Curated reasoning/coding catalog |
+| **Custom** | User-defined `baseUrl` (`photon.providers.custom`) | Custom OpenAI-compat endpoints, custom headers, optional key in body |
 
-## Per-Model Personalization (Local Power Users)
-
-**Settings → Per-model configuration** lists *only* local models (`ollama`/`llamacpp`). Expand a row:
-
-* **Every local model:** `Context window` (`numCtx`), `Note`
-* **llama.cpp only:** `-ngl` (`all` or `0..N`), `--fit` on/off, `-np` (slots), `-fa` on/off, `-ctk` (`q8_0`), `-ctv` (`q8_0`), `Extra args` (`--jinja …`). Live preview builds the exact `llama-server -m <gguf> -c 32768 -ngl all --fit -np 1 -fa on -ctk q8_0 -ctv q8_0 --port …` — **Copy** and restart `llama-server` with it.
-
-Resolution: **per-model `ctx`/`llamacpp.ctx` → global `userNumCtx` → `.photon/config.yaml` → adaptive RAM cap**. Both the turn plan (`buildPlan`) and `cloudPlan` respect the per-model ctx.
-
-Teams can also check in `.photon/config.json|yaml|yml` (flat YAML, versioned) with `model, intelligence, numCtx, indexing, autoApprove` — file wins over defaults, personal per-model wins over file, and the file watcher hot-reloads without restart.
-
----
-
-## User Interface — Every Surface
-
-**Shell:** Centered `860px` column even when you stretch the VS Code panel wide; `gutter 10px`. Your bubbles align **right** (`var(--space-700)`), Photon left; code blocks inside user bubbles expand to full width. Markdown is capped at `72ch` for scan.
-
-**Header** (two-row, calm):
-- *Top*: `Chat | Plan | Agent` tabs (red underline) left, **Photon** orbital wordmark right at the same baseline.
-- *Bottom left*: `Local | ☁ Cloud` toggle + **Model picker** (`Auto 🤖` + `display = without provider prefix`, `tier · tok/s` suffix, `max-width 320px` ellipsis). 
-- *Bottom right*: `Auto Mode ◎`, `History 🕒`, `Refresh ↻`, `New +`, `Settings ⚙`.
-
-**Hero (empty state):** Title *Start a conversation*, subtitle, model line, and **3 mode-specific suggestion** cards that are now `grid auto-fit 240px` so they don’t stretch.
-
-**Messages:** Streaming `Markdown` (`inline code`, `fenced block` with language tag + **Copy** on hover), **Tool Cards** (collapsible, dot `proposed grey / running amber pulse / done green / error red`, mono args ellipsis, `max-height 220px` result), **Approval cards** (write/execute → `Approve / Deny` + optional *remember*). Attachment thumbnails (`180px` image or `📄` doc chip).
-
-**Composer:** `ContextMeter` top inside the input area, optional compact badges (now merged into the meter line to avoid duplication), `attach-error`, `attach chips` (`×` now `22×22`), `input-wrap` (`+ Attach` — now `space-700`, transparent border — + auto-grow `textarea 160px` + `↑ Send / ■ Stop`). **Drag-drop** anywhere on the composer + **paste (Ctrl+V)** of screenshots/files create chips via `readFileToAttachment`. Vision-gated `accept`: blocks images if `!model.vision` with a clear error. `Enter` sends, `Shift+Enter` newline.
-
-**Panels:**
-* **History** (from `Clock`): popover `260×320`, sorted `updatedAt desc`, `title` ellipsis + `mode · count · time`, `×` delete on hover.
-* **Transparency** (from `◎`): `Auto-select` checkbox, chosen model + `auto/pinned` badge, reason line, `level · files · steps · needs ctx` chips, ranked `scores` (warn `⚠ ctx` if `!fits`) with **Pin** per row. One click to pin.
-* **Settings** (full-page): `Intelligence grid` (Auto/Maximum/High/Medium/Low), `Adaptive engine` toggle + `rationale ul`, `Global context override` (commits on blur) + per-model hints, **Per-model configuration** section, `Tools` (auto-approve, web search `duckduckgo/none`, tool list with `writes` badge), `Workspace index` (toggle, status, Re-index, embedding model), `MCP servers` (`pending→connected` + `Approve/Revoke`), `Model benchmarks` table (`tok/s · tools% · reason ✓/✕ · ↻`), `Machine & model` (`tier RAM cores GPU`, model `tier param quant`, badges, raw caps, *View full diagnostics*), `Connection` (`ollamaBaseUrl` + reachable), `Cloud providers` intro + cards per provider.
-
-**Cloud Provider Cards:** Letter logo color, `✓ Connected / No key`, `N added`, `› Expand + Toggle`; inside: hint, **API Key** (`password` + `👁/🙈` reveal + `Connect / Clear` + `Get key ↗` docs), **Models available to your key** + `↻ Refresh` + error banner + manual input for `blackbox` + chip rows (`mono id + compact badges + Test › + spinner ⧗ / ✓ Nms / ✗ error + Add to picker / ✓ Added ✕ remove`).
-
-**System chrome:** `OfflineBanner` (local unreachable), `ErrorBanner` dismissible, `StatusIndicator` (`Thinking` / `Running toolName` + spinner + animated dots), `MCP/Bench/Settings` hints dim.
-
-**Focus & scroll:** `*:focus-visible` red `1.5px`, icon buttons `28×28`, custom `6px` scrollbar `space-500`.
+* **SSE & Timeout Hardening**: All cloud streams enforce a `60s` HTTP fetch timeout, `90s` SSE idle watchdog, immediate `[DONE]` loop termination (preventing keep-alive stalls), duplicate-call spin guards, and elapsed progress notices (`Waiting for model (Ns)…` / `Thinking (Ns)…` / `Generating (Ns)…`).
 
 ---
 
-## Persistence & Safety
+## Workspace Intelligence & Tools
 
-| Store | What | Where | Limit |
-|-------|------|-------|-------|
-| **Sessions** | Every turn | `globalState photon.sessions` sorted `updatedAt desc` | `40 sessions`, persisted **200 msgs / 8k chars msg / 6k tool result**, `KEEP_INLINE_IMAGES 4` newest base64, JSON `4MB` guard drops oldest. Live cap `400 msgs` (`MAX_CONTENT 250k` per message in webview). |
-| **Project** | Pinned model, approved MCP ids | `workspaceState` per workspace | — |
-| **Bench** | `tok/s, firstTokenMs, toolCallReliability, reasoningPass` | `globalState photon.bench` key `model+hardwareClass+methodologyVersion 1` | `200` latest `ranAt` |
-| **Per-model configs** | `numCtx, llamacpp` per model | `globalState photon.perModelConfigs` | — |
-| **Custom models** | After-test added cloud models | `globalState photon.customModels` | — |
-| **Secrets** | All cloud (+ optional llamacpp) keys | `secrets photon.provider.<id>.apiKey` | never plaintext |
-| **Index** | Vectors | `globalStorage/index-<hash>.json` `version 1, dim` | validation drops mismatched dims |
-| **Queues** | In-flight prompt queue | in-memory `promptQueue` | inbox-style drain sequential |
+### Maintained Project Context & Offline Vector Index
+* **Maintained Project Context (`ProjectContextManager`, `ProjectContextModal`)**: Maintains structural workspace digests, file/symbol outlines, architectural decision logs, and cross-model/cross-mode handoff summaries injected into system prompts and accessible via `query_project_context` / `update_project_context`.
+* **Local Semantic Vector Index (`indexService.ts`)**: Watches up to `1,500` workspace files (`≤256 KB` each), chunks code (`60` lines, `12`-line overlap), embeds locally via Ollama `nomic-embed-text` (or configured model, validated against model-identity changes), stores up to `8,000` normalized vectors in `globalStorage`, and retrieves top-6 chunks during Plan/Agent turns (`Medium+` tiers).
 
-**Approval:** Every `sideEffecting` tool (`write/edit/move/run_command` + MCP) goes through `requestApproval` → `ToolApprovalRequest` UI → promise → `projectState` can remember. Abort `turnAbort` cancels generation (`reader.cancel`) and resolves pending approvals as denied.
+### Built-in Tools & MCP (`src/core/tools/`, `mcpCoordinator.ts`)
+* **Workspace (Local 17 tools + Cloud-mapped aliases):** `read_file` (with `start_line`/`end_line`), `edit_file` (`replace_in_file`), `write_file` (`write_to_file`), `append_file`, `move_path`, `find_files`, `list_dir` (`list_files`), `search_code` (`search_files`), `code_outline` (`list_code_definition_names`), `get_diagnostics`, `run_command` (`execute_command`), `query_project_context`, `update_project_context`, `todo_write`, `think`, `web_search` (DuckDuckGo / Google), `web_fetch`.
+* **MCP Servers:** Reads `.vscode/mcp.json` (`stdio` allowlist `npx/node/python/uvx/bun/deno` with shell-injection guard & filtered env, or `http(s)://`), registers tools as `mcp_<id>_<tool>`, exposed in **Agent** mode (`Local` + `Cloud`), with trust fingerprints and one-click Approve/Revoke.
 
 ---
 
-## Protocol & Prompting (Why Small Models Still Follow)
+## Webview UX & Safety
 
-**Canonical:** ` [TOOL name] arg: value [/TOOL]` with `arg: value` per line; multi-line via ` ``` fence`. Rendered verbosity scales by intelligence (`low` one-line specs vs full bullets with `[changes workspace]`). Native `tools` JSON (`type: function, parameters + required`) is only sent when `toolTrained && tier medium|large`.
-
-**Forgiving parser** accepts *all* of these and maps to the same `ToolCall` (overlap-deduped, start-sorted):
-
-* `[TOOL]…[/TOOL]` + truncated unclosed tail
-* `<tool_call> JSON | <|tool_call>call:NAME \n path: .` (Gemma pipe + plain key: value, with unclosed-trail handler)
-* ```json / `tool_call` / `tool` fences
-* bare `{ "name":…, "arguments":{…}}` balanced-JSON scan (capped `50` objects, `200` brace attempts O(n²) guard)
-
-Greedy `content/find/replace` fence fallback, `coerce` (`string→String, number→Number, boolean yes/true/1 → true`), `Missing required` / `expected type` errors fed back. `tool result` → `[RESULT/ERROR name]…[/RESULT]` (`tool` role for native, `user` for block). Truncation noted on final message.
-
-**System prompt builder:** Identity + workspace name + mode prompt + tool instructions + (if `mode≠chat`+`level≠low`) multi-file guide + *budget-checked* `workspaceMap` (`MAP_LINES`) + *bounded* retrieved code (`fitBlock 40 token min`) + formatting. Budget `floor(numCtx × fraction)` clamped `256`.
-
----
-
-## Diagnostics & Performance
-
-**Status bar:** `Photon: <model> | Auto | (error)` (+ tooltip reasoning).
-
-**Bench (Photon Bench, M7):** Short deterministic `num_ctx 4096, num_predict 160, seed 7`: 1) throughput (`Write add(a,b)` via `eval_count/eval_duration`), 2) `2×` tool-call `read_file` reliability, 3) reasoning (`[]+3×2 → 6`). Auto-kicks for local models without a result; never competes with a turn; one-click **Benchmark all** / `↻` per row; hardware class derived (`totalRam ≥32 or vram≥12 → high, ≥16 or vram≥6 → mid else low` via `nvidia-smi` / registry `QP...MemorySize` / `system_profiler`).
-
-**Live tok/s:** `tps = ceil(accChars/4)/elapsedMs×1000`, throttled `250ms`, emitted via `onGenerationStats` (`cloudEngine` + `engine` `250ms`), cleared on `onDone`/`onError`/abort. Shown as `⚡ 42 tok/s · 128 tok` pill.
-
-**Engine resilience:** `streamRetries 1`, `emptyStreak ≤2` (“Your reply arrived empty…”), `continuations ≤5` for `length/max_tokens` or unclosed ` ``` ` or `!doneReason && toolsRun>0` (“Continue EXACTLY where you stopped”), `continueNudges ≤5` for `format` (`[TOOL` in prose) / `continue` (`let me, now let…`), duplicate `path-keyed` guard `5× → stop`, identical `raw` loop `4→nudge else stop`, `failStreak 2+` appends `spec.example`.
-
----
-
-## Security & Privacy
-Local by default, no telemetry required. Indexed code never leaves the machine. Cloud keys encrypted in `SecretStorage`; MCP `stdio` allowlist `npx/node/python/uvx/bun/deno` + `BLOCKED_ARG_RE` (`rm -rf|sud o|chmod +x| |sh|;`) + env filtered to `PATH/NODE_ENV/PYTHONPATH/MCP_*`, http only `https?://`. Official MCP SDK imports are `pending → approved → connected`.
-
----
-
-## Why Photon Exists (in one paragraph)
-Cloud-first agents assume strong models and large contexts. On small local models they drown the context, expose too many tools, and fail on malformed tool calls. Photon does the opposite — it **adapts down**: terse prompts for small windows, fewer tools, capped budgets, and forgiving parsing with repair. That’s why a 7–8B model can finish multi-file edits here when it stalls elsewhere — and when you *do* need a frontier model, your own cloud key is one click away without ever pooling free tiers.
-
+* **Clean Turn Abstraction (`TurnProcess`, `AssistantTurn`)**: Groups intermediate tool calls (`ToolCard`) and thinking blocks (`ThinkingBlock`) cleanly per turn, auto-collapsing finished work into concise summaries while keeping live pulsing status visible through multi-step waits and mid-reply generation.
+* **Smart Markdown & Large-File Previews (`Markdown.tsx`)**: Line-based CommonMark parser supporting `4`-backtick outer blocks (` ````markdown ```` `), resilient nested `3`-backtick fences inside Markdown/README blocks (keeping an entire file in one copyable block), and automatic **14-line preview + `See more (N more lines)` / `Show less` collapse** with always-accessible full **Copy** on large files (`>20` lines or `>1,400` chars).
+* **Composer & Controls (`Composer.tsx`, `ContextMeter.tsx`)**: Slash command menu (`/compact`, `/revert`, `/rewind`), file/screenshot drag-drop & paste (`Ctrl+V`, vision-gated), live `tok/s` & context budget popover with manual **Compact** and **Telemetry**, queue/abort (`TurnCoordinator`), onboarding walkthrough (`OnboardingModal`), and project config hot-reload (`.photon/config.json|yaml|yml`).
+* **Persistence & Redaction (`sessionStore.ts`, `SecretStorage`)**: Up to `40` sessions persisted (`SESSION_STORE_SCHEMA_VERSION = 2`, 200 persisted messages / 400 live messages per session) with automatic `redactSecrets` scrubbing of API keys/Bearer tokens across persisted histories, logs, and compaction summaries.

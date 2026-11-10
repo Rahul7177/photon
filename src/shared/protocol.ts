@@ -27,6 +27,7 @@ import type {
   ModelInfo,
   OllamaRuntimeModel,
   PullProgress,
+  LocalRuntimeId,
   LocalRuntimeInfo,
   ProviderLifecycleState,
   ModelCapability,
@@ -220,7 +221,16 @@ export type ViewMessage =
   | { type: "pullModel"; payload: { model: string } }
   | { type: "cancelPull" }
   | { type: "detectProviders" }
-  | { type: "requestRecommendations"; payload?: { goal?: ModelCapability; ctxTokens?: number } }
+  | {
+      type: "requestRecommendations";
+      payload?: {
+        goal?: ModelCapability;
+        ctxTokens?: number;
+        taskPrompt?: string;
+        runtime?: LocalRuntimeId;
+        quantization?: string;
+      };
+    }
   | { type: "startProvider"; payload: { id: "ollama" | "llamacpp"; modelPath?: string } }
   | { type: "stopProvider"; payload: { id: "ollama" | "llamacpp" } }
   | { type: "restartProvider"; payload: { id: "ollama" | "llamacpp" } }

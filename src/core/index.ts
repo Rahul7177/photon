@@ -47,6 +47,25 @@ export {
 } from "./adaptive/tokens";
 export { profileMachine, sampleHardwareMetrics } from "./adaptive/machineProfiler";
 export { profileModel } from "./adaptive/modelProfiler";
+export {
+  MODEL_CATALOG,
+  hardwareFromProfile,
+  hardwareTier,
+  memoryRequiredGb,
+  findMatchingBenchmark,
+  validatePredictionAgainstRuntime,
+  assessFit,
+  summarizeHardware,
+  evaluateInstalledLocalModels,
+  recommendModels,
+  recommendModelForTask,
+  evaluateBackgroundBenchGuard,
+  type LiveObservation,
+  type FitPredictOptions,
+  type RecommendOptions,
+  type TaskRecommendOptions,
+  type BackgroundBenchGuardInput,
+} from "./adaptive/modelAdvisor";
 export { CloudUsageTracker, estimateCloudCost, getModelPricing, type CloudPricing } from "./telemetry/cloudUsage";
 
 // --- Agent turn loop (M9 repair) ------------------------------------------
@@ -63,6 +82,7 @@ export { buildCloudSystemPrompt, type CloudSystemInput } from "./prompts/cloudSy
 export { fitToWindow, type FitResult } from "./agent/contextManager";
 export {
   compactSessionMessages,
+  compactMidTurnLLMHistory,
   shouldAutoCompact,
   extractCompactionCandidates,
   extractStructuredCompactionData,
@@ -74,6 +94,9 @@ export {
   MIN_MESSAGES_FOR_COMPACTION,
   type CompactionResult,
   type CompactionOptions,
+  type CompactionPressureOptions,
+  type MidTurnCompactionOptions,
+  type MidTurnCompactionResult,
   type CompactionCandidateSet,
   type CompactionRetainedItems,
   type StructuredCompactionData,

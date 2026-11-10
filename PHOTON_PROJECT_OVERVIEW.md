@@ -17,7 +17,7 @@ The core differentiator: unlike most AI coding extensions built for massive clou
 | **MCP Support** | Connects external MCP servers from `.vscode/mcp.json` with strict approval controls |
 | **Offline Workspace RAG** | Vector embedding engine powered by Ollama (`nomic-embed-text`) with sliding-window code chunking |
 | **Checkpoints & Rollback** | Pre-mutation snapshots, reverse-chain cumulative rollback, revert/rewind chat, one-click restore modals |
-| **Context Compaction** | Auto-triggers at 85% context pressure; preserves task objective, active files, todos, key decisions |
+| **Context Compaction** | Auto-triggers at 75% projected context pressure; preserves task objective, active files, todos, key decisions |
 | **Hardware & Cost Telemetry** | Live CPU/RAM/VRAM gauges + USD cost calculator across OpenAI, Anthropic, Google Gemini, NVIDIA NIM |
 | **Modern UI** | Void black theme, animated gradients, matte finish, crisp SVG icons |
 

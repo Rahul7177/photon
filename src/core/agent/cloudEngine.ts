@@ -9,10 +9,12 @@ import type { Tool, ToolContext } from "../tools/types";
 import {
   classifyRuntimeError,
   formatNativeToolOutcome,
+  isContextOverflowError,
   sanitizeToolPairing,
   shouldRetryStep,
   waitWithBackoff,
 } from "./errorRecovery";
+import { compactMidTurnLLMHistory } from "./compactor";
 import { executionFingerprint, looksLikeNarration } from "../intelligence/policy";
 
 /**
@@ -535,6 +537,8 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
   let forcedTextUsed = false;
   const blockedWriteDrafts: BlockedWriteDraft[] = [];
   let toolsRun = 0;
+  let midTurnCompactions = 0;
+  let overflowCompactions = 0;
   let mutationEpoch = 0;
   const executed = new Map<string, { count: number; lastStep: number }>();
 
@@ -551,12 +555,46 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
       forceTextOnlyNextStep = false;
     }
     const activeNativeTools = disablingToolsThisStep ? undefined : nativeTools;
-    const stepHistory = disablingToolsThisStep ? flattenHistoryForNoTools(history) : history;
-    const { compacted, savedTokens: compactionSavedTokens } = compactCloudHistory(stepHistory);
-    const fit = fitToWindow(system, compacted, 0, contextWindow, model, {
+    let stepHistory = disablingToolsThisStep ? flattenHistoryForNoTools(history) : history;
+    let { compacted, savedTokens: compactionSavedTokens } = compactCloudHistory(stepHistory);
+    let fit = fitToWindow(system, compacted, 0, contextWindow, model, {
       preserveFirstUser: true,
       toolSchemasTokens: activeNativeTools ? toolSchemasTokens : 0,
     });
+
+    const usableInputWindow = Math.max(1024, contextWindow - 1000);
+    if (
+      step > 0 &&
+      !disablingToolsThisStep &&
+      midTurnCompactions < 3 &&
+      history.length >= 6 &&
+      usableInputWindow >= 2048 &&
+      (fit.droppedCount > 0 || fit.usage.used >= usableInputWindow * 0.8)
+    ) {
+      emitter.onPhase("thinking", "Compacting context window");
+      const mid = await compactMidTurnLLMHistory({
+        history,
+        contextWindow,
+        model,
+        provider,
+        signal,
+        useProviderSummarizer: true,
+      });
+      if (mid.compacted) {
+        midTurnCompactions++;
+        history.splice(0, history.length, ...mid.history);
+        stepHistory = history;
+        const recomputed = compactCloudHistory(stepHistory);
+        compacted = recomputed.compacted;
+        compactionSavedTokens = recomputed.savedTokens;
+        fit = fitToWindow(system, compacted, 0, contextWindow, model, {
+          preserveFirstUser: true,
+          toolSchemasTokens: activeNativeTools ? toolSchemasTokens : 0,
+        });
+        ctx.log(`[cloud] mid-turn compacted history (${mid.strategy}) to keep context fit.`);
+      }
+    }
+
     const messages = fit.messages;
     const historyTokens = fit.usage.breakdown.find((b) => b.label === "Conversation")?.tokens ?? 0;
     emitter.onUsage(fit.usage);
@@ -706,6 +744,43 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
           !content.trim() && calls.length === 0 ? "Stopped before the model replied." : "Stopped."
         );
         return;
+      }
+      if (
+        isContextOverflowError(streamError, classified.rawMessage) &&
+        !content.trim() &&
+        calls.length === 0 &&
+        overflowCompactions < 2
+      ) {
+        overflowCompactions++;
+        emitter.onAssistantCancel(assistantId);
+        emitter.onPhase("thinking", "Context overflow — compacting and retrying");
+        const mid = await compactMidTurnLLMHistory({
+          history,
+          contextWindow,
+          model,
+          provider,
+          signal,
+          maxRecentMessages: 4,
+          useProviderSummarizer: overflowCompactions === 1,
+        });
+        if (mid.compacted) {
+          history.splice(0, history.length, ...mid.history);
+          ctx.log(`[cloud] recovered from context overflow via mid-turn compaction (${mid.strategy}).`);
+          step--;
+          continue;
+        }
+        let clampedAny = false;
+        for (let hi = 0; hi < history.length - 1; hi++) {
+          if (history[hi].role === "tool" && history[hi].content.length > 1200) {
+            history[hi] = { ...history[hi], content: clamp(history[hi].content, 1200) };
+            clampedAny = true;
+          }
+        }
+        if (clampedAny) {
+          ctx.log("[cloud] recovered from context overflow by aggressively clamping tool outputs.");
+          step--;
+          continue;
+        }
       }
       const canRetry = shouldRetryStep(classified, {
         sideEffectsOccurred: toolsRun > 0,

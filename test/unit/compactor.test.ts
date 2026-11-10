@@ -6,11 +6,16 @@ import {
   extractStructuredCompactionData,
   buildNativeCompactionSummary,
   compactSessionMessages,
+  compactMidTurnLLMHistory,
   isToolResultMessage,
   isUsableProviderSummary,
 } from "../../src/core/agent/compactor";
-import type { ChatMessage, ToolCall } from "../../src/shared/types";
+import { runCloudTurn } from "../../src/core/agent/cloudEngine";
+import { runUnifiedTurn } from "../../src/core/agent/unifiedEngine";
+import { enforceSessionMessageCap } from "../../src/host/sessionCoordinator";
+import type { AdaptivePlan, ChatMessage, SessionState, ToolCall } from "../../src/shared/types";
 import type { LLMChatChunk, LLMChatRequest, LLMProvider } from "../../src/core/llm/types";
+import type { Tool } from "../../src/core/tools/types";
 
 function makeUserMsg(id: string, content: string): ChatMessage {
   return { id, role: "user", content, createdAt: Date.now() };
@@ -63,6 +68,28 @@ describe("Context Compaction Engine (P1 Item 4)", () => {
       ];
       assert.equal(shouldAutoCompact(msgs, 1000, undefined, 0.5), false);
       assert.equal(shouldAutoCompact(msgs, 1000, undefined, 0.3), true);
+    });
+
+    it("accounts for the pending turn and reserved completion before overflow", () => {
+      const text = "word ".repeat(110); // roughly 143 tokens with message framing
+      const msgs = [
+        makeUserMsg("1", "Task anchor"),
+        makeAssistantMsg("2", text),
+        makeUserMsg("3", "Continue"),
+        makeAssistantMsg("4", text),
+      ];
+
+      // Historical messages alone remain under 75% of a 1k window.
+      assert.equal(shouldAutoCompact(msgs, 1000, undefined, 0.75), false);
+      // The same history must compact before adding a 400-token prompt while
+      // reserving 200 tokens for the response (usable input window = 800).
+      assert.equal(
+        shouldAutoCompact(msgs, 1000, undefined, 0.75, {
+          incomingTokens: 400,
+          reserveOutputTokens: 200,
+        }),
+        true
+      );
     });
   });
 
@@ -533,6 +560,60 @@ describe("Context Compaction Engine (P1 Item 4)", () => {
     });
   });
 
+  describe("Provider-summary fact retention", () => {
+    it("appends omitted inspected paths, commands, and failures to a provider summary", async () => {
+      const msgs: ChatMessage[] = [
+        makeUserMsg("u1", "Fix the import issue without changing public APIs"),
+        makeAssistantMsg("a1", "I inspected and tested it.", [
+          {
+            id: "read-1",
+            name: "read_file",
+            args: { path: "src/imports.ts" },
+            status: "done",
+            result: "import { legacy } from './legacy';",
+          },
+          {
+            id: "test-1",
+            name: "execute_command",
+            args: { command: "npm test -- imports" },
+            status: "error",
+            error: "module not found",
+          },
+        ]),
+        makeUserMsg("u2", "Try the supported module path"),
+        makeAssistantMsg("a2", "Still investigating."),
+      ];
+      const terseProvider: LLMProvider = {
+        id: "openai",
+        label: "OpenAI",
+        enabled: true,
+        isConfigured: () => true,
+        ping: async () => true,
+        listModels: async () => [],
+        async *chatStream(): AsyncGenerator<LLMChatChunk> {
+          yield {
+            done: false,
+            message: { role: "assistant", content: "### Summary\n- Continuing the import investigation." },
+          };
+        },
+      };
+
+      const result = await compactSessionMessages({
+        messages: msgs,
+        contextWindow: 4096,
+        model: "openai:gpt-4o-mini",
+        provider: terseProvider,
+        force: true,
+        keepRecentUserTurns: 1,
+      });
+
+      assert.equal(result.strategy, "provider-model");
+      assert.ok(result.summary?.includes("src/imports.ts"));
+      assert.ok(result.summary?.includes("npm test -- imports"));
+      assert.ok(result.summary?.includes("module not found"));
+    });
+  });
+
   describe("Phase 4.1: Compactor Fidelity, Fact Separation & Boundary Invariants", () => {
     it("accurately records source and destination for moves and prefers result metadata over model args", () => {
       const msgs: ChatMessage[] = [
@@ -669,6 +750,332 @@ describe("Context Compaction Engine (P1 Item 4)", () => {
       assert.ok(!summary.includes("sk-proj-123456789012345678"));
       assert.ok(!summary.includes("superSecretPass12345"));
       assert.ok(summary.includes("[REDACTED_KEY]") || summary.includes("[REDACTED]"));
+    });
+  });
+
+  describe("Enterprise Compaction Parity (Archive Rollover, Active Fallback & Mid-Turn Recovery)", () => {
+    it("preserves leading enforceSessionMessageCap archive digests across subsequent compactions", async () => {
+      const messages: ChatMessage[] = [
+        makeUserMsg("u0", "Original root objective: migrate auth tokens to RS256"),
+        makeAssistantMsg("a0", "Migrated core signing helper.", [
+          { id: "tc0", name: "edit_file", args: { path: "src/auth/jwtSigner.ts" }, status: "done" },
+        ]),
+        makeUserMsg("u1", "Add key rotation support"),
+        makeAssistantMsg("a1", "Added rotation config."),
+        makeUserMsg("u2", "Now audit middleware"),
+        makeAssistantMsg("a2", "Audited middleware."),
+        makeUserMsg("u3", "Latest prompt"),
+        makeAssistantMsg("a3", "Latest reply."),
+      ];
+
+      const session: SessionState = {
+        id: "s-archive",
+        title: "Archive test",
+        mode: "agent",
+        messages,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+
+      // Force persistence cap so index 0 becomes an assistant-role archive digest
+      const archived = enforceSessionMessageCap(session, 5);
+      assert.equal(archived, true);
+      assert.equal(session.messages[0].isCompacted, true);
+      assert.ok(session.messages[0].content.includes("src/auth/jwtSigner.ts"));
+
+      // Subsequent compaction MUST NOT drop session.messages[0]!
+      const comp2 = await compactSessionMessages({
+        messages: session.messages,
+        contextWindow: 4096,
+        force: true,
+        keepRecentUserTurns: 1,
+      });
+      assert.equal(comp2.compacted, true);
+      const joined = comp2.newMessages.map((m) => m.content).join("\n");
+      assert.ok(joined.includes("src/auth/jwtSigner.ts"), "Leading archive digest facts must survive next compaction");
+    });
+
+    it("falls back to active model when lightweight sibling model errors and preserves >8k transcripts", async () => {
+      const requestedModels: string[] = [];
+      let receivedPrompt = "";
+
+      const fallbackProvider: LLMProvider = {
+        id: "claude",
+        label: "Claude",
+        enabled: true,
+        isConfigured: () => true,
+        ping: async () => true,
+        listModels: async () => [],
+        async *chatStream(req: LLMChatRequest): AsyncGenerator<LLMChatChunk> {
+          requestedModels.push(req.model);
+          if (req.model.includes("haiku")) {
+            throw new Error("404 model_not_found");
+          }
+          receivedPrompt = req.messages.map((m) => m.content).join("\n");
+          yield {
+            done: true,
+            message: {
+              role: "assistant",
+              content: "### 🎯 Summary\n- Successfully synthesized full transcript using active model fallback.",
+            },
+          };
+        },
+      };
+
+      const msgs: ChatMessage[] = [
+        makeUserMsg("u1", "Build analytics pipeline"),
+        makeAssistantMsg("a1", "Step 1: " + "A".repeat(1800)),
+        makeUserMsg("u2", "MIDDLE_MARKER_TOKEN_98765"),
+        makeAssistantMsg("a2", "Step 2: " + "B".repeat(1800)),
+        makeUserMsg("u3", "Keep logging enabled"),
+        makeAssistantMsg("a3", "Step 3: " + "C".repeat(1800)),
+        makeUserMsg("u4", "Final step"),
+        makeAssistantMsg("a4", "Working on final step."),
+      ];
+
+      const res = await compactSessionMessages({
+        messages: msgs,
+        contextWindow: 128_000,
+        model: "claude:claude-sonnet-4-5",
+        provider: fallbackProvider,
+        force: true,
+        keepRecentUserTurns: 1,
+      });
+
+      assert.equal(res.compacted, true);
+      assert.equal(res.strategy, "provider-model");
+      assert.deepEqual(requestedModels, ["claude:claude-haiku-4-5", "claude:claude-sonnet-4-5"]);
+      assert.ok(receivedPrompt.includes("MIDDLE_MARKER_TOKEN_98765"), "Dynamic transcript limit should retain >8k chars on 128k models");
+    });
+
+    it("avoids redundant auto-recompaction loops when history is already compacted", async () => {
+      const msgs: ChatMessage[] = [
+        makeUserMsg("u1", "Big initial task " + "word ".repeat(300)),
+        {
+          id: "c1",
+          role: "assistant",
+          content: "⚡ **[Context Compaction Summary]**\n\n### Summary\n- Earlier context",
+          createdAt: Date.now(),
+          isCompacted: true,
+        },
+        makeUserMsg("u2", "Latest large turn " + "word ".repeat(300)),
+        makeAssistantMsg("a2", "Done " + "word ".repeat(300)),
+      ];
+
+      const res = await compactSessionMessages({
+        messages: msgs,
+        contextWindow: 1000,
+        force: false,
+      });
+      assert.equal(res.compacted, false);
+      assert.equal(res.reason, "already_compacted");
+    });
+
+    it("compacts mid-turn and recovers automatically from context overflow errors in Cloud Engine", async () => {
+      let attempt = 0;
+      const phases: string[] = [];
+      let errorMsg = "";
+      let finalOut = "";
+
+      const provider: LLMProvider = {
+        id: "openai",
+        name: "OpenAI",
+        chat: async () => ({ content: "" }),
+        async *chatStream(req: LLMChatRequest): AsyncGenerator<LLMChatChunk> {
+          // Compaction engine prompt check
+          if (req.messages[0]?.content.includes("context compaction engine")) {
+            yield {
+              done: true,
+              message: {
+                role: "assistant",
+                content: "### 🎯 Compaction Digest\n- Inspected `src/file1.ts` and `src/file2.ts`.",
+              },
+            };
+            return;
+          }
+          attempt++;
+          if (attempt <= 3) {
+            yield {
+              done: true,
+              done_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: "",
+                tool_calls: [
+                  { id: `c-${attempt}`, function: { name: "read_file", arguments: { path: `src/file${attempt}.ts` } } },
+                ],
+              },
+            };
+            return;
+          }
+          if (attempt === 4) {
+            // Simulate API rejecting due to unexpected context length overflow
+            throw Object.assign(new Error("400 Bad Request: maximum context length exceeded (context_length_exceeded)"), {
+              status: 400,
+            });
+          }
+          yield {
+            done: true,
+            done_reason: "stop",
+            message: { role: "assistant", content: "Completed task cleanly after mid-turn compaction." },
+          };
+        },
+      };
+
+      const readTool: Tool = {
+        spec: {
+          name: "read_file",
+          summary: "Read file",
+          params: [{ name: "path", type: "string", required: true, description: "p" }],
+          sideEffecting: false,
+          priority: 1,
+        },
+        execute: async (args) => ({ ok: true, output: `contents of ${args.path}: ` + "x".repeat(400) }),
+      };
+
+      await runCloudTurn({
+        provider,
+        model: "openai:gpt-4o",
+        system: "sys",
+        history: [{ role: "user", content: "Inspect multiple files and summarize." }],
+        tools: [readTool],
+        contextWindow: 128_000,
+        ctx: {
+          mode: "chat",
+          workspaceRoot: "B:/repo",
+          signal: new AbortController().signal,
+          log: () => {},
+          webSearchProvider: "duckduckgo",
+          findFiles: async () => [],
+          capability: "high",
+          getDiagnostics: async () => [],
+          todos: [],
+          requestApproval: async () => true,
+        },
+        emitter: {
+          onAssistantStart: () => {},
+          onDelta: (_, d) => { finalOut += d; },
+          onContent: (_, c) => { finalOut += c; },
+          onAssistantCancel: () => {},
+          onPhase: (_, detail) => { if (detail) phases.push(detail); },
+          onToolCall: () => {},
+          onToolUpdate: () => {},
+          onUsage: () => {},
+          onGenerationStats: () => {},
+          onDone: () => {},
+          onError: (e) => { errorMsg = e; },
+        },
+        signal: new AbortController().signal,
+        mode: "chat",
+      });
+
+      assert.equal(errorMsg, "", "Cloud Engine must recover from context overflow instead of failing");
+      assert.equal(attempt, 5);
+      assert.ok(phases.some((p) => /compact/i.test(p)));
+      assert.ok(finalOut.includes("Completed task cleanly after mid-turn compaction"));
+    });
+
+    it("recovers automatically from context overflow errors in Local Unified Engine", async () => {
+      let attempt = 0;
+      let errorMsg = "";
+      let finalOut = "";
+
+      const plan: AdaptivePlan = {
+        model: "qwen2.5-coder:7b",
+        mode: "chat",
+        contextWindow: 8192,
+        numCtx: 8192,
+        temperature: 0.2,
+        topP: 0.9,
+        maxOutputTokens: 1024,
+        toolProtocol: "native",
+        maxTools: 4,
+        allowParallelTools: false,
+        intelligence: "medium",
+        intelligenceAuto: false,
+        rationale: [],
+      };
+
+      const session = {
+        messages: [
+          makeUserMsg("u1", "Analyze module"),
+          makeAssistantMsg("a1", "Checked part 1"),
+          makeUserMsg("u2", "Check part 2"),
+          makeAssistantMsg("a2", "Checked part 2"),
+          makeUserMsg("u3", "Give final overview"),
+        ],
+      };
+
+      const provider: LLMProvider = {
+        id: "ollama",
+        label: "Ollama",
+        enabled: true,
+        isConfigured: () => true,
+        ping: async () => true,
+        listModels: async () => [],
+        async *chatStream(req: LLMChatRequest): AsyncGenerator<LLMChatChunk> {
+          if (req.messages[0]?.content.includes("context compaction engine")) {
+            yield {
+              done: true,
+              message: {
+                role: "assistant",
+                content: "### 🎯 Summary\n- Reviewed parts 1 and 2 successfully.",
+              },
+            };
+            return;
+          }
+          attempt++;
+          if (attempt === 1) {
+            throw new Error("prompt is too long for context window");
+          }
+          yield {
+            done: true,
+            done_reason: "stop",
+            message: { role: "assistant", content: "Overview complete after overflow recovery." },
+          };
+        },
+      };
+
+      await runUnifiedTurn(
+        session,
+        plan,
+        {
+          onAssistantStart: () => {},
+          onDelta: (_, d) => { finalOut += d; },
+          onContent: (_, c) => { finalOut += c; },
+          onAssistantCancel: () => {},
+          onPhase: () => {},
+          onToolCall: () => {},
+          onToolUpdate: () => {},
+          onUsage: () => {},
+          onGenerationStats: () => {},
+          onDone: () => {},
+          onError: (e) => { errorMsg = e; },
+        },
+        new AbortController().signal,
+        {
+          provider,
+          tools: [],
+          buildToolContext: (sig) => ({
+            mode: "chat",
+            workspaceRoot: "B:/repo",
+            signal: sig,
+            log: () => {},
+            webSearchProvider: "duckduckgo",
+            findFiles: async () => [],
+            capability: "medium",
+            getDiagnostics: async () => [],
+            todos: [],
+            requestApproval: async () => true,
+          }),
+          reserveOutputTokens: 1024,
+        }
+      );
+
+      assert.equal(errorMsg, "");
+      assert.equal(attempt, 2);
+      assert.ok(session.messages.some((m) => m.isCompacted), "Session should hold compacted digest after overflow recovery");
+      assert.ok(finalOut.includes("Overview complete after overflow recovery."));
     });
   });
 });

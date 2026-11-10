@@ -66,7 +66,8 @@ export function checkContextWindowOverflow(
   const usableRamGb = Math.max(0.5, Math.min(freeRamGb - totalRamGb * 0.1, totalRamGb - ramBufferGb));
   const vramGb = (machine.gpu?.vramBytes ?? 0) / 1024 ** 3;
   const usableVramGb = vramGb > 0 ? Math.max(0, vramGb - 0.5) : 0;
-  const safePoolGb = usableVramGb + usableRamGb;
+  const isUnified = Boolean(machine.gpu?.isUnifiedMemory);
+  const safePoolGb = isUnified ? usableRamGb : usableVramGb + usableRamGb;
 
   const remainingForKvGb = Math.max(0, safePoolGb - weightGb);
   const rawSafeTokens = Math.floor((remainingForKvGb / kvGbPer1k) * 1024);
@@ -83,8 +84,9 @@ export function checkContextWindowOverflow(
     );
   }
   if (totalNeededGb > safePoolGb) {
-    const hwDesc =
-      vramGb > 0
+    const hwDesc = isUnified
+      ? `${totalRamGb.toFixed(0)} GB unified memory (${freeRamGb.toFixed(1)} GB free, keeping ~22% RAM buffer for your OS & VS Code)`
+      : vramGb > 0
         ? `${vramGb.toFixed(1)} GB GPU VRAM + ${freeRamGb.toFixed(1)} GB free RAM (keeping ~22% RAM buffer for your OS & VS Code)`
         : `${freeRamGb.toFixed(1)} GB free RAM (keeping ~22% RAM buffer for your OS & VS Code)`;
     reasons.push(

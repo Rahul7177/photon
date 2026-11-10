@@ -1,11 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { ChatMessage, Role } from "../../shared/types";
 import type { LLMMessage, LLMProvider } from "../llm/types";
-import {
-  estimateTokens,
-  estimateMessagesTokens,
-} from "../adaptive/tokens";
-import { redactSecretsFromError } from "./errorRecovery";
+import { estimateMessagesTokens } from "../adaptive/tokens";
+import { redactSecretsFromError, sanitizeToolPairing } from "./errorRecovery";
 
 export interface CompactionCandidateSet {
   anchor: ChatMessage | null;
@@ -54,6 +51,22 @@ export interface CompactionOptions {
   threshold?: number;
   recentTurnsToKeep?: number;
   keepRecentUserTurns?: number;
+  signal?: AbortSignal;
+}
+
+/**
+ * Tokens which are about to be added to the request but are not represented by
+ * the persisted chat messages yet.  Keeping these separate lets callers make a
+ * compaction decision before appending the new user turn (and before a request
+ * can overflow a small model's usable input window).
+ */
+export interface CompactionPressureOptions {
+  /** The pending user turn, attachments, or other soon-to-be-added input. */
+  incomingTokens?: number;
+  /** System prompt, tool schemas, and provider chat-template framing. */
+  fixedOverheadTokens?: number;
+  /** Completion budget which is unavailable to the input context. */
+  reserveOutputTokens?: number;
 }
 
 export type StructuredCompactionData = ReturnType<typeof extractStructuredCompactionData>;
@@ -88,13 +101,21 @@ export function shouldAutoCompact(
   messages: ChatMessage[],
   contextWindow: number,
   model?: string,
-  threshold = DEFAULT_AUTO_COMPACT_THRESHOLD
+  threshold = DEFAULT_AUTO_COMPACT_THRESHOLD,
+  pressure: CompactionPressureOptions = {}
 ): boolean {
   if (!messages || messages.length < MIN_MESSAGES_FOR_COMPACTION) return false;
   if (!contextWindow || contextWindow <= 0) return false;
 
-  const currentTokens = estimateMessagesTokens(messages, model);
-  const ratio = currentTokens / contextWindow;
+  const incomingTokens = Math.max(0, pressure.incomingTokens ?? 0);
+  const fixedOverheadTokens = Math.max(0, pressure.fixedOverheadTokens ?? 0);
+  const reserveOutputTokens = Math.min(
+    Math.max(0, pressure.reserveOutputTokens ?? 0),
+    Math.max(0, contextWindow - 1)
+  );
+  const usableInputWindow = Math.max(1, contextWindow - reserveOutputTokens);
+  const currentTokens = estimateMessagesTokens(messages, model) + incomingTokens + fixedOverheadTokens;
+  const ratio = currentTokens / usableInputWindow;
   return ratio >= threshold;
 }
 
@@ -116,6 +137,9 @@ export function extractCompactionCandidates(
   const firstUserIdx = messages.findIndex((m) => m.role === "user" && !isToolResultMessage(m));
   const anchor = firstUserIdx >= 0 ? messages[firstUserIdx] : null;
   const minCompactIdx = firstUserIdx >= 0 ? firstUserIdx + 1 : 0;
+  // Preserve any leading messages before the first genuine user prompt (e.g. a
+  // session-persistence-archive digest placed at index 0 by enforceSessionMessageCap).
+  const preAnchor = firstUserIdx > 0 ? messages.slice(0, firstUserIdx) : [];
 
   // Decide how many recent genuine user turns to preserve:
   const effectiveRecentTurns = recentTurnsToKeep ?? (messages.length <= 8 ? 1 : 2);
@@ -159,7 +183,7 @@ export function extractCompactionCandidates(
     }
   }
 
-  const toCompact = messages.slice(minCompactIdx, recentStartIdx);
+  const toCompact = [...preAnchor, ...messages.slice(minCompactIdx, recentStartIdx)];
   const recent = messages.slice(recentStartIdx);
 
   const canCompact = toCompact.length >= 1;
@@ -323,11 +347,18 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
         name === "search_code" ||
         name === "find_files" ||
         name === "list_dir" ||
-        name === "code_outline"
+        name === "list_files" ||
+        name === "code_outline" ||
+        name === "list_code_definition_names" ||
+        name === "get_diagnostics" ||
+        name === "query_project_context" ||
+        name === "web_search" ||
+        name === "web_fetch"
       ) {
         if (filePath) filesInspected.add(filePath);
         if (args.pattern) filesInspected.add(`pattern: "${args.pattern}"`);
         if (args.query) filesInspected.add(`query: "${args.query}"`);
+        if (args.url) filesInspected.add(`url: ${args.url}`);
       } else if (
         name === "execute_command" ||
         name === "run_command" ||
@@ -400,11 +431,11 @@ export function extractStructuredCompactionData(messages: ChatMessage[]) {
       for (const line of lines) {
         const trimmed = line.trim();
         if (
-          /^(?:[-*]|\d+\.)\s+(?:Fixed|Implemented|Configured|Added|Updated|Verified|Resolved|Adopted|Selected|Refactored|Created|Decided|Assumed)/i.test(
+          /^(?:[-*]|\d+\.)\s+(?:Fixed|Implemented|Configured|Added|Updated|Verified|Resolved|Adopted|Selected|Refactored|Created|Decided|Assumed|Found|Identified|Root cause)/i.test(
             trimmed
           ) ||
-          /^(?:Decision|Architecture|Key finding|Root cause|Assumption|Constraint):/i.test(trimmed) ||
-          /\b(?:decided to|assumed|chosen because|for backward compatibility)\b/i.test(trimmed)
+          /^(?:Decision|Architecture|Key finding|Conclusion|Summary|Root cause|Assumption|Constraint):/i.test(trimmed) ||
+          /\b(?:decided to|assumed|chosen because|for backward compatibility|root cause)\b/i.test(trimmed)
         ) {
           const clean = redactSecretsFromError(trimmed.replace(/^(?:[-*]|\d+\.)\s+/, ""));
           if (clean.length > 10 && !modelDecisions.includes(clean)) {
@@ -637,6 +668,41 @@ export function isUsableProviderSummary(text: string | null | undefined): boolea
 }
 
 /**
+ * A provider summary is useful for narrative compression, but it is not a
+ * source of truth.  Add any omitted structured facts after it so a model that
+ * summarized only the beginning/end of a long transcript cannot erase an
+ * executed command, an inspected path, or an unresolved failure.
+ */
+function retainMissingStructuredFacts(
+  summary: string,
+  data: StructuredCompactionData
+): string {
+  const missing: string[] = [];
+  const add = (line: string, needle: string) => {
+    if (!summary.toLowerCase().includes(needle.toLowerCase())) missing.push(line);
+  };
+
+  for (const [path, notes] of data.filesModified) {
+    add(`- Modified \`${path}\`: ${notes.join("; ")}`, path);
+  }
+  for (const path of data.filesInspected) {
+    add(`- Inspected \`${path}\``, path);
+  }
+  for (const finding of data.negativeFindings) {
+    add(`- ${finding}`, finding);
+  }
+  for (const command of data.commandsRun) {
+    add(`- Command \`${command.command}\` ended ${command.status}`, command.command);
+  }
+  for (const item of data.unresolvedItems) {
+    add(`- Unresolved: ${item}`, item);
+  }
+
+  if (missing.length === 0) return summary;
+  return `${summary}\n\n### ✅ Retained Structured Facts\n${missing.join("\n")}`;
+}
+
+/**
  * Model-Assisted Compaction:
  * Attempts to summarize conversation turns using the provider's fastest/lightest model.
  * Includes timeout, output validation, and deterministic fact-preservation fallback.
@@ -647,18 +713,21 @@ export async function summarizeWithProviderModel(
   messages: ChatMessage[],
   focus?: string,
   anchorPrompt?: string,
-  timeoutMs = 9000
+  timeoutMs = 30_000,
+  extraOpts: { contextWindow?: number; signal?: AbortSignal } = {}
 ): Promise<string | null> {
   try {
-    const summarizerModel = chooseSummarizerModel(provider.id, model);
+    if (extraOpts.signal?.aborted) return null;
+    const candidates = chooseSummarizerCandidates(provider.id, model);
+    const data = extractStructuredCompactionData(messages);
 
     const systemPrompt =
       "You are Photon's context compaction engine. " +
       "Summarize the conversation history concisely while preserving: " +
       "(1) Original task & user constraints, " +
-      "(2) Verified repository facts (exact file paths read/modified, commands run, tool results), " +
-      "(3) Model decisions & assumptions (explicitly distinguished from verified repository facts), and " +
-      "(4) Unresolved questions or errors. " +
+      "(2) Verified repository facts (exact file paths read/modified, commands run, tool outcomes, symbol names), " +
+      "(3) Model decisions & working assumptions (explicitly distinguished from verified repository facts), and " +
+      "(4) Unresolved questions, failing checks, or next steps. " +
       "Be dense, factual, and strictly technical. Use markdown sections and bullet points.";
 
     let transcript = "";
@@ -668,7 +737,7 @@ export async function summarizeWithProviderModel(
 
     for (const m of messages) {
       const role = m.role.toUpperCase();
-      let text = m.content.slice(0, 1200);
+      let text = m.content.slice(0, 2000);
       if (m.toolCalls?.length) {
         text += `\n[Tool calls: ${m.toolCalls
           .map((t) => {
@@ -694,12 +763,18 @@ export async function summarizeWithProviderModel(
       transcript += `${role}: ${text}\n`;
     }
 
-    // Preserve head and tail if transcript is very long
-    if (transcript.length > 8000) {
+    const cw = extraOpts.contextWindow;
+    const maxTranscriptChars =
+      cw && cw > 0 ? Math.max(8_000, Math.min(48_000, Math.floor(cw * 1.5))) : 36_000;
+
+    // Preserve head and tail proportionally within dynamic budget
+    if (transcript.length > maxTranscriptChars) {
+      const headLen = Math.floor(maxTranscriptChars * 0.55);
+      const tailLen = maxTranscriptChars - headLen;
       transcript =
-        transcript.slice(0, 4000) +
-        "\n... [middle turns condensed] ...\n" +
-        transcript.slice(-4000);
+        transcript.slice(0, headLen) +
+        "\n... [middle turns condensed; key files & commands retained below] ...\n" +
+        transcript.slice(-tailLen);
     }
 
     const llmMessages: LLMMessage[] = [
@@ -710,30 +785,46 @@ export async function summarizeWithProviderModel(
       },
     ];
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let usableResult: string | null = null;
+    for (const candidateModel of candidates) {
+      if (extraOpts.signal?.aborted) return null;
+      const controller = new AbortController();
+      const onParentAbort = () => controller.abort();
+      extraOpts.signal?.addEventListener("abort", onParentAbort, { once: true });
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
-    let result = "";
-    try {
-      for await (const chunk of provider.chatStream(
-        { model: summarizerModel, messages: llmMessages, options: { num_predict: 900 } },
-        controller.signal
-      )) {
-        if (chunk.message?.content) result += chunk.message.content;
+      let result = "";
+      try {
+        for await (const chunk of provider.chatStream(
+          {
+            model: candidateModel,
+            messages: llmMessages,
+            options: { temperature: 0.1, num_predict: 2000 },
+          },
+          controller.signal
+        )) {
+          if (chunk.message?.content) result += chunk.message.content;
+        }
+        if (isUsableProviderSummary(result)) {
+          usableResult = result.trim();
+          break;
+        }
+      } catch {
+        // Fall through to next candidate (e.g. user's active model) or native heuristic
+      } finally {
+        clearTimeout(timeout);
+        extraOpts.signal?.removeEventListener("abort", onParentAbort);
       }
-    } finally {
-      clearTimeout(timeout);
     }
 
-    if (!isUsableProviderSummary(result)) {
+    if (!usableResult) {
       return null;
     }
 
-    let finalSummary = result.trim();
+    let finalSummary = usableResult;
 
-    // Ensure critical repository facts (modified file paths & anchor goal) are never lost
-    // even if the provider model forgot to mention a file path.
-    const data = extractStructuredCompactionData(messages);
+    // Ensure deterministic facts survive even when the provider summarizer has
+    // condensed a long transcript to its head and tail.
     const missingModFiles = [...data.filesModified.keys()].filter(
       (f) => !finalSummary.includes(f)
     );
@@ -762,7 +853,7 @@ export async function summarizeWithProviderModel(
       }
     }
 
-    return redactSecretsFromError(finalSummary);
+    return redactSecretsFromError(retainMissingStructuredFacts(finalSummary, data));
   } catch {
     // Graceful fallback to native compactor on timeout, network error, or crash
     return null;
@@ -770,28 +861,34 @@ export async function summarizeWithProviderModel(
 }
 
 /**
- * Chooses the fastest model suited for compaction from the provider.
+ * Chooses ordered summarizer model candidates: lightweight sibling first when
+ * helpful (unless already fast/local), followed by the active model itself.
  */
-function chooseSummarizerModel(providerId: string, activeModel: string): string {
+function chooseSummarizerCandidates(providerId: string, activeModel: string): string[] {
   const p = providerId.toLowerCase();
   const m = activeModel.toLowerCase();
+  const alreadyFastOrSmall =
+    /\b(?:flash|mini|haiku|lite|light|nano|versatile)\b/i.test(m) ||
+    /:(?:[1-9]|1[0-4])b\b/i.test(m);
 
-  if (p === "gemini" || m.startsWith("gemini:")) {
-    return "gemini:gemini-3.1-flash-lite-preview";
+  let fastCandidate: string | undefined;
+  if (!alreadyFastOrSmall) {
+    if (p === "gemini" || m.startsWith("gemini:")) {
+      fastCandidate = "gemini:gemini-2.5-flash";
+    } else if (p === "claude" || m.startsWith("claude:")) {
+      fastCandidate = "claude:claude-haiku-4-5";
+    } else if (p === "openai" || m.startsWith("openai:")) {
+      fastCandidate = "openai:gpt-4o-mini";
+    } else if (p === "openrouter" || m.startsWith("openrouter:")) {
+      fastCandidate = "openrouter:google/gemini-2.5-flash";
+    } else if (p === "groq" || m.startsWith("groq:")) {
+      fastCandidate = "groq:llama-3.3-70b-versatile";
+    }
   }
-  if (p === "claude" || m.startsWith("claude:")) {
-    return "claude:claude-3-5-haiku-20241022";
-  }
-  if (p === "openai" || m.startsWith("openai:")) {
-    return "openai:gpt-4o-mini";
-  }
-  if (p === "openrouter" || m.startsWith("openrouter:")) {
-    return "openrouter:google/gemini-2.5-flash";
-  }
-  if (p === "groq" || m.startsWith("groq:")) {
-    return "groq:llama-3.3-70b-versatile";
-  }
-  return activeModel;
+
+  return fastCandidate && fastCandidate !== activeModel
+    ? [fastCandidate, activeModel]
+    : [activeModel];
 }
 
 /**
@@ -810,6 +907,7 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
     threshold = DEFAULT_AUTO_COMPACT_THRESHOLD,
     recentTurnsToKeep,
     keepRecentUserTurns,
+    signal,
   } = options;
 
   const effectiveRecentTurns = recentTurnsToKeep ?? keepRecentUserTurns;
@@ -847,6 +945,21 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
     };
   }
 
+  if (!force && candidates.toCompact.every((m) => Boolean(m.isCompacted))) {
+    return {
+      compacted: false,
+      reason: "already_compacted",
+      messagesBefore: messages.length,
+      messagesAfter: messages.length,
+      tokensBefore,
+      tokensAfter: tokensBefore,
+      tokensSaved: 0,
+      pctSaved: 0,
+      strategy: "native-heuristic",
+      newMessages: messages,
+    };
+  }
+
   const { anchor, toCompact, recent } = candidates;
   const anchorText = anchor ? anchor.content : undefined;
   const structuredData = extractStructuredCompactionData(toCompact);
@@ -855,8 +968,19 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
   let strategy: "provider-model" | "native-heuristic" = "native-heuristic";
 
   // Try model-assisted provider compaction if available
-  if (provider && provider.isConfigured() && model) {
-    summary = await summarizeWithProviderModel(provider, model, toCompact, focus, anchorText);
+  const providerReady = Boolean(
+    provider && (typeof provider.isConfigured !== "function" || provider.isConfigured())
+  );
+  if (providerReady && provider && model && !signal?.aborted) {
+    summary = await summarizeWithProviderModel(
+      provider,
+      model,
+      toCompact,
+      focus,
+      anchorText,
+      30_000,
+      { contextWindow, signal }
+    );
     if (summary) strategy = "provider-model";
   }
 
@@ -877,18 +1001,14 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
       ? "assistant"
       : "user";
 
-  const tokensSavedEstimate = Math.max(
-    0,
-    estimateMessagesTokens(toCompact, model) - estimateTokens(summary)
-  );
-  const pctSaved =
-    contextWindow > 0 ? Math.min(100, Math.round((tokensSavedEstimate / contextWindow) * 100)) : 0;
-
   const retained: CompactionRetainedItems = {
     anchorPreserved: keepAnchor,
     taskPreserved: keepAnchor,
     userDirectivesCount: structuredData.userDirectives.length,
-    constraintsCount: structuredData.userDirectives.length,
+    constraintsCount: Math.max(
+      structuredData.userConstraints.length,
+      structuredData.userDirectives.length
+    ),
     modifiedFiles: [...structuredData.filesModified.keys()],
     modifiedFilesCount: structuredData.filesModified.size,
     inspectedFiles: [...structuredData.filesInspected],
@@ -911,24 +1031,12 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
   }
   retainedDescParts.push(`${recent.length} recent msg(s)`);
 
-  const compactionNotice =
-    `⚡ Context compacted (${triggerDesc}): ${toCompact.length} msgs compressed · ` +
-    `Freed ~${formatCompactTokens(tokensSavedEstimate)} tokens (${pctSaved}%) · ` +
-    `Retained ${retainedDescParts.join(", ")}`;
-
   const compactionMessage: ChatMessage = {
     id: randomUUID(),
     role: nextRole,
     content: `⚡ **[Context Compaction Summary]**\n\n${summary}`,
     createdAt: Date.now(),
-    notice: compactionNotice,
     isCompacted: true,
-    compactStats: {
-      messagesCount: toCompact.length,
-      tokensSaved: tokensSavedEstimate,
-      pctSaved,
-      strategy,
-    },
   };
 
   // Assemble new message history:
@@ -945,6 +1053,19 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
   const realPctSaved =
     contextWindow > 0 ? Math.min(100, Math.round((realTokensSaved / contextWindow) * 100)) : 0;
 
+  const compactionNotice =
+    `⚡ Context compacted (${triggerDesc}): ${toCompact.length} msgs compressed · ` +
+    `Freed ~${formatCompactTokens(realTokensSaved)} tokens (${realPctSaved}%) · ` +
+    `Retained ${retainedDescParts.join(", ")}`;
+
+  compactionMessage.notice = compactionNotice;
+  compactionMessage.compactStats = {
+    messagesCount: toCompact.length,
+    tokensSaved: realTokensSaved,
+    pctSaved: realPctSaved,
+    strategy,
+  };
+
   return {
     compacted: true,
     reason: force ? "manual" : "threshold_met",
@@ -959,6 +1080,149 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
     compactionNotice,
     retained,
     newMessages,
+  };
+}
+
+/** Convert wire LLMMessage[] slice into ChatMessage[] so mid-turn compaction reuses the same fact extractors & summarizer. */
+function llmMessagesToChatMessages(msgs: LLMMessage[]): ChatMessage[] {
+  const toolOutcomes = new Map<string, { output: string; ok: boolean }>();
+  for (const m of msgs) {
+    if (m.role === "tool" && m.tool_call_id) {
+      const ok = !/^\s*(?:\[TOOL_ERROR|error:|side-effecting tool)/i.test(m.content || "");
+      toolOutcomes.set(m.tool_call_id, { output: m.content, ok });
+    }
+  }
+  const out: ChatMessage[] = [];
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
+    if (m.role === "tool") continue;
+    const toolCalls =
+      m.role === "assistant" && m.tool_calls?.length
+        ? m.tool_calls.map((tc, j) => {
+            const id = tc.id ?? `mid_${i}_${j}`;
+            const outcome = toolOutcomes.get(id);
+            return {
+              id,
+              name: tc.function.name,
+              args: tc.function.arguments ?? {},
+              status: (outcome ? (outcome.ok ? "done" : "error") : "done") as "done" | "error",
+              result: outcome?.ok ? outcome.output : undefined,
+              error: outcome && !outcome.ok ? outcome.output : undefined,
+            };
+          })
+        : undefined;
+    out.push({
+      id: `mid_${i}`,
+      role: (m.role === "system" ? "assistant" : m.role) as Role,
+      content: m.content ?? "",
+      createdAt: i,
+      ...(toolCalls ? { toolCalls } : {}),
+    });
+  }
+  return out;
+}
+
+export interface MidTurnCompactionOptions {
+  history: LLMMessage[];
+  contextWindow: number;
+  model?: string;
+  provider?: LLMProvider;
+  signal?: AbortSignal;
+  maxRecentMessages?: number;
+  useProviderSummarizer?: boolean;
+}
+
+export interface MidTurnCompactionResult {
+  compacted: boolean;
+  history: LLMMessage[];
+  strategy: "provider-model" | "native-heuristic";
+  summary?: string;
+}
+
+/**
+ * In-loop compaction for long multi-step turns (`runCloudTurn`):
+ * Compresses older tool rounds inside the active turn into a structured digest
+ * while keeping the initial prompt, latest turn/tool calls intact, and valid roles.
+ */
+export async function compactMidTurnLLMHistory(
+  opts: MidTurnCompactionOptions
+): Promise<MidTurnCompactionResult> {
+  const { history, contextWindow, model, provider, signal, maxRecentMessages = 6, useProviderSummarizer = true } = opts;
+  if (history.length < 6) {
+    return { compacted: false, history, strategy: "native-heuristic" };
+  }
+
+  const anchor = history[0]?.role === "user" ? history[0] : null;
+  const startIdx = anchor ? 1 : 0;
+  let splitIdx = Math.max(startIdx, history.length - Math.max(2, maxRecentMessages));
+
+  // Walk backward so we never slice inside an assistant tool_calls -> tool result group
+  while (splitIdx > startIdx) {
+    const cur = history[splitIdx];
+    const prev = history[splitIdx - 1];
+    if (cur?.role === "tool") {
+      splitIdx--;
+    } else if (prev?.role === "assistant" && (prev.tool_calls?.length ?? 0) > 0 && cur?.role !== "user") {
+      splitIdx--;
+    } else {
+      break;
+    }
+  }
+
+  const middle = history.slice(startIdx, splitIdx);
+  const recent = history.slice(splitIdx);
+  if (middle.length < 2) {
+    return { compacted: false, history, strategy: "native-heuristic" };
+  }
+
+  const middleChat = llmMessagesToChatMessages(middle);
+  let summary: string | null = null;
+  let strategy: "provider-model" | "native-heuristic" = "native-heuristic";
+
+  const providerReady = Boolean(
+    provider && (typeof provider.isConfigured !== "function" || provider.isConfigured())
+  );
+  if (useProviderSummarizer && providerReady && provider && model && !signal?.aborted) {
+    summary = await summarizeWithProviderModel(
+      provider,
+      model,
+      middleChat,
+      "Mid-turn compaction: preserve all file edits, read findings, failed checks, and unresolved steps so work continues seamlessly.",
+      anchor?.content,
+      25_000,
+      { contextWindow, signal }
+    );
+    if (summary) strategy = "provider-model";
+  }
+
+  if (!summary) {
+    summary = buildNativeCompactionSummary(middleChat, undefined, anchor?.content);
+    strategy = "native-heuristic";
+  }
+
+  const digestMsg: LLMMessage = {
+    role: "assistant",
+    content: `⚡ **[Context Compaction Summary]** (Mid-turn digest)\n\n${summary}`,
+  };
+
+  const rebuilt: LLMMessage[] = [];
+  if (anchor) rebuilt.push(anchor);
+  rebuilt.push(digestMsg);
+
+  // Preserve strict alternating user -> assistant ordering if recent starts on assistant
+  if (recent[0]?.role === "assistant") {
+    rebuilt.push({
+      role: "user",
+      content: "Continue completing the task from the compacted context summary and the latest active step below.",
+    });
+  }
+  rebuilt.push(...recent);
+
+  return {
+    compacted: true,
+    history: sanitizeToolPairing(rebuilt),
+    strategy,
+    summary,
   };
 }
 

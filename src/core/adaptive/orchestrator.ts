@@ -1,5 +1,6 @@
 import type { AdaptivePlan, BenchResult, IntelligenceLevel, IntelligenceSetting, MachineProfile, Mode, ModelInfo, ModelTier, TaskAnalysis } from "../../shared/types";
 import { analyzeTask, buildExecutionPolicy, buildVerificationPlan, capabilityForModel, isFreshInfoRequest, shouldUseNativeToolProtocol } from "../intelligence/policy";
+import { bytesPerParamForQuant, normalizeQuantization } from "./modelAdvisor";
 
 export interface OrchestratorInput{model:ModelInfo;machine:MachineProfile|null;mode:Mode;prompt?:string;userNumCtx?:number;intelligence:IntelligenceSetting;reserveOutputTokens:number;adaptiveEnabled:boolean;cloudNativeTools?:boolean;task?:TaskAnalysis;bench?:BenchResult;}
 interface LevelProfile{maxTools:number;allowParallelTools:boolean;outputCap:number;chatTemp:number;taskTemp:number;}
@@ -169,9 +170,10 @@ export function computeOptimalContextWindow(
 
   // 1. Model weight footprint in GB
   const paramsB=model.paramsB??(model.tier==="tiny"?3:model.tier==="small"?7:model.tier==="medium"?14:30);
+  const bpp=bytesPerParamForQuant(normalizeQuantization(model.quantization,model.name));
   const weightBytes=model.sizeBytes&&model.sizeBytes>0
     ? model.sizeBytes
-    : paramsB*0.65*(1024**3);
+    : paramsB*bpp*(1024**3);
   const weightGb=weightBytes/(1024**3);
 
   // 2. KV cache + compute buffer cost per 1K context tokens (GB per 1K tokens)
@@ -185,9 +187,11 @@ export function computeOptimalContextWindow(
   const usableSystemRamGb=Math.max(0.5, Math.min(freeRamGb - totalRamGb*0.10, totalRamGb - ramSafetyBufferGb));
   const vramGb=(machine.gpu?.vramBytes??0)/(1024**3);
   const usableVramGb=vramGb>0?Math.max(0, vramGb-0.5):0;
+  const isUnified=Boolean(machine.gpu?.isUnifiedMemory);
 
-  // Total memory available for (Model Weights + KV Cache) across GPU + System RAM
-  const totalPoolGb=usableVramGb + usableSystemRamGb;
+  // Total memory available for (Model Weights + KV Cache) across GPU + System RAM.
+  // On unified-memory SoCs (e.g. Apple Silicon), VRAM and RAM share the same physical pool.
+  const totalPoolGb=isUnified?usableSystemRamGb:usableVramGb + usableSystemRamGb;
   const remainingForKvGb=Math.max(0, totalPoolGb - weightGb);
 
   // Raw max context tokens that fit in the remaining VRAM + RAM pool without touching the 22.5% RAM buffer

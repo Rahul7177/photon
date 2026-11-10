@@ -99,6 +99,25 @@ export interface InstallOption {
 
 /* ---------------- Hardware-aware model advisor ---------------- */
 export type ModelCapability = "coding" | "reasoning" | "multimodal" | "autocomplete";
+export interface PredictionValidation {
+  /** Predicted GPU residency % (0-100) before live measurement. */
+  predictedGpuPercent: number;
+  /** Live GPU residency % reported by runtime (/api/ps), when loaded. */
+  actualGpuPercent?: number;
+  /** Predicted throughput (tok/s) prior to live observation. */
+  predictedTokPerSec?: number;
+  /** Live measured throughput (tok/s) from benchmark or turn stats. */
+  actualTokPerSec?: number;
+  /** Runtime model memory footprint reported by runtime (GB), when loaded. */
+  actualMemoryGb?: number;
+  /** Live runtime context length reported by runtime (/api/ps), when loaded. */
+  actualContextTokens?: number;
+  /** Ratio `actualTokPerSec / predictedTokPerSec` when both are available. */
+  calibrationFactor?: number;
+  /** Classification of agreement between predicted and live measurement. */
+  status: "unverified" | "matched" | "faster" | "slower" | "more_offload";
+  detail: string;
+}
 export interface FitAssessment {
   mode: "gpu" | "hybrid" | "cpu" | "exceeds";
   badge: "green" | "yellow" | "red";
@@ -110,6 +129,18 @@ export interface FitAssessment {
   isEstimate?: boolean;
   /** Human-readable badge text (no emoji). */
   label: string;
+  /** Estimated share of weights + KV hosted on GPU (0-100). */
+  gpuPercent?: number;
+  /** Estimated memory pressure band against available VRAM/RAM pools. */
+  pressure?: "low" | "moderate" | "high" | "critical";
+  /** Maximum safe context window (tokens) that fits current memory without swapping. */
+  maxSafeContextTokens?: number;
+  /** Effective runtime assumed or targeted for this prediction. */
+  runtime?: LocalRuntimeId;
+  /** Effective quantization tag (e.g. "q4_k_m", "q8_0") inferred or supplied. */
+  quantization?: string;
+  /** Validation against live /api/ps runtime telemetry and measured tok/s. */
+  validation?: PredictionValidation;
 }
 export interface HardwareSummary {
   totalRamGb: number;
@@ -135,6 +166,10 @@ export interface ModelRecommendation {
   installedName?: string;
   recommended: boolean;
   quality: number;
+  quantization?: string;
+  runtime?: LocalRuntimeId;
+  taskScore?: number;
+  taskReason?: string;
 }
 export interface InstalledModelEvaluation {
   name: string;
@@ -145,6 +180,9 @@ export interface InstalledModelEvaluation {
   recommended: boolean;
   quality: number;
   reason: string;
+  quantization?: string;
+  runtime?: LocalRuntimeId;
+  taskScore?: number;
 }
 export interface RecommendationSet {
   hardware: HardwareSummary;
@@ -155,6 +193,11 @@ export interface RecommendationSet {
   headline: string;
   evaluatedInstalled?: InstalledModelEvaluation[];
   bestInstalledName?: string;
+  runtime?: LocalRuntimeId;
+  taskQuery?: string;
+  taskComplexity?: ComplexityLevel;
+  taskReason?: string;
+  calibrationScale?: number;
 }
 
 /** Determine whether a model is locally hosted (Ollama / llama.cpp) vs cloud. */

@@ -104,7 +104,7 @@ Photon features a checkpoint and rollback system engineered to undo faulty agent
 
 To prevent conversation context overflows during long-running sessions, Photon implements an automated compaction engine (`compactor.ts`):
 
-- **Automatic Threshold Compaction:** Continuously computes token usage against the model's active context window (`used / window`). When context pressure exceeds **85%**, the engine automatically triggers context compaction before prompt execution.
+- **Automatic Threshold Compaction:** Continuously computes projected request pressure against the model's usable context window (history + incoming turn, with completion reserve). When pressure reaches **75%**, the engine automatically triggers context compaction before prompt execution.
 - **Structural Summarization (`compactSessionMessages`):**
   - **Preserved Core Context:** Preserves the initial user request, active task goal, workspace files touched, pending todos, key technical decisions, and the 2 most recent turns.
   - **Condensed History:** Compresses intermediate turns, tool calls, and diagnostics into a dense `[Context Compaction Summary]` block.
