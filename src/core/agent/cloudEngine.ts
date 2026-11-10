@@ -13,6 +13,7 @@ import {
   shouldRetryStep,
   waitWithBackoff,
 } from "./errorRecovery";
+import { executionFingerprint, looksLikeNarration } from "../intelligence/policy";
 
 /**
  * CLOUD ENGINE — token-economical native tool-calling loop for frontier cloud models.
@@ -288,11 +289,21 @@ export function normalizeCloudToolCall(call: PendingCall, _availableTools?: Tool
     };
   }
 
-  // 8. Diagnostics
+  // 8. Diagnostics & Code Outline
   if (name === "diagnostics" || name === "getDiagnostics" || name === "get_errors" || name === "check_errors") {
     return {
       ...call,
       name: "get_diagnostics",
+      args: {
+        path: args.path ?? args.file_path ?? args.filePath,
+      },
+    };
+  }
+
+  if (name === "code_outline" || name === "outline" || name === "listCodeDefinitions") {
+    return {
+      ...call,
+      name: "list_code_definition_names",
       args: {
         path: args.path ?? args.file_path ?? args.filePath,
       },
@@ -400,6 +411,111 @@ function compactCloudHistory(history: LLMMessage[]): {
   };
 }
 
+const CLOUD_MUTATING_OR_EXEC_NAMES = new Set([
+  "write_to_file",
+  "replace_in_file",
+  "execute_command",
+  "edit_file",
+  "write_file",
+  "append_file",
+  "move_path",
+  "run_command",
+  "delete_file",
+  "create_file",
+  "update_file",
+  "modify_file",
+  "patch_file",
+  "apply_patch",
+  "save_file",
+  "rewrite_file",
+  "remove_file",
+  "bash",
+  "terminal",
+  "shell",
+  "run_terminal_command",
+]);
+
+interface BlockedWriteDraft {
+  toolName: string;
+  path?: string;
+  content?: string;
+  find?: string;
+  replace?: string;
+}
+
+function isWriteOrExecCall(name: string, tool?: Tool): boolean {
+  if (tool?.spec.sideEffecting || tool?.spec.risk === "execute") return true;
+  if (CLOUD_MUTATING_OR_EXEC_NAMES.has(name)) return true;
+  return /^(?:write|edit|create|update|modify|patch|replace|delete|remove|save|append|move|rename|run|exec|execute)_/.test(
+    name
+  );
+}
+
+/**
+ * Converts native tool_calls / role:"tool" history into plain alternating
+ * user/assistant messages so toolless fallback turns work across strict
+ * OpenAI, Anthropic, and Gemini gateways without schema/role pairing errors.
+ */
+function flattenHistoryForNoTools(messages: LLMMessage[]): LLMMessage[] {
+  const flat: LLMMessage[] = [];
+  const pushMerged = (role: "user" | "assistant" | "system", content: string, images?: string[]) => {
+    const trimmed = content.trim();
+    if (!trimmed && (!images || images.length === 0)) return;
+    const prev = flat[flat.length - 1];
+    if (prev && prev.role === role && role !== "system") {
+      prev.content = [prev.content, trimmed].filter(Boolean).join("\n\n");
+      if (images?.length) prev.images = [...(prev.images ?? []), ...images];
+      return;
+    }
+    flat.push({ role, content: trimmed, ...(images?.length ? { images } : {}) });
+  };
+
+  for (const m of messages) {
+    if (m.role === "assistant") {
+      const toolNotes = (m.tool_calls ?? []).map((tc) => {
+        const pathArg =
+          typeof tc.function.arguments?.path === "string" ? tc.function.arguments.path : "";
+        return pathArg ? `${tc.function.name}(${pathArg})` : tc.function.name;
+      });
+      const text = [m.content?.trim(), toolNotes.length ? `[Attempted tools: ${toolNotes.join(", ")}]` : ""]
+        .filter(Boolean)
+        .join("\n\n");
+      pushMerged("assistant", text);
+    } else if (m.role === "tool") {
+      pushMerged("user", `[Tool output — ${m.name ?? "tool"}]:\n${m.content}`);
+    } else {
+      pushMerged(m.role, m.content, m.images);
+    }
+  }
+  return flat;
+}
+
+function wrapFence(code: string, langHint?: string): string {
+  const fence = /```/.test(code) ? "````" : "```";
+  const lang = langHint ? langHint : "";
+  return `${fence}${lang}\n${code.replace(/\s+$/, "")}\n${fence}`;
+}
+
+function formatBlockedWriteFallback(drafts: BlockedWriteDraft[]): string {
+  const parts: string[] = [
+    "I cannot edit or write workspace files directly because **Chat** mode is strictly read-only and does not have file-write access.",
+  ];
+  for (const d of drafts) {
+    const label = d.path ? `\`${d.path}\`` : "the target file";
+    const ext = d.path?.split(".").pop()?.toLowerCase();
+    const lang = ext === "md" ? "markdown" : ext;
+    if (d.content) {
+      parts.push(`Here is the proposed content for ${label} so you can copy and paste it manually:\n\n${wrapFence(d.content, lang)}`);
+    } else if (d.replace) {
+      parts.push(`Here is the proposed replacement for ${label}:\n\n${wrapFence(d.replace, lang)}`);
+    }
+  }
+  parts.push(
+    "You can apply these changes manually, or switch the mode selector to **Agent** mode and ask again if you would like me to edit the file directly."
+  );
+  return parts.join("\n\n");
+}
+
 /** Run one cloud turn to completion. */
 export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
   const { provider, model, system, tools, contextWindow, ctx, emitter, signal, onStepUsage } = input;
@@ -412,19 +528,34 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
   let emptyStreak = 0;
   let streamRetries = 0;
   let continuations = 0;
+  let narrationNudges = 0;
+  let duplicateOnlySteps = 0;
+  let hasBlockedWriteInChat = false;
+  let forceTextOnlyNextStep = false;
+  let forcedTextUsed = false;
+  const blockedWriteDrafts: BlockedWriteDraft[] = [];
   let toolsRun = 0;
+  let mutationEpoch = 0;
+  const executed = new Map<string, { count: number; lastStep: number }>();
 
-  const MODE_CAPS: Record<Mode, number> = { chat: 6, plan: 10, agent: 25 };
-  const modeCap = input.mode ? (MODE_CAPS[input.mode] ?? 25) : 25;
+  const MODE_CAPS: Record<Mode, number> = { chat: 100, plan: 150, agent: 200 };
+  const modeCap = input.mode ? (MODE_CAPS[input.mode] ?? 200) : 200;
   const effectiveMaxSteps = Math.min(input.maxSteps ?? modeCap, modeCap);
 
   for (let step = 0; step < effectiveMaxSteps; step++) {
     if (signal.aborted) return;
 
-    const { compacted, savedTokens: compactionSavedTokens } = compactCloudHistory(history);
+    const disablingToolsThisStep = forceTextOnlyNextStep;
+    if (disablingToolsThisStep) {
+      forcedTextUsed = true;
+      forceTextOnlyNextStep = false;
+    }
+    const activeNativeTools = disablingToolsThisStep ? undefined : nativeTools;
+    const stepHistory = disablingToolsThisStep ? flattenHistoryForNoTools(history) : history;
+    const { compacted, savedTokens: compactionSavedTokens } = compactCloudHistory(stepHistory);
     const fit = fitToWindow(system, compacted, 0, contextWindow, model, {
       preserveFirstUser: true,
-      toolSchemasTokens,
+      toolSchemasTokens: activeNativeTools ? toolSchemasTokens : 0,
     });
     const messages = fit.messages;
     const historyTokens = fit.usage.breakdown.find((b) => b.label === "Conversation")?.tokens ?? 0;
@@ -456,16 +587,40 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
     const calls: PendingCall[] = [];
     let streamError: unknown = null;
     let doneReason: string | undefined;
+    let lastVisibleAt = genStart;
+    const slowTimer = setInterval(() => {
+      if (signal.aborted) return;
+      const now = Date.now();
+      const totalSec = Math.round((now - genStart) / 1000);
+      const quietSec = Math.round((now - lastVisibleAt) / 1000);
+      if (quietSec >= 5) {
+        emitter.onPhase(
+          "thinking",
+          thinkingStart > 0 && !thinkingDoneEmitted
+            ? `Thinking (${totalSec}s)…`
+            : accChars > 0
+              ? `Generating (${totalSec}s)…`
+              : `Waiting for model (${totalSec}s)…`
+        );
+      }
+    }, 3_000);
     try {
       for await (const chunk of provider.chatStream(
-        { model, messages, ...(nativeTools ? { tools: nativeTools } : {}) },
+        { model, messages, ...(activeNativeTools ? { tools: activeNativeTools } : {}) },
         signal
       )) {
         if (chunk.message?.thinking) {
-          if (!thinkingStart) thinkingStart = Date.now();
+          if (!thinkingStart) {
+            thinkingStart = Date.now();
+            emitter.onPhase("thinking", "Reasoning");
+          }
           emitter.onThinkingDelta?.(assistantId, chunk.message.thinking);
         }
         if (chunk.message?.content) {
+          lastVisibleAt = Date.now();
+          if (accChars === 0) {
+            emitter.onPhase("thinking", "Generating response");
+          }
           if (thinkingStart && !thinkingDoneEmitted) {
             thinkingDoneEmitted = true;
             emitter.onThinkingEnd?.(assistantId, Math.max(1, Date.now() - thinkingStart));
@@ -525,6 +680,8 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
       }
     } catch (e) {
       streamError = e;
+    } finally {
+      clearInterval(slowTimer);
     }
     if (thinkingStart && !thinkingDoneEmitted) {
       thinkingDoneEmitted = true;
@@ -603,14 +760,26 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
     }
 
     if (calls.length === 0 && !content.trim()) {
+      if (disablingToolsThisStep && input.mode === "chat" && hasBlockedWriteInChat) {
+        const fb = formatBlockedWriteFallback(blockedWriteDrafts);
+        emitter.onContent(assistantId, fb);
+        emitter.onGenerationStats(null);
+        emitter.onDone(assistantId);
+        return;
+      }
       emptyStreak++;
       emitter.onAssistantCancel(assistantId);
       if (emptyStreak <= MAX_EMPTY_RETRIES) {
         ctx.log(`[cloud] empty generation ${emptyStreak}/${MAX_EMPTY_RETRIES} — nudging.`);
+        if (history[history.length - 1]?.role !== "assistant") {
+          history.push({ role: "assistant", content: "(empty response)" });
+        }
         history.push({
           role: "user",
           content:
-            "Your previous reply arrived empty. Continue the task from the tool results above: call the next tool if steps remain, or reply with your final answer. Do not repeat tool calls you already made.",
+            thinkingStart > 0
+              ? "You produced internal reasoning without any visible response or tool call. Output your visible Markdown answer now, or invoke the next tool."
+              : "Your previous reply arrived empty. Continue the task from the tool results above: call the next tool if steps remain, or reply with your final answer. Do not repeat tool calls you already made.",
         });
         continue;
       }
@@ -623,16 +792,14 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
     emptyStreak = 0;
 
     if (calls.length === 0) {
-      const cutOff =
-        isLengthCutoff(doneReason) ||
-        hasUnclosedFence(content) ||
-        (!doneReason && toolsRun > 0);
+      const cutOff = isLengthCutoff(doneReason) || hasUnclosedFence(content);
       if (cutOff && continuations < MAX_CONTINUATIONS) {
         continuations++;
         emitter.onDone(assistantId);
         ctx.log(
           `[cloud] output cut off (reason: ${doneReason ?? "none"}, ${content.length} chars) — asking model to continue (${continuations}/${MAX_CONTINUATIONS}).`
         );
+        history.push({ role: "assistant", content });
         history.push({
           role: "user",
           content:
@@ -641,8 +808,49 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
         continue;
       }
 
-      // High-end cloud models deliver their conversational answers, explanations, or questions
-      // directly in Markdown without requiring artificial narration interruptions or pseudo-tools.
+      if (!cutOff && narrationNudges < 1 && !forcedTextUsed && looksLikeNarration(content)) {
+        narrationNudges++;
+        emitter.onAssistantCancel(assistantId);
+        ctx.log(`[cloud] narration-only response in ${input.mode ?? "cloud"} mode — nudging for completion.`);
+        history.push({ role: "assistant", content });
+        if (input.mode === "chat") {
+          forceTextOnlyNextStep = true;
+          history.push({
+            role: "user",
+            content:
+              "You are in read-only Chat mode and do not have file-write access. Stop narrating 'Let me create/update it'. Directly output the complete proposed file content (in a fenced Markdown code block) or manual instructions now, and advise the user to paste it manually or switch to Agent mode.",
+          });
+        } else {
+          const narrationPrompt =
+            input.mode === "plan"
+              ? "You are in read-only Plan mode. Do not stop with a promise to continue later. Either ask concise clarifying questions now or output the complete structured implementation plan in Markdown."
+              : "Do not stop with narration of your next step. Invoke the tool you intended to run now, or if the task is finished, present the final summary.";
+          history.push({ role: "user", content: narrationPrompt });
+        }
+        continue;
+      }
+
+      if (input.mode === "chat" && hasBlockedWriteInChat) {
+        if (looksLikeNarration(content) && !/```/.test(content)) {
+          emitter.onAssistantCancel(assistantId);
+          const fbId = randomUUID();
+          emitter.onAssistantStart(fbId);
+          emitter.onContent(fbId, formatBlockedWriteFallback(blockedWriteDrafts));
+          emitter.onGenerationStats(null);
+          emitter.onDone(fbId);
+          return;
+        }
+        if (
+          !/\bagent\b/i.test(content) ||
+          !/(?:manual|paste|copy|write\s*access|read[- ]only|cannot\s+(?:write|edit|modify))/i.test(content)
+        ) {
+          emitter.onDelta(
+            assistantId,
+            "\n\n> **Note:** Chat mode is read-only and does not have file-write access. You can copy and paste the content above manually, or switch to **Agent** mode so I can edit files directly."
+          );
+        }
+      }
+
       emitter.onGenerationStats(null);
       emitter.onDone(assistantId);
       return;
@@ -704,29 +912,81 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
       executableCalls.length > 1 &&
       executableCalls.every((ec) => ec.tool && !ec.tool.spec.sideEffecting);
 
+    let stepFreshCalls = 0;
+    let stepBlockedWriteCalls = 0;
+
     const runOneCall = async (ec: { pending: PendingCall; tool?: Tool; callObj: ToolCall }) => {
       const { pending: c, tool, callObj } = ec;
       emitter.onPhase("working", c.name);
       emitter.onToolUpdate(assistantId, { ...callObj, status: "running" });
       let output: string;
       let okResult: boolean;
-      if (!tool) {
+      const isMutatingOrExec = isWriteOrExecCall(c.name, tool);
+      const isForbiddenInReadOnly =
+        (input.mode === "chat" || input.mode === "plan") && isMutatingOrExec;
+      if (isForbiddenInReadOnly) {
+        stepBlockedWriteCalls++;
+        if (input.mode === "chat") {
+          hasBlockedWriteInChat = true;
+          const pathArg =
+            typeof c.args.path === "string"
+              ? c.args.path
+              : typeof c.args.file === "string"
+                ? c.args.file
+                : undefined;
+          const contentArg =
+            typeof c.args.content === "string" && c.args.content.trim() ? c.args.content : undefined;
+          const findArg = typeof c.args.find === "string" ? c.args.find : undefined;
+          const replaceArg =
+            typeof c.args.replace === "string" && c.args.replace.trim() ? c.args.replace : undefined;
+          if (contentArg || replaceArg) {
+            blockedWriteDrafts.push({
+              toolName: c.name,
+              path: pathArg,
+              content: contentArg,
+              find: findArg,
+              replace: replaceArg,
+            });
+          }
+        }
+        output =
+          input.mode === "chat"
+            ? `Side-effecting tool "${c.name}" is forbidden in "chat" mode (no write access). Do not retry write or read tools. Directly output the complete proposed file content in ONE single outer 4-backtick block (\`\`\`\`markdown ... \`\`\`\`) or manual instructions so the user can paste it easily, and advise switching to Agent mode to apply changes directly.`
+            : `Side-effecting tool "${c.name}" is forbidden in "plan" mode (read-only planning). Do not modify files or run commands; continue clarifying/discussing or present the implementation plan in Markdown, and let the user switch to Agent mode to execute it.`;
+        okResult = false;
+      } else if (!tool) {
         output = `Unknown tool "${c.name}". Available: ${tools.map((t) => t.spec.name).join(", ")}.`;
         okResult = false;
-      } else if ((input.mode === "chat" || input.mode === "plan") && tool.spec.sideEffecting) {
-        output = `Side-effecting tool "${c.name}" is forbidden in "${input.mode}" mode.`;
-        okResult = false;
-      } else if (ctx.executionPolicy?.blockTerminalCommands && (c.name === "run_command" || tool.spec.risk === "execute")) {
+      } else if (ctx.executionPolicy?.blockTerminalCommands && (c.name === "run_command" || c.name === "execute_command" || tool.spec.risk === "execute")) {
         output = `Terminal command execution is disabled by current execution policy.`;
         okResult = false;
       } else {
-        try {
-          const r = await tool.execute(c.args, { ...ctx, pendingCallId: c.id });
-          output = r.output;
-          okResult = r.ok;
-        } catch (e) {
-          output = (e as Error).message;
+        const fp = !isMutatingOrExec ? executionFingerprint(callObj, mutationEpoch) : "";
+        const prior = fp ? executed.get(fp) : undefined;
+        if (fp && prior && prior.count >= 1 && step - prior.lastStep < 15) {
+          executed.set(fp, { count: prior.count + 1, lastStep: step });
+          output =
+            prior.count === 1
+              ? `Already executed ${c.name} with identical arguments in this epoch and no files have changed. Reuse the earlier result above and proceed with the next step or answer the user directly.`
+              : `Duplicate tool call blocked: ${c.name} was already executed repeatedly with identical arguments.`;
           okResult = false;
+        } else {
+          stepFreshCalls++;
+          try {
+            const r = await tool.execute(c.args, { ...ctx, pendingCallId: c.id });
+            output = r.output;
+            okResult = r.ok;
+          } catch (e) {
+            output = (e as Error).message;
+            okResult = false;
+          }
+          if (okResult) {
+            if (isMutatingOrExec) {
+              mutationEpoch++;
+            } else if (fp) {
+              executed.set(fp, { count: (prior?.count ?? 0) + 1, lastStep: step });
+            }
+          }
         }
       }
       toolsRun++;
@@ -782,6 +1042,91 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
       return;
     }
 
+    if (input.mode === "chat" && stepBlockedWriteCalls > 0 && stepFreshCalls === 0) {
+      if (disablingToolsThisStep || step >= effectiveMaxSteps - 1) {
+        if (looksLikeNarration(content) || !content.trim()) {
+          emitter.onAssistantCancel(assistantId);
+          const fbId = randomUUID();
+          emitter.onAssistantStart(fbId);
+          emitter.onContent(fbId, formatBlockedWriteFallback(blockedWriteDrafts));
+          emitter.onGenerationStats(null);
+          emitter.onDone(fbId);
+        } else {
+          if (
+            !/\bagent\b/i.test(content) ||
+            !/(?:manual|paste|copy|write\s*access|read[- ]only|cannot\s+(?:write|edit|modify))/i.test(content)
+          ) {
+            emitter.onDelta(
+              assistantId,
+              `\n\n${formatBlockedWriteFallback(blockedWriteDrafts)}`
+            );
+          }
+          emitter.onGenerationStats(null);
+          emitter.onDone(assistantId);
+        }
+        return;
+      }
+      if (!content.trim() || looksLikeNarration(content)) {
+        emitter.onAssistantCancel(assistantId);
+      } else {
+        emitter.onDone(assistantId);
+      }
+      forceTextOnlyNextStep = true;
+      duplicateOnlySteps = 0;
+      history.push({
+        role: "user",
+        content:
+          "Chat mode is strictly read-only and does NOT have file-write access. Tools are now disabled for your final reply. Output the ENTIRE file content in ONE single outer 4-backtick code block (e.g. ````markdown\\n...\\n```` — never split one file across multiple separate code blocks) or clear manual instructions so the user can copy and paste it with one click, explain that Chat mode lacks write access, and suggest switching to Agent mode to apply changes automatically.",
+      });
+      continue;
+    }
+
+    if (executableCalls.length > 0 && stepFreshCalls === 0) {
+      duplicateOnlySteps++;
+      if (duplicateOnlySteps >= 2) {
+        if (!forcedTextUsed && !disablingToolsThisStep && step < effectiveMaxSteps - 1) {
+          emitter.onDone(assistantId);
+          forceTextOnlyNextStep = true;
+          history.push({
+            role: "user",
+            content:
+              input.mode === "chat"
+                ? "Stop repeating tool calls — tools are now disabled. Using only the information already gathered above, provide your complete Markdown response now (if the user asked to improve or edit a file, put the ENTIRE file inside ONE single outer 4-backtick code block like ````markdown ... ```` rather than splitting it, explain that Chat mode does not have file-write access, and advise switching to Agent mode)."
+                : input.mode === "plan"
+                  ? "Stop repeating tool calls — tools are now disabled. Present your clarifying questions or complete structured Markdown implementation plan using the files already inspected."
+                  : "Stop repeating tool calls — tools are now disabled. Summarize what was completed, what could not be finished, and any next manual step.",
+          });
+          continue;
+        }
+        emitter.onGenerationStats(null);
+        emitter.onDone(assistantId);
+        if (input.mode === "chat" && hasBlockedWriteInChat) {
+          const fbId = randomUUID();
+          emitter.onAssistantStart(fbId);
+          emitter.onContent(fbId, formatBlockedWriteFallback(blockedWriteDrafts));
+          emitter.onDone(fbId);
+          return;
+        }
+        emitter.onError(
+          "Stopped because the model repeated the exact same blocked or duplicate tool calls without making progress."
+        );
+        return;
+      }
+    } else if (stepFreshCalls > 0) {
+      duplicateOnlySteps = 0;
+    }
+
+    if (input.mode === "chat" && stepBlockedWriteCalls > 0 && !forcedTextUsed && step < effectiveMaxSteps - 1) {
+      emitter.onDone(assistantId);
+      forceTextOnlyNextStep = true;
+      history.push({
+        role: "user",
+        content:
+          "Chat mode is strictly read-only and does NOT have file-write access. Tools are now disabled for your final reply. Using the file contents already read above, directly output the complete proposed file content in a fenced Markdown code block so the user can paste it manually, explain that Chat mode lacks write access, and advise switching to Agent mode.",
+      });
+      continue;
+    }
+
     emitter.onDone(assistantId);
   }
 
@@ -804,6 +1149,11 @@ export function cloudHistoryFromSession(messages: ChatMessage[]): LLMMessage[] {
 
   for (const m of messages) {
     if (m.role === "user") {
+      // Hidden user messages come from local photon-block turns (either duplicate
+      // <tool_result> wrappers whose outcomes are already reconstructed from
+      // assistant.toolCalls, or internal step-level coaching nudges). Skip them so
+      // Local -> Cloud mode transitions preserve clean conversation history.
+      if (m.hidden) continue;
       const docs = (m.attachments ?? []).filter((a) => a.kind === "text" && a.text);
       let content = m.content;
       for (const d of docs) {

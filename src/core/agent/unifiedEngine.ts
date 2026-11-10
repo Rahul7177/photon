@@ -53,8 +53,8 @@ async function fetchWithTimeout<T>(
   }
 }
 
-// Spec §5 hard caps
-const MODE_CAPS:Record<string,number>={chat:6,plan:10,agent:25};
+// High non-blocking safety ceilings so tasks complete without artificial cutoffs
+const MODE_CAPS:Record<string,number>={chat:100,plan:150,agent:200};
 const CHECK_IN_INTERVAL=8;
 
 export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:AdaptivePlan,emitter:UnifiedEmitter,signal:AbortSignal,deps:UnifiedEngineDeps):Promise<void>{
@@ -145,9 +145,15 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
   const verificationPlan:VerificationPlan=plan.verification??buildVerificationPlan(task);
 
   // Spec §2: core loop — enforce step budget from mode caps and execution policy
-  const configuredMaxSteps = MODE_CAPS[plan.mode] ?? 25;
+  const configuredMaxSteps = MODE_CAPS[plan.mode] ?? 200;
   const policyStepBudget = plan.executionPolicy?.stepBudget ?? configuredMaxSteps;
   const maxSteps = Math.min(configuredMaxSteps, policyStepBudget);
+
+  const turnStartIndex = session.messages.length;
+  const hasPriorConversation = session.messages.some(
+    (m, i) => i < session.messages.length - 1 && !m.hidden && m.role === "assistant" && (m.content.trim().length > 0 || (m.toolCalls?.length ?? 0) > 0)
+  );
+  let chatBlockNudges = 0;
 
   let mutationEpoch=0;
   const executed=new Set<string>();
@@ -155,7 +161,7 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
   let lastAssistantResponse = "";
   // OPT + FIX: preserve todos across tool-context rebuilds by initializing from existing
   // tool context and writing mutations back to baseToolCtx on every update.
-  const baseToolCtx={...deps.buildToolContext(signal),executionPolicy:plan.executionPolicy};
+  const baseToolCtx={...deps.buildToolContext(signal),mode:plan.mode,executionPolicy:plan.executionPolicy};
   const initialTodos = baseToolCtx.todos ?? [];
   const sharedTodos:TodoItem[]=[...initialTodos];
   const todoState=sharedTodos;
@@ -166,7 +172,7 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
       baseToolCtx.todos.push(...sharedTodos);
     }
   };
-  const toolCtxFor=(pendingCallId:string)=>({...deps.buildToolContext(signal),todos:sharedTodos,pendingCallId,executionPolicy:plan.executionPolicy});
+  const toolCtxFor=(pendingCallId:string)=>({...deps.buildToolContext(signal),mode:plan.mode,todos:sharedTodos,pendingCallId,executionPolicy:plan.executionPolicy});
   const ctxMgr=getProjectContextManager(baseToolCtx.workspaceRoot);
   if(ctxMgr) await ctxMgr.ensureInitialized().catch(()=>undefined);
   const projectContextDigest=!freshInfo?ctxMgr?.buildPromptDigest({userQuery:lastUserText,activeModel:plan.model,maxTokens:Math.min(1200,Math.floor(plan.numCtx*0.18))}):undefined;
@@ -403,7 +409,7 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
     }
 
     emitter.onPhase("thinking");
-    const history=historyToLLM(session.messages,plan);
+    const history=historyToLLM(session.messages,plan,turnStartIndex);
     const toolSchemasTokens = nativeTools && nativeTools.length > 0 ? estimateToolSchemasTokens(nativeTools, plan.model) : 0;
     const fit=fitToWindow(systemMsg,history,budgetTokens,plan.numCtx,plan.model,{
       preserveFirstUser: true,
@@ -529,11 +535,43 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
       }
     }
 
-    if(plan.mode==="chat"&&calls.length&&!modeToolNames.has(calls[0].name)){
-      emitter.onContent(id,chatRedirectText(calls[0]));
+    if(plan.mode==="chat"&&calls.length&&(!modeToolNames.has(calls[0].name)||toolSpecByName.get(calls[0].name)?.sideEffecting)){
+      const blocked=calls[0];
+      if(chatBlockNudges<1&&step<maxSteps-1){
+        chatBlockNudges++;
+        const blockMsg=
+          `Tool "${blocked.name}" is blocked because Chat mode is strictly read-only (no file modifications, creations, moves, or shell commands). `+
+          `Do NOT call write/edit/command tools. Reply politely in plain text: show the user how to make the change manually (with clear steps or code snippet) and suggest switching the mode selector to Agent mode to edit files directly.`;
+        if(plan.toolProtocol==="native"){
+          session.messages.push({id:randomUUID(),role:"assistant",content:visible||"",toolCalls:[blocked],createdAt:Date.now(),hidden:true} as ChatMessage);
+          session.messages.push({id:randomUUID(),role:"tool",content:formatNativeToolOutcome(blocked.name,blockMsg,false),toolCallId:blocked.id,name:blocked.name,createdAt:Date.now(),hidden:true} as ChatMessage);
+        }else{
+          session.messages.push({id:randomUUID(),role:"user",content:renderToolResult(blocked.name,blockMsg,false),createdAt:Date.now(),hidden:true});
+        }
+        completeAssistant(id);
+        currentAssistantId=randomUUID();
+        continue;
+      }
+      const prefix=visible.trim()?`${boundOutput(visible.trim(), MAX_OUTPUT_CHARS)}\n\n`:"";
+      const redirect=prefix+chatRedirectText(blocked);
+      lastAssistantResponse=redirect;
+      emitter.onContent(id,redirect);
       completeAssistant(id);
       commitTurnHandoff("completed");
       return;
+    }
+    if(plan.mode==="plan"&&calls.length&&(!modeToolNames.has(calls[0].name)||toolSpecByName.get(calls[0].name)?.sideEffecting)){
+      const blocked=calls[0];
+      const blockMsg=`Tool "${blocked.name}" is not available in Plan mode (read-only). Do not modify files or run commands; ask focused clarifying questions (2–4 at most) if requirements are unclear, or present the final Markdown implementation plan directly.`;
+      if(plan.toolProtocol==="native"){
+        session.messages.push({id:randomUUID(),role:"assistant",content:visible||"",toolCalls:[blocked],createdAt:Date.now(),hidden:true} as ChatMessage);
+        session.messages.push({id:randomUUID(),role:"tool",content:formatNativeToolOutcome(blocked.name,blockMsg,false),toolCallId:blocked.id,name:blocked.name,createdAt:Date.now(),hidden:true} as ChatMessage);
+      }else{
+        session.messages.push({id:randomUUID(),role:"user",content:renderToolResult(blocked.name,blockMsg,false),createdAt:Date.now(),hidden:true});
+      }
+      completeAssistant(id);
+      currentAssistantId=randomUUID();
+      continue;
     }
     if(plan.toolProtocol!=="native"){
       if(visible.trim()) emitter.onContent(id,boundOutput(visible, MAX_OUTPUT_CHARS));
@@ -542,8 +580,9 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
     }
     if (visible.trim()) lastAssistantResponse = boundOutput(visible.trim(), MAX_OUTPUT_CHARS);
 
-    // Hard guard: greetings / small talk must never trigger a tool.
-    if (isGreetingOnly(lastUserText ?? "")) {
+    // Hard guard: standalone opening greetings must never trigger a tool.
+    // Never trigger on confirmations ("ok", "great") in ongoing conversations or when tools were called.
+    if (!calls.length && isGreetingOnly(lastUserText ?? "", hasPriorConversation)) {
       const text = visible || "Hello! How can I help you with your coding tasks today?";
       lastAssistantResponse = text;
       commitTurnHandoff("completed");
@@ -610,13 +649,27 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
       }
       const shouldCheckNarration =
         (plan.mode !== "chat" || toolsRunThisTurn > 0) &&
-        !isGreetingOnly(lastUserText ?? "") &&
+        !isGreetingOnly(lastUserText ?? "", hasPriorConversation) &&
         continueNudges < MAX_CONTINUE_NUDGES;
       if(raw.trim() && shouldCheckNarration){
         const proseOnly=stripFencedCode(raw);
         const isNarration = looksLikeNarration(raw)
           || (proseOnly.length>=8&&looksLikeNarration(proseOnly));
         if(isNarration){
+          if (plan.mode === "chat") {
+            session.messages.push({
+              id: randomUUID(),
+              role: "user",
+              content:
+                "Chat mode is strictly read-only and cannot write or modify files. Do not narrate 'Let me create/update it' or attempt any write/edit tool. Output the complete proposed content (or manual edit instructions) directly in Markdown so the user can paste it manually, and suggest switching to Agent mode to let Photon apply it directly.",
+              createdAt: Date.now(),
+              hidden: true,
+            });
+            continueNudges++;
+            completeAssistant(id);
+            currentAssistantId = randomUUID();
+            continue;
+          }
           const firstTool = suggestFirstTool(specs, lastUserText);
           const namedTool=specs.map(s=>s.name).find(n=>new RegExp(`\\b${n}\\b`).test(raw));
           const nudge = toolsRunThisTurn === 0
@@ -636,8 +689,8 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
       return;
     }
 
-    // In Chat mode, if a tool already ran, nudge the model to conclude with an answer instead of running endless tools
-    if(plan.mode === "chat" && toolsRun >= 1 && concludeNudges < MAX_CONCLUDE_NUDGES){
+    // In Chat mode, allow a few read-only or web calls (e.g. search -> read_file), then nudge to conclude before hitting the step cap
+    if(plan.mode === "chat" && ((freshInfo && toolsRun >= 2) || toolsRun >= 4) && concludeNudges < MAX_CONCLUDE_NUDGES){
       concludeNudges++;
       session.messages.push({
         id: randomUUID(),
@@ -1000,8 +1053,8 @@ function injectUser(session:{messages:ChatMessage[]},content:string):void{sessio
 function chatRedirectText(call:ToolCall):string{
   const target=[call.args?.path,call.args?.file,(call.args as any)?.query]
     .find(v=>typeof v==="string"&&(v as string).trim());
-  const what=target?` to update \`${String(target).trim()}\``:"";
-  return `I can't change files in **Chat** mode — here I can only answer questions and look things up on the web, so I couldn't run \`${call.name}\`${what}.\n\nSwitch the mode selector below from **Chat** to **Agent** and send your request again — I'll take care of it there.`;
+  const what=target?` on \`${String(target).trim()}\``:"";
+  return `I can't modify files or run commands in **Chat** mode — here I can only read files, answer questions, and search the web, so I couldn't run \`${call.name}\`${what}.\n\nYou can apply the change manually from the code/guidance above, or switch the mode selector below from **Chat** to **Agent** and ask again so I can edit it directly.`;
 }
 
 /** Off-ramp after a mutation lands: without an explicit stop condition weak
@@ -1038,8 +1091,72 @@ function resolveCalls(raw:string,native:{id?:string;name:string;args:Record<stri
   const calls:ToolCall[]=parsed.calls.map(p=>({id:randomUUID(),name:p.name,args:p.args,status:(p.errors.length?"error":"proposed") as ToolCall["status"],error:p.errors.join(" "),sideEffecting:specs.find(s=>s.name===p.name)?.sideEffecting}));
   return{calls,cleanedText:parsed.cleanedText};
 }
-function historyToLLM(messages:ChatMessage[],plan:AdaptivePlan):LLMMessage[]{const out:LLMMessage[]=[];for(const m of messages){if(m.role==="user")out.push({role:"user",content:m.content,images:m.attachments?.filter(a=>a.kind==="image"&&a.dataBase64).map(a=>a.dataBase64 as string)});else if(m.role==="assistant"){const calls=m.toolCalls??[];if(m.content.trim()||calls.length)out.push({role:"assistant",content:m.content,tool_calls:plan.toolProtocol==="native"&&calls.length?calls.map(c=>({id:c.id,function:{name:c.name,arguments:c.args},thoughtSignature:c.thoughtSignature})):undefined});}else if(m.role==="tool")out.push({role:"tool",content:m.content,tool_call_id:m.toolCallId,name:(m as any).name});}return sanitizeToolPairing(out);}
-function lastUser(messages:ChatMessage[]):string|undefined{for(let i=messages.length-1;i>=0;i--)if(messages[i].role==="user")return messages[i].content;return undefined;}
+function isSyntheticToolMsg(m:ChatMessage):boolean{
+  if(m.role==="tool")return true;
+  if(m.role!=="user")return false;
+  const trimmed=(m.content??"").trimStart();
+  return trimmed.startsWith("<tool_result")||trimmed.startsWith("<photon:result")||trimmed.startsWith("[TOOL_RESULT")||trimmed.startsWith("[tool:");
+}
+function historyToLLM(messages:ChatMessage[],plan:AdaptivePlan,turnStartIndex=messages.length):LLMMessage[]{
+  const out:LLMMessage[]=[];
+  const existingToolIds=new Set<string>();
+  for(const m of messages){
+    if(m.role==="tool"&&(m as any).toolCallId) existingToolIds.add((m as any).toolCallId);
+  }
+  for(let idx=0;idx<messages.length;idx++){
+    const m=messages[idx];
+    if(m.role==="user"){
+      // Skip internal step coaching nudges from previous finished turns so they
+      // don't confuse future turns or mode switches, while preserving active-turn nudges
+      // and current-protocol tool outputs.
+      if(idx<turnStartIndex&&m.hidden&&!isSyntheticToolMsg(m)) continue;
+      if(plan.toolProtocol==="native"&&m.hidden&&isSyntheticToolMsg(m)) continue;
+      const docs=(m.attachments??[]).filter(a=>a.kind==="text"&&a.text);
+      let content=m.content;
+      for(const d of docs){
+        content+=`\n\n--- Attached file: ${d.name} ---\n${d.text}\n--- end ${d.name} ---`;
+      }
+      out.push({role:"user",content,images:m.attachments?.filter(a=>a.kind==="image"&&a.dataBase64).map(a=>a.dataBase64 as string)});
+    }else if(m.role==="assistant"){
+      const calls=m.toolCalls??[];
+      if(plan.toolProtocol==="native"){
+        if(m.content.trim()||calls.length){
+          out.push({role:"assistant",content:m.content,tool_calls:calls.length?calls.map(c=>({id:c.id,function:{name:c.name,arguments:c.args},thoughtSignature:c.thoughtSignature})):undefined});
+          for(const c of calls){
+            if(!existingToolIds.has(c.id)){
+              const outcome=c.result!==undefined?c.result:c.error!==undefined?c.error:c.status==="denied"?"Tool execution declined by user.":"Tool execution did not complete.";
+              out.push({role:"tool",tool_call_id:c.id,name:c.name,content:formatNativeToolOutcome(c.name,outcome,c.status==="done")});
+            }
+          }
+        }
+      }else{
+        const nextMsg=messages[idx+1];
+        const hasFollowingResult=nextMsg&&(nextMsg.role==="tool"||isSyntheticToolMsg(nextMsg));
+        const finished=calls.filter(c=>c.result!==undefined||c.error!==undefined);
+        if(m.content.trim()||calls.length){
+          const fallbackText=finished.length?`Calling ${finished.map(c=>c.name).join(", ")}`:m.content;
+          if(m.content.trim()||finished.length){
+            out.push({role:"assistant",content:m.content.trim()?m.content:fallbackText});
+          }
+        }
+        // When switching from Cloud -> Local photon-block, prior tool calls may have outcomes
+        // stored on m.toolCalls without trailing <tool_result> user messages.
+        if(finished.length&&!hasFollowingResult){
+          const summary=finished.map(c=>renderToolResult(c.name,String(c.result??c.error??""),c.status==="done")).join("\n");
+          out.push({role:"user",content:summary});
+        }
+      }
+    }else if(m.role==="tool"){
+      if(plan.toolProtocol==="native"){
+        out.push({role:"tool",content:m.content,tool_call_id:m.toolCallId,name:(m as any).name});
+      }else{
+        out.push({role:"user",content:renderToolResult(String((m as any).name??"tool"),m.content,!/^\[TOOL_ERROR/i.test(m.content.trim()))});
+      }
+    }
+  }
+  return sanitizeToolPairing(out);
+}
+function lastUser(messages:ChatMessage[]):string|undefined{for(let i=messages.length-1;i>=0;i--)if(messages[i].role==="user"&&!messages[i].hidden&&!isSyntheticToolMsg(messages[i]))return messages[i].content;return undefined;}
 function lastToolSucceeded(messages:ChatMessage[]):boolean{
   for(let i=messages.length-1;i>=0;i--){
     const message=messages[i];
@@ -1067,9 +1184,13 @@ function renderCorrectExample(spec:ToolSpec,args:Record<string,unknown>):string{
   return lines.join("\n");
 }
 
-function isGreetingOnly(text: string): boolean {
+function isGreetingOnly(text: string, hasPriorConversation = false): boolean {
   const t = text.trim().toLowerCase().replace(/[!.,?]+$/g, "").trim();
   if (!t) return true;
+  if (hasPriorConversation) {
+    // In an ongoing conversation, confirmations ("ok", "great", "cool") continue the workflow.
+    return /^(hi|hello|hey|hiya|howdy|yo|greetings|good\s*(morning|afternoon|evening)|bye|goodbye|hello\s*there|hi\s*there)[\s!.,?]*$/i.test(t);
+  }
   const greetingRe = /^(hi|hello|hey|hiya|howdy|yo|sup|greetings|good\s*(morning|afternoon|evening)|thanks|thank\s*you|thx|bye|goodbye|ok|okay|cool|nice|great|awesome|hello\s*there|hi\s*there|what's\s*up|whats\s*up)[\s!.,?]*$/i;
   return greetingRe.test(t);
 }

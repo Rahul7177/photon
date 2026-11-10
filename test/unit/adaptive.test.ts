@@ -236,17 +236,19 @@ describe("Adaptive Intelligence & Hardware Profiling", () => {
       assert.equal(verifyRanked[0].name, "get_diagnostics");
     });
 
-    it("selectToolSpecs restricts tools in chat mode to web and context queries", () => {
+    it("selectToolSpecs restricts tools in chat mode to read-only inspection and web queries", () => {
       const specs: ToolSpec[] = [
         { name: "web_search", summary: "search", params: [], sideEffecting: false, priority: 1 },
         { name: "web_fetch", summary: "fetch", params: [], sideEffecting: false, priority: 2 },
         { name: "read_file", summary: "read", params: [], sideEffecting: false, priority: 3 },
         { name: "write_file", summary: "write", params: [], sideEffecting: true, priority: 4 },
+        { name: "edit_file", summary: "edit", params: [], sideEffecting: true, priority: 5 },
+        { name: "run_command", summary: "run", params: [], sideEffecting: true, priority: 6 },
       ];
       const plan = {
         mode: "chat" as const,
         intelligence: "high" as const,
-        maxTools: 5,
+        maxTools: 10,
         numCtx: 8192,
         contextWindow: 8192,
         toolProtocol: "photon-block" as const,
@@ -259,8 +261,11 @@ describe("Adaptive Intelligence & Hardware Profiling", () => {
       const selected = selectToolSpecs(specs, plan, "orient");
       const names = selected.map((s) => s.name);
       assert.ok(names.includes("web_search"));
-      assert.ok(!names.includes("read_file"));
+      assert.ok(names.includes("web_fetch"));
+      assert.ok(names.includes("read_file"));
       assert.ok(!names.includes("write_file"));
+      assert.ok(!names.includes("edit_file"));
+      assert.ok(!names.includes("run_command"));
     });
 
     it("identifies model narration vs deliverable", () => {

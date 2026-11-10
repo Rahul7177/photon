@@ -19,7 +19,7 @@ export const Markdown = memo(function Markdown({ text, streaming }: { text: stri
     <div className="md">
       {blocks.map((b, i) =>
         b.type === "code" ? (
-          <CodeBlock key={i} lang={b.lang} code={b.content} />
+          <CodeBlock key={i} lang={b.lang} code={b.content} streaming={streaming === true && !b.closed} />
         ) : (
           <Prose key={i} text={b.content} />
         )
@@ -34,8 +34,9 @@ export const Markdown = memo(function Markdown({ text, streaming }: { text: stri
  * end-anchored linear replacements — no backtracking.
  */
 function hideDanglingMarkers(text: string): string {
-  const fences = (text.match(/```/g) || []).length;
-  if (fences % 2 === 1) return text; // inside an open code block
+  const blocks = splitFences(text);
+  const last = blocks[blocks.length - 1];
+  if (last?.type === "code" && !last.closed) return text; // inside an open code block
 
   let out = text;
   if ((out.match(/`/g) || []).length % 2 === 1) out = out.replace(/`[^`\n]*$/, "");
@@ -43,30 +44,190 @@ function hideDanglingMarkers(text: string): string {
   return out;
 }
 
-interface Block {
+export interface MarkdownBlock {
   type: "code" | "text";
   content: string;
   lang?: string;
+  closed?: boolean;
 }
 
-function splitFences(text: string): Block[] {
-  const blocks: Block[] = [];
-  const re = /```([^\n]*)\n([\s\S]*?)```/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    if (m.index > last) blocks.push({ type: "text", content: text.slice(last, m.index) });
-    blocks.push({ type: "code", lang: m[1].trim(), content: m[2].replace(/\n$/, "") });
-    last = re.lastIndex;
+/**
+ * Line-oriented CommonMark fence scanner with resilience for:
+ *  - Variable-length backtick/tilde fences (````, ~~~) so outer 4-backtick blocks preserve inner ``` fences
+ *  - Unclosed/streaming code fences (renders live as a code block instead of spilling raw prose)
+ *  - Legacy 3-backtick markdown/md blocks that embed inner ```lang ... ``` snippets
+ */
+export function splitFences(text: string): MarkdownBlock[] {
+  const normalized = text.replace(/\r\n?/g, "\n");
+  const lines = normalized.split("\n");
+  const blocks: MarkdownBlock[] = [];
+  const textLines: string[] = [];
+
+  let inFence = false;
+  let fenceChar: "`" | "~" = "`";
+  let fenceLen = 3;
+  let fenceLang = "";
+  let codeLines: string[] = [];
+  let markdownNestedDepth = 0;
+
+  const flushText = () => {
+    if (textLines.length === 0) return;
+    const chunk = textLines.join("\n");
+    textLines.length = 0;
+    if (chunk) blocks.push({ type: "text", content: chunk });
+  };
+
+  const countFenceStatsAfter = (fromIdx: number) => {
+    let bare = 0;
+    let tagged = 0;
+    let hasMarkdown = false;
+    for (let j = fromIdx; j < lines.length; j++) {
+      const l = lines[j];
+      if (/^ {0,3}`{3}\s*$/.test(l)) bare++;
+      else {
+        const tm = l.match(/^ {0,3}`{3}([^\s`].*)$/);
+        if (tm) {
+          tagged++;
+          if (/^(?:markdown|md|mdx)(?:\s|$)/i.test(tm[1].trim())) hasMarkdown = true;
+        }
+      }
+    }
+    return { bare, tagged, hasMarkdown };
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (!inFence) {
+      const openMatch = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+      if (openMatch) {
+        const marker = openMatch[1];
+        const char = marker[0] as "`" | "~";
+        const info = openMatch[2] ?? "";
+        // Per CommonMark, backtick fence info strings cannot contain backticks (avoids ```inline``` lines).
+        if (!(char === "`" && info.includes("`"))) {
+          flushText();
+          inFence = true;
+          fenceChar = char;
+          fenceLen = marker.length;
+          fenceLang = info.trim();
+          codeLines = [];
+          markdownNestedDepth = 0;
+          continue;
+        }
+      }
+      textLines.push(line);
+      continue;
+    }
+
+    const isOuterMarkdown =
+      fenceChar === "`" &&
+      fenceLen === 3 &&
+      /^(?:markdown|md|mdx)(?:\s|$)/i.test(fenceLang);
+
+    // Handle inner ```lang code fences nested inside a legacy 3-backtick ```markdown block.
+    if (isOuterMarkdown) {
+      const innerOpen = line.match(/^ {0,3}`{3}([^\s`].*)$/);
+      if (innerOpen) {
+        const stats = countFenceStatsAfter(i + 1);
+        if (stats.bare >= markdownNestedDepth + 2) {
+          markdownNestedDepth++;
+          codeLines.push(line);
+          continue;
+        }
+      }
+    }
+
+    const closeMatch = line.match(/^ {0,3}(`{3,}|~{3,})\s*$/);
+    if (closeMatch && closeMatch[1][0] === fenceChar && closeMatch[1].length >= fenceLen) {
+      if (isOuterMarkdown && closeMatch[1].length === 3) {
+        if (markdownNestedDepth > 0) {
+          markdownNestedDepth--;
+          codeLines.push(line);
+          continue;
+        }
+        const stats = countFenceStatsAfter(i + 1);
+        const unpairedBare = stats.bare - stats.tagged;
+        if (!stats.hasMarkdown && unpairedBare >= 2 && unpairedBare % 2 === 0) {
+          markdownNestedDepth++;
+          codeLines.push(line);
+          continue;
+        }
+      }
+      blocks.push({
+        type: "code",
+        lang: fenceLang,
+        content: codeLines.join("\n"),
+        closed: true,
+      });
+      inFence = false;
+      codeLines = [];
+      markdownNestedDepth = 0;
+      continue;
+    }
+
+    codeLines.push(line);
   }
-  if (last < text.length) blocks.push({ type: "text", content: text.slice(last) });
+
+  if (inFence) {
+    // Drop trailing blank line emitted before EOF split if empty while closed handled above
+    blocks.push({
+      type: "code",
+      lang: fenceLang,
+      content: codeLines.join("\n"),
+      closed: false,
+    });
+  } else {
+    flushText();
+  }
+
   return blocks;
 }
 
-function CodeBlock({ lang, code }: { lang?: string; code: string }) {
+export const CODE_PREVIEW_LINES = 14;
+export const CODE_COLLAPSE_MIN_LINES = 20;
+export const CODE_COLLAPSE_MIN_CHARS = 1400;
+
+export interface CodeBlockPreview {
+  isBig: boolean;
+  lineCount: number;
+  hiddenLines: number;
+  previewText: string;
+}
+
+export function computeCodeBlockPreview(code: string): CodeBlockPreview {
+  const lines = code.split("\n");
+  const lineCount = lines.length;
+  const isBig = lineCount > CODE_COLLAPSE_MIN_LINES || code.length > CODE_COLLAPSE_MIN_CHARS;
+  if (!isBig) {
+    return { isBig: false, lineCount, hiddenLines: 0, previewText: code };
+  }
+  if (lineCount > CODE_PREVIEW_LINES) {
+    return {
+      isBig: true,
+      lineCount,
+      hiddenLines: lineCount - CODE_PREVIEW_LINES,
+      previewText: lines.slice(0, CODE_PREVIEW_LINES).join("\n"),
+    };
+  }
+  return {
+    isBig: true,
+    lineCount,
+    hiddenLines: 0,
+    previewText: `${code.slice(0, CODE_COLLAPSE_MIN_CHARS)}…`,
+  };
+}
+
+function CodeBlock({ lang, code, streaming }: { lang?: string; code: string; streaming?: boolean }) {
   const [copied, setCopied] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout>>();
   useEffect(() => () => clearTimeout(timer.current), []);
+
+  const preview = useMemo(() => computeCodeBlockPreview(code), [code]);
+  const isCollapsed = preview.isBig && !expanded;
+  const displayedCode = isCollapsed ? preview.previewText : code;
+
   const copy = () => {
     navigator.clipboard?.writeText(code).then(() => {
       setCopied(true);
@@ -74,6 +235,45 @@ function CodeBlock({ lang, code }: { lang?: string; code: string }) {
       timer.current = setTimeout(() => setCopied(false), 1200);
     });
   };
+
+  if (preview.isBig) {
+    return (
+      <div className={`code-block code-block-large${isCollapsed ? " collapsed" : ""}`}>
+        <div className="code-block-header">
+          <span className="code-block-meta">
+            {lang ? lang.toUpperCase() : "TEXT"} · {preview.lineCount} lines{streaming ? " · streaming…" : ""}
+          </span>
+          <button
+            type="button"
+            className="code-block-copy"
+            aria-label={copied ? "Copied code to clipboard" : "Copy full code to clipboard"}
+            onClick={copy}
+          >
+            {copied ? "Copied" : "Copy"}
+          </button>
+        </div>
+        <div className="code-block-body">
+          <pre>
+            <code>{displayedCode}</code>
+          </pre>
+          {isCollapsed && <div className="code-block-fade" aria-hidden="true" />}
+        </div>
+        <button
+          type="button"
+          className="code-block-more-btn"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((v) => !v)}
+        >
+          {isCollapsed
+            ? preview.hiddenLines > 0
+              ? `See more (${preview.hiddenLines} more lines)`
+              : "See more"
+            : "Show less"}
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="code-block">
       {lang && <span className="lang">{lang}</span>}

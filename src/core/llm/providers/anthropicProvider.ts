@@ -162,7 +162,7 @@ export class AnthropicProvider implements LLMProvider {
         body: JSON.stringify(body),
         signal,
       },
-      { retries: 2, signal }
+      { retries: 2, timeoutMs: 60_000, signal }
     );
     if (!res.ok || !res.body) {
       const detail = await res.text().catch(() => "");
@@ -175,7 +175,7 @@ export class AnthropicProvider implements LLMProvider {
     let outputTokens = 0;
     let cachedTokens = 0;
 
-    for await (const payload of streamSse(res.body, signal)) {
+    for await (const payload of streamSse(res.body, signal, 90_000)) {
       const json = tryJson<{
         type?: string;
         error?: { type?: string; message?: string };

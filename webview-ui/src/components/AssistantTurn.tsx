@@ -4,7 +4,14 @@ import type { Actions } from "../state/store";
 import { Markdown } from "./Markdown";
 import { TurnProcess } from "./TurnProcess";
 import { AttachmentThumb, MessageActions, NoticeBubble, CheckpointPill, hasVisibleText } from "./Message";
-import { ClaudeThinkingIndicator } from "./StatusIndicator";
+import { ClaudeThinkingIndicator, getClaudeThinkingLabel } from "./StatusIndicator";
+
+export function shouldShowTurnThinking(opts: {
+  turnActive: boolean;
+  activeHasRunningTool: boolean;
+}): boolean {
+  return opts.turnActive && !opts.activeHasRunningTool;
+}
 
 /**
  * Renders an entire assistant turn (which may span multiple agentic steps,
@@ -17,10 +24,16 @@ export const AssistantTurn = memo(function AssistantTurn({
   messages,
   pendingApproval,
   actions,
+  isWorking,
+  status,
+  statusDetail,
 }: {
   messages: ChatMessage[];
   pendingApproval?: ToolCall | null;
   actions?: Actions;
+  isWorking?: boolean;
+  status?: string;
+  statusDetail?: string | null;
 }) {
   const allAttachments: Attachment[] = [];
   const notices: string[] = [];
@@ -38,7 +51,18 @@ export const AssistantTurn = memo(function AssistantTurn({
     if (hasVisibleText(m.notice)) notices.push(m.notice!);
   }
 
-  const showThinking = isStreaming && !hasContent && !hasTools;
+  const turnActive = isStreaming || Boolean(isWorking);
+  const activeStreamMsg = [...messages].reverse().find((m) => m.streaming === true);
+  const activeHasContent = activeStreamMsg ? hasVisibleText(activeStreamMsg.content) : false;
+  const activeHasThinking = activeStreamMsg ? hasVisibleText(activeStreamMsg.thinking) : hasThinking;
+  const activeHasRunningTool = activeStreamMsg?.toolCalls?.some((c) => c.status === "running") ?? false;
+  const showThinking = shouldShowTurnThinking({ turnActive, activeHasRunningTool });
+  const thinkingLabel = getClaudeThinkingLabel(
+    statusDetail,
+    status,
+    isStreaming && !activeHasThinking,
+    activeHasThinking
+  );
 
   // Nothing to paint at all
   if (
@@ -73,8 +97,8 @@ export const AssistantTurn = memo(function AssistantTurn({
         messages={messages}
         pendingApproval={pendingApproval}
         actions={actions}
-        isStreaming={isStreaming}
-        hasContent={hasContent}
+        isStreaming={turnActive}
+        hasContent={turnActive ? activeHasContent : hasContent}
       />
 
       {/* Actual answer content */}
@@ -89,7 +113,7 @@ export const AssistantTurn = memo(function AssistantTurn({
 
       {showThinking && (
         <div className="msg-body">
-          <ClaudeThinkingIndicator label={hasThinking ? "Thinking..." : "Generating..."} />
+          <ClaudeThinkingIndicator label={thinkingLabel} />
         </div>
       )}
 
@@ -110,7 +134,7 @@ export const AssistantTurn = memo(function AssistantTurn({
         );
       })()}
 
-      {!isStreaming && hasContent && (
+      {!turnActive && hasContent && (
         <MessageActions content={fullContent} isUser={false} />
       )}
     </div>

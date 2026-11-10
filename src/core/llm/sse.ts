@@ -55,17 +55,22 @@ export async function* streamSse(
   let buffer = "";
   let dataLines: string[] = [];
   let totalBytes = 0;
+  let doneTerminated = false;
 
   const dispatch = function* (): Generator<string> {
     if (dataLines.length === 0) return;
     const payload = dataLines.join("\n");
     dataLines = [];
-    if (!payload || payload === "[DONE]") return;
+    if (!payload) return;
+    if (payload === "[DONE]") {
+      doneTerminated = true;
+      return;
+    }
     yield payload;
   };
 
   try {
-    while (true) {
+    while (!doneTerminated) {
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
       if (maxDurationMs && Date.now() - startTime > maxDurationMs) {
         throw new Error(`Stream exceeded maximum duration limit of ${Math.round(maxDurationMs / 1000)}s.`);
@@ -110,9 +115,15 @@ export async function* streamSse(
         if (line.startsWith("data:")) {
           // Strip exactly one optional leading space per the SSE specification
           const rest = line.slice(5);
-          dataLines.push(rest.startsWith(" ") ? rest.slice(1) : rest);
+          const value = rest.startsWith(" ") ? rest.slice(1) : rest;
+          if (dataLines.length === 0 && value === "[DONE]") {
+            doneTerminated = true;
+            break;
+          }
+          dataLines.push(value);
         } else if (line.trim() === "") {
           yield* dispatch();
+          if (doneTerminated) break;
         }
         // Lines starting with event:, id:, retry: are metadata; ignored for chat payload
       }
@@ -122,7 +133,7 @@ export async function* streamSse(
     buffer += decoder.decode();
 
     // Flush any residual buffer line not terminated by a newline
-    if (buffer.trim()) {
+    if (!doneTerminated && buffer.trim()) {
       const line = buffer.replace(/\r$/, "");
       if (line.startsWith("data:")) {
         const rest = line.slice(5);
@@ -131,7 +142,7 @@ export async function* streamSse(
     }
 
     // Flush any final event not terminated by a blank line
-    yield* dispatch();
+    if (!doneTerminated) yield* dispatch();
   } finally {
     try {
       await reader.cancel();

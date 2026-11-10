@@ -194,7 +194,7 @@ export function computeSummary(
   const runningTool = toolCalls.find((c) => c.status === "running");
   const timeStr = totalThinkingMs > 0 ? `Thought for ${formatElapsed(totalThinkingMs)}` : "";
 
-  if (isStreaming && !hasContent) {
+  if (isStreaming && (runningTool || !hasContent)) {
     if (runningTool) {
       const doneCount = toolCalls.filter((c) => c.status === "done").length;
       const isVerifying = runningTool.name === "get_diagnostics";

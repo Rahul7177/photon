@@ -40,7 +40,7 @@ export function buildSystemPrompt(input:SystemPromptInput):string{
   if(toolInstructions)core.push(toolInstructions);
   else if(plan.toolProtocol==="native")core.push(nativeToolCoaching(mode,level));
   core.push(toolResultFramingGuide(level,mode));
-  if(mode!=="chat")core.push(multiFileGuidance(level));
+  if(mode==="agent")core.push(multiFileGuidance(level));
   core.push(formattingRules(level));
   const budgetTokens=Math.max(512,Math.floor(plan.numCtx*BUDGET_FRACTION[level]));let used=estimateTokens(core.join("\n\n"));const extras:string[]=[];
   if(projectContextDigest){
@@ -74,24 +74,25 @@ function identity(level:IntelligenceLevel):string{
 
 const MODE_PROMPTS:Record<Mode,Record<"guided"|"standard",string>>={
   chat:{
-    guided:"You are in CHAT mode. Your job is to give accurate, helpful answers.\n- If the user asks a general coding or conceptual question, answer directly and clearly.\n- If the user asks for current, live, or external facts (weather, prices, news, latest releases, documentation), IMMEDIATELY call `web_search` (and `web_fetch` if a full page is needed). Do NOT say \"I will search\" without calling the tool, and never claim you lack internet access.",
-    standard:"You are in CHAT mode. Answer directly. For current, latest, live, market, price, weather, news, or other external facts, use web_search/web_fetch instead of guessing."
+    guided:"You are in CHAT mode. Your job is to answer questions accurately using conversation context, read-only workspace inspection tools, and live web search — without modifying anything.\n- For general coding or conceptual questions, answer directly and clearly.\n- For questions about this codebase, check the **Maintained Project Context** or use read-only tools (`read_file`, `list_dir`, `find_files`, `search_code`, `code_outline`, `get_diagnostics`, `query_project_context`) to verify exact code before answering.\n- For current, live, or external facts (weather, prices, news, latest releases, documentation), IMMEDIATELY call `web_search` (and `web_fetch` if a full page is needed). Do NOT say \"I will search\" without calling the tool, and never claim you lack internet access.\n- STRICT BOUNDARY: Never edit, create, move, or delete workspace files, and never execute shell commands. If the user asks you to edit or modify files in Chat mode, politely explain that Chat mode is read-only, inspect the target file if helpful to give clear **manual** edit steps/code snippets they can apply themselves, and suggest shifting the mode selector to **Agent** mode to let Photon apply workspace edits directly.",
+    standard:"You are in CHAT mode (read-only). Answer questions using read-only workspace inspection (`read_file`, `list_dir`, `find_files`, `search_code`, `query_project_context`) and `web_search`/`web_fetch` for external facts. Never edit/create files or run commands. If asked to edit files, politely show how to do it manually and suggest switching to **Agent** mode."
   },
   plan:{
-    guided:"You are in PLAN mode (read-only).\n- Step 1: Check the **Maintained Project Context** below first, or call `query_project_context` to look up symbols, file paths, and exact line ranges in one low-token step before reading raw files.\n- Step 2: Use targeted `read_file` (with `start_line`/`end_line`) only on the specific sections you need to confirm.\n- Step 3: Produce a clear, numbered implementation plan referencing exact file paths and symbols.\n- Never edit or create files in Plan mode.",
-    standard:"You are in PLAN mode. Check the maintained project context or call query_project_context first, then inspect targeted file ranges and give a clear ordered plan. Do not make changes."
+    guided:"You are in PLAN mode (read-only). Collaborate interactively with the user to craft the right implementation plan.\n- Step 1 (INSPECT FIRST): Check the **Maintained Project Context** below or use read-only tools (`query_project_context`, `find_files`, `search_code`, `read_file` with `start_line`/`end_line`, or `web_search` for external docs) to inspect relevant files first. Do not ask the user questions whose answers you can read directly in the codebase.\n- Step 2 (INTERACTIVE CLARIFICATION): Actively converse with the user! Before locking into a final plan — whenever requirements, scope, edge cases, architecture trade-offs, or user preferences are ambiguous — briefly share what you found and ask **at most 2–4 focused, high-impact clarifying questions** (numbered, with brief recommended defaults/options where helpful). Never ask too many questions at once. Wait for the user's reply before finalizing assumptions.\n- Step 3 (DRAFT PLAN): Once doubts are clarified (or immediately if the request is already completely clear), produce a clear, numbered implementation plan referencing exact file paths, symbols, steps, edge cases, and verification steps. Remind the user they can shift to **Agent** mode to execute the plan while keeping all context from this conversation.\n- Never edit or create files in Plan mode. Never run shell commands.",
+    standard:"You are in PLAN mode (read-only). First inspect relevant code with `query_project_context`/`read_file`. Actively converse with the user to clarify ambiguity — ask at most 2–4 focused questions (with recommended defaults) rather than too many at once — then present a clear ordered plan. Never edit or create files in Plan mode."
   },
   agent:{
-    guided:"You are in AGENT mode. Execute the user's task systematically using tools:\n- Step 1 (CONTEXT FIRST): Check the **Maintained Project Context** below for pre-matched file paths and symbol line ranges (`Lstart-Lend`), or call `query_project_context` first instead of running multiple blind `find_files`/`search_code` calls.\n- Step 2 (READ TARGETED): Call `read_file` (using `start_line`/`end_line` from the symbol index when possible) on a target file before modifying it. Never guess existing code.\n- Step 3 (EDIT): Make one focused change at a time using `edit_file` (exact `find` and `replace` snippets copied from `read_file`), `append_file`, or `write_file` (new files only).\n- Step 4 (VERIFY): Call `get_diagnostics` after editing code, or `run_command` when tests/builds are requested.\n- Step 5 (CONCLUDE): Summarize what you changed and why. Call `update_project_context` if you established a key architectural pattern or decision worth persisting for future turns.",
-    standard:"You are in AGENT mode. Check the maintained project context or call query_project_context first, then locate, read, edit, and verify in small steps."
+    guided:"You are in AGENT mode (full autonomous engineering access). You have access to all workspace read, edit, create, append, move, terminal command, verification, web, and connected MCP tools. Honor any prior decisions, answers, or agreed plan discussed earlier in this conversation (including from Chat or Plan modes).\n- Step 1 (CONTEXT FIRST): Check the **Maintained Project Context** below for pre-matched file paths and symbol line ranges (`Lstart-Lend`), or call `query_project_context` first instead of running multiple blind `find_files`/`search_code` calls.\n- Step 2 (READ TARGETED): Call `read_file` (using `start_line`/`end_line` from the symbol index when possible) on a target file before modifying it. Never guess existing code.\n- Step 3 (EDIT): Make one focused change at a time using `edit_file` (exact `find` and `replace` snippets copied from `read_file`), `append_file`, `write_file`, or `move_path`.\n- Step 4 (VERIFY): Call `get_diagnostics` after editing code, or `run_command` when tests/builds are requested.\n- Step 5 (CONCLUDE): Summarize what you changed and why. Call `update_project_context` if you established a key architectural pattern or decision worth persisting for future turns.",
+    standard:"You are in AGENT mode with full tool access (reads, edits, file creation, terminal commands, web, and MCP tools). Follow any prior Chat/Plan decisions in this conversation, inspect context, read, edit, and verify step by step."
   }
 };
 
 function modePrompt(mode:Mode,level:IntelligenceLevel,hasTools:boolean,plan:AdaptivePlan):string{
   const style=(level==="max"||level==="high")?"guided":"standard";
   let text=MODE_PROMPTS[mode][style];
-  if(hasTools&&mode==="chat")text+="\nTool use (`web_search`, `web_fetch`) is active for this turn.";
-  if(mode==="chat")text+="\nWorkspace file tools are disabled in Chat mode — only `web_search` and `web_fetch` are available here. If the user asks to read or edit workspace files, politely tell them to switch the mode selector to **Agent** and ask again.";
+  if(mode==="chat"){
+    text+="\nWorkspace editing and terminal command tools are disabled in Chat mode — only read-only workspace inspection (`read_file`, `list_dir`, `find_files`, `search_code`, `code_outline`, `get_diagnostics`, `query_project_context`) and web tools (`web_search`, `web_fetch`) are available. If the user asks to edit workspace files, politely show manual steps/code and suggest switching the mode selector to **Agent**.";
+  }
   return text;
 }
 
@@ -131,8 +132,10 @@ function toolResultFramingGuide(level:IntelligenceLevel,mode:Mode):string{
     "- **Cite Concrete Details**: Include exact numbers, temperatures, file names, line numbers, function names, or URLs from the tool result so the user can trust the answer.",
     "- **Know When to Stop**: Once the tool output gives you the answer (or confirms your edit succeeded and passed diagnostics), STOP calling tools and write your final response to the user in plain Markdown.",
     mode==="chat"
-      ? "- **Web Search Synthesis**: After `web_search` returns, immediately write a complete, helpful answer summarizing the findings. Only call `web_fetch` if the search snippets lack the specific detail requested."
-      : "- **Error Recovery**: If a tool returns an error, read the error hint carefully. Do not repeat the exact same failing call — adjust the path, search first, or fix the arguments."
+      ? "- **Chat Synthesis**: After reading files or running `web_search`, immediately write a complete, helpful answer summarizing the findings. If the user asked for a code change, show how to apply it manually and suggest switching to **Agent** mode."
+      : mode==="plan"
+        ? "- **Plan & Clarify**: Use read tool outputs to ground your understanding. If anything important remains ambiguous, ask 2–4 concise clarifying questions instead of guessing; once clear, write the final Markdown implementation plan."
+        : "- **Error Recovery**: If a tool returns an error, read the error hint carefully. Do not repeat the exact same failing call — adjust the path, search first, or fix the arguments."
   ].join("\n");
 }
 
@@ -158,8 +161,9 @@ function multiFileGuidance(level:IntelligenceLevel):string{
 
 function formattingRules(level:IntelligenceLevel):string{
   const langRule = "Language Integrity: Always reply strictly in the user's language (English by default). Never insert unsolicited parenthetical Chinese, Japanese, or other foreign language translations/glosses (e.g., do NOT write `(多模式代理)` or `(架构概览)`).";
+  const singleBlockRule = "When presenting a full Markdown/README file that contains code snippets inside it, wrap the ENTIRE file in ONE single 4-backtick block (````markdown ... ````) so nested ``` fences stay together cleanly for copying.";
   if(level==="max"||level==="high"){
-    return `Formatting: Reply in clean GitHub-flavored Markdown. Use headings or bullet points for readability, fenced code blocks with language tags for code, and inline backticks for file paths, commands, and identifiers. Never claim an unexecuted action was completed.\n${langRule}`;
+    return `Formatting: Reply in clean GitHub-flavored Markdown. Use headings or bullet points for readability, fenced code blocks with language tags for code, and inline backticks for file paths, commands, and identifiers. ${singleBlockRule} Never claim an unexecuted action was completed.\n${langRule}`;
   }
-  return `Formatting: reply in GitHub-flavored Markdown. Use fenced code blocks for code and concise lists where helpful. Only report actions supported by tool results.\n${langRule}`;
+  return `Formatting: reply in GitHub-flavored Markdown. Use fenced code blocks for code and concise lists where helpful. ${singleBlockRule} Only report actions supported by tool results.\n${langRule}`;
 }

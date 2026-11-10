@@ -12,7 +12,18 @@ const TIER_ORDER: Record<IntelligenceLevel, number> = {
   max: 4,
 };
 
-const ALLOWED_CHAT_TOOLS = new Set(["web_search", "web_fetch", "query_project_context"]);
+const ALLOWED_CHAT_TOOLS = new Set([
+  "read_file",
+  "list_dir",
+  "find_files",
+  "search_code",
+  "code_outline",
+  "get_diagnostics",
+  "query_project_context",
+  "web_search",
+  "web_fetch",
+  "think",
+]);
 const MAX_TOOL_OUTPUT_CHARS = 100_000;
 
 function validateCallStructure(call: ToolCall): { valid: boolean; error?: string } {
@@ -226,7 +237,7 @@ export class ToolPipeline {
       };
     }
 
-    if (ctx.mode === "chat" && !ALLOWED_CHAT_TOOLS.has(call.name)) {
+    if (ctx.mode === "chat" && (isSideEffecting || !ALLOWED_CHAT_TOOLS.has(call.name))) {
       return {
         ok: false,
         status: "permission_denied",

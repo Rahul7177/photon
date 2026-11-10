@@ -228,7 +228,7 @@ export class OpenAICompatProvider implements LLMProvider {
         body: JSON.stringify(body),
         signal,
       },
-      { retries: 2, signal }
+      { retries: 2, timeoutMs: 60_000, signal }
     );
     if (!res.ok || !res.body) {
       const detail = await res.text().catch(() => "");
@@ -241,8 +241,18 @@ export class OpenAICompatProvider implements LLMProvider {
     let cachedTokens = 0;
     const pendingCalls = new Map<number, { id: string; name: string; args: string }>();
     const nextIndex = () => (pendingCalls.size ? Math.max(...pendingCalls.keys()) + 1 : 0);
+    const resolveCallIndex = (tc: { index?: number; id?: string }): number => {
+      if (typeof tc.index === "number") return tc.index;
+      if (tc.id) {
+        for (const [k, v] of pendingCalls.entries()) {
+          if (v.id === tc.id) return k;
+        }
+        return nextIndex();
+      }
+      return pendingCalls.size ? Math.max(...pendingCalls.keys()) : 0;
+    };
 
-    for await (const payload of streamSse(res.body, signal, this.idleTimeoutMs)) {
+    for await (const payload of streamSse(res.body, signal, this.idleTimeoutMs ?? 90_000)) {
       const json = tryJson<{
         usage?: {
           prompt_tokens?: number;
@@ -287,7 +297,7 @@ export class OpenAICompatProvider implements LLMProvider {
         yield { message: { role: "assistant", content: "", thinking: reasoning }, done: false };
       }
       for (const tc of choice?.delta?.tool_calls ?? []) {
-        const idx = tc.index ?? nextIndex();
+        const idx = resolveCallIndex(tc);
         const cur = pendingCalls.get(idx) ?? { id: "", name: "", args: "" };
         if (tc.id) cur.id = tc.id;
         if (tc.function?.name) cur.name += tc.function.name;

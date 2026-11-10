@@ -74,18 +74,22 @@ export function MessageList({
     if (!nearBottom.current) return;
     // "auto" (not smooth) so rapid streaming deltas don't queue animations.
     endRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
-  }, [state.messages, state.pendingApproval]);
+  }, [state.messages, state.pendingApproval, state.status]);
 
   return (
     <div className="messages" ref={containerRef}>
-      {turnGroups.map((g) => {
+      {turnGroups.map((g, idx) => {
         if (g.kind === "assistant") {
+          const isWorking = state.status === "thinking" || state.status === "running";
           return (
             <AssistantTurn
               key={g.id}
               messages={g.messages}
               pendingApproval={state.pendingApproval}
               actions={actions}
+              isWorking={isWorking && idx === turnGroups.length - 1}
+              status={state.status}
+              statusDetail={state.statusDetail}
             />
           );
         }
@@ -102,8 +106,8 @@ export function MessageList({
       {/* Claude Code-style live thinking indicator when turn is active before assistant chunks */}
       {(() => {
         const isWorking = state.status === "thinking" || state.status === "running";
-        const lastMsg = state.messages[state.messages.length - 1];
-        if (isWorking && lastMsg && lastMsg.role === "user") {
+        const lastGroup = turnGroups[turnGroups.length - 1];
+        if (isWorking && (!lastGroup || lastGroup.kind !== "assistant")) {
           return (
             <div className="msg assistant">
               <div className="msg-body">

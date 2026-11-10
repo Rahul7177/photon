@@ -46,7 +46,7 @@ describe("System Prompt Assembly & Language Integrity", () => {
       assert.ok(!prompt.includes("structured cognitive workflow"));
     });
 
-    it("configures Chat mode with web tools guidance and disables workspace file edits", () => {
+    it("configures Chat mode with read-only & web tools guidance and disables workspace file edits", () => {
       const prompt = buildSystemPrompt({
         mode: "chat",
         plan: { ...basePlan, mode: "chat" },
@@ -55,11 +55,13 @@ describe("System Prompt Assembly & Language Integrity", () => {
       });
 
       assert.ok(prompt.includes("You are in CHAT mode."));
-      assert.ok(prompt.includes("Workspace file tools are disabled in Chat mode"));
+      assert.ok(prompt.includes("Workspace editing and terminal command tools are disabled in Chat mode"));
+      assert.ok(prompt.includes("read_file"));
       assert.ok(prompt.includes("web_search"));
+      assert.ok(prompt.includes("Agent"));
     });
 
-    it("configures Plan mode as read-only investigation and forbids edits", () => {
+    it("configures Plan mode as interactive read-only investigation and forbids edits", () => {
       const prompt = buildSystemPrompt({
         mode: "plan",
         plan: { ...basePlan, mode: "plan" },
@@ -69,6 +71,7 @@ describe("System Prompt Assembly & Language Integrity", () => {
 
       assert.ok(prompt.includes("You are in PLAN mode (read-only)."));
       assert.ok(prompt.includes("Never edit or create files in Plan mode."));
+      assert.ok(!prompt.includes("Apply minimal, accurate changes with `edit_file`"));
     });
 
     it("injects fresh info directive when freshInfoRequest is set", () => {

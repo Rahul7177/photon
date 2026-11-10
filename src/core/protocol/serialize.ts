@@ -53,12 +53,18 @@ export function renderToolInstructions(
     "7. CRITICAL — Web & current info: If the user asks about anything that changes over time (latest",
     "   versions, news, prices, weather, current events, recent releases, live data), you MUST call",
     "   web_search FIRST. Never answer these from memory — your training data is outdated. Call the tool.",
-    "8. CRITICAL — File edits: Before changing an existing file, call read_file first.",
-    "   For ADD/APPEND requests use append_file(path, content) — it preserves all old content.",
-    "   append_file requires EXACTLY two arguments: path and content. Never omit either one.",
-    "   Example: TOOL_NAME: append_file, BEGIN_ARG: path, temp.md, END_ARG, BEGIN_ARG: content, your text, END_ARG.",
-    "   For targeted updates use edit_file with old_str copied from read_file and new_str.",
-    "   write_file is CREATE-ONLY. Never use it on an existing file.",
+    ...(plan.mode === "agent"
+      ? [
+          "8. CRITICAL — File edits: Before changing an existing file, call read_file first.",
+          "   For ADD/APPEND requests use append_file(path, content) — it preserves all old content.",
+          "   append_file requires EXACTLY two arguments: path and content. Never omit either one.",
+          "   Example: TOOL_NAME: append_file, BEGIN_ARG: path, temp.md, END_ARG, BEGIN_ARG: content, your text, END_ARG.",
+          "   For targeted updates use edit_file with old_str copied from read_file and new_str.",
+          "   write_file is CREATE-ONLY. Never use it on an existing file.",
+        ]
+      : [
+          `8. CRITICAL — Read-Only Mode (${plan.mode}): NEVER invoke file-editing, file-writing, move, or shell command tools — they are disabled in ${plan.mode} mode.`,
+        ]),
   ].join("\n");
 }
 

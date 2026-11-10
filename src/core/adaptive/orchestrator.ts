@@ -3,8 +3,8 @@ import { analyzeTask, buildExecutionPolicy, buildVerificationPlan, capabilityFor
 
 export interface OrchestratorInput{model:ModelInfo;machine:MachineProfile|null;mode:Mode;prompt?:string;userNumCtx?:number;intelligence:IntelligenceSetting;reserveOutputTokens:number;adaptiveEnabled:boolean;cloudNativeTools?:boolean;task?:TaskAnalysis;bench?:BenchResult;}
 interface LevelProfile{maxTools:number;allowParallelTools:boolean;outputCap:number;chatTemp:number;taskTemp:number;}
-// Spec §5 hard caps: Ask 6, Plan 10, Agent 25
-const MODE_CAPS:Record<Mode,number>={chat:6,plan:10,agent:25};
+// High non-blocking safety ceilings so complex tasks finish naturally; duplicate-call and runaway guards prevent spin loops.
+const MODE_CAPS:Record<Mode,number>={chat:100,plan:150,agent:200};
 /**
  * Adaptive Scaffolding Profiles (Inverse Scaffolding Philosophy):
  * All intelligence levels grant access to the full tool suite (no artificial tool
@@ -18,10 +18,10 @@ const MODE_CAPS:Record<Mode,number>={chat:6,plan:10,agent:25};
  *  - `low`: Minimal/Autonomous overhead for large self-sufficient models.
  */
 const LEVELS:Record<IntelligenceLevel,LevelProfile>={
-  low:{maxTools:18,allowParallelTools:false,outputCap:2048,chatTemp:.25,taskTemp:.15},
-  medium:{maxTools:18,allowParallelTools:false,outputCap:3072,chatTemp:.25,taskTemp:.15},
-  high:{maxTools:18,allowParallelTools:false,outputCap:4096,chatTemp:.2,taskTemp:.1},
-  max:{maxTools:18,allowParallelTools:false,outputCap:4096,chatTemp:.15,taskTemp:.1},
+  low:{maxTools:40,allowParallelTools:false,outputCap:2048,chatTemp:.25,taskTemp:.15},
+  medium:{maxTools:40,allowParallelTools:false,outputCap:3072,chatTemp:.25,taskTemp:.15},
+  high:{maxTools:40,allowParallelTools:false,outputCap:4096,chatTemp:.2,taskTemp:.1},
+  max:{maxTools:40,allowParallelTools:false,outputCap:4096,chatTemp:.15,taskTemp:.1},
 };
 const TIER_RANK:Record<ModelTier,number>={tiny:0,small:1,medium:2,large:3};
 

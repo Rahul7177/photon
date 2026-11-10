@@ -269,14 +269,14 @@ export function fitToWindow(
   }
   const newestIndex = working.length - 1;
 
-  // Priority 1: Clamp oversized intermediate tool results
+  // Priority 1: Clamp oversized intermediate tool results (both native role:"tool" and photon-block <tool_result> wrappers)
   let currentConvTokens = working.reduce((s, m) => s + tokensOf(m, model), 0);
   const maxChars = options.maxIntermediateToolChars ?? 2400;
 
   if (currentConvTokens > available) {
     for (let i = 0; i < working.length; i++) {
       const m = working[i];
-      if (m.role === "tool") {
+      if (isToolOutputMessage(m)) {
         const isOldTurn = activeUserIndex >= 0 && i < activeUserIndex;
         const threshold = isOldTurn ? maxChars : maxChars * 2;
         if (m.content.length > threshold) {
@@ -295,7 +295,7 @@ export function fitToWindow(
 
   // Protect trailing active turn messages (active assistant tool calls and trailing tool responses)
   for (let i = working.length - 1; i >= Math.max(0, activeUserIndex); i--) {
-    if (working[i].role === "tool" || working[i].tool_calls) {
+    if (isToolOutputMessage(working[i]) || working[i].tool_calls) {
       protectedIndices.add(i);
     } else if (i !== newestIndex && working[i].role === "user") {
       break;
@@ -328,7 +328,7 @@ export function fitToWindow(
   if (currentConvTokens > available) {
     for (const [, msg] of keptMap.entries()) {
       if (currentConvTokens <= available) break;
-      if (msg.role === "tool" && msg.content.length > 800) {
+      if (isToolOutputMessage(msg) && msg.content.length > 800) {
         const oldT = tokensOf(msg, model);
         msg.content = clampStructuredToolResult(msg.content, 800);
         const newT = tokensOf(msg, model);
@@ -362,4 +362,16 @@ export function fitToWindow(
     droppedCount,
     usage,
   };
+}
+
+function isToolOutputMessage(m: LLMMessage): boolean {
+  if (m.role === "tool") return true;
+  if (m.role !== "user") return false;
+  const trimmed = (m.content ?? "").trimStart();
+  return (
+    trimmed.startsWith("<tool_result") ||
+    trimmed.startsWith("<photon:result") ||
+    trimmed.startsWith("[TOOL_RESULT") ||
+    trimmed.startsWith("[tool:")
+  );
 }

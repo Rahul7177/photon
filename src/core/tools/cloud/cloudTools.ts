@@ -38,14 +38,19 @@ export function getCloudToolPolicy(): CloudToolPolicy {
 }
 
 /**
- * Request-aware tool surface: greetings get no tools, pure external-info
- * requests get web tools first, agent/plan modes get mode-appropriate tools.
+ * Request-aware tool surface: standalone opening greetings get no tools,
+ * ongoing turns retain full mode-appropriate context & tools, external-info
+ * requests in chat mode get web tools, and plan/agent modes get mode-appropriate tools.
  */
-export function classifyCloudToolPolicy(mode: unknown, text: string): CloudToolPolicy {
+export function classifyCloudToolPolicy(mode: unknown, text: string, hasHistory = false): CloudToolPolicy {
   const t = text.trim().toLowerCase();
   if (!t) return "all";
+  // Only strip tools/mode prompt on standalone opening greetings in a fresh turn.
+  // Confirmations like "ok" / "great" or replies in ongoing Plan/Agent/Chat threads
+  // MUST retain mode context and tools.
   if (
-    /^(hi|hello|hey|hiya|yo|thanks|thank you|thx|ok|okay|great|cool|nice|good morning|good afternoon|good evening)[\s,!.?]*$/i.test(
+    !hasHistory &&
+    /^(hi|hello|hey|hiya|yo|good morning|good afternoon|good evening|thanks|thank you|thx)[\s,!.?]*$/i.test(
       t
     )
   ) {
@@ -178,6 +183,7 @@ export const cloudExecuteCommand: Tool = {
       { name: "timeout_ms", type: "number", required: false, description: "Optional timeout in ms (default 180000, max 600000)." },
     ],
     sideEffecting: true,
+    risk: "execute",
     priority: 4,
     tags: ["exec", "write"],
   },

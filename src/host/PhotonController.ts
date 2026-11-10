@@ -36,7 +36,7 @@ import { builtinTools } from "../core/tools/builtin";
 import { McpManager, type McpServerConfig } from "../core/tools/mcp/bridge";
 import { AgentEngine, type TurnEmitter } from "../core/agent/engine";
 import { runCloudTurn, cloudHistoryFromSession } from "../core/agent/cloudEngine";
-import { cloudTools } from "../core/tools/cloud/cloudTools";
+import { cloudTools, classifyCloudToolPolicy, getCloudToolPolicy, setCloudToolPolicy } from "../core/tools/cloud/cloudTools";
 import { buildCloudSystemPrompt } from "../core/prompts/cloudSystem";
 import { buildWorkspaceMap } from "../core/tools/workspaceMap";
 import { compactSessionMessages, shouldAutoCompact } from "../core/agent/compactor";
@@ -73,7 +73,6 @@ import { CheckpointCoordinator } from "./checkpointCoordinator";
 import { McpCoordinator } from "./mcpCoordinator";
 import { ProviderService } from "./providerService";
 import { TurnCoordinator } from "./turnCoordinator";
-import { getCloudToolPolicy, setCloudToolPolicy } from "../core/tools/cloud/cloudTools";
 
 const DEFAULT_EMBEDDING_MODEL = "nomic-embed-text";
 
@@ -969,6 +968,9 @@ export class PhotonController {
         this.session.mode = msg.payload.mode;
         this.recomputePlan();
         this.pushPlan();
+        if (this.session.messages.length > 0) {
+          void this.persistActiveSession(this.session);
+        }
         return;
       case "setContextWindow":
         this.userNumCtx = msg.payload.numCtx || undefined;
@@ -1349,6 +1351,7 @@ export class PhotonController {
 
   /** Abort the in-flight turn and release any awaited approval promises. */
   private cancelActiveTurn(): void {
+    this.turnCoord.clearQueue();
     this.turnCoord.abortTurn();
     // Resolve any pending approval prompts as "denied" so the tool call that is
     // awaiting them unwinds instead of hanging forever.
@@ -1358,6 +1361,8 @@ export class PhotonController {
     } else {
       this.checkpointCoord.cancelTurn();
     }
+    this.safePost({ type: "status", payload: { kind: "idle" } });
+    this.safePost({ type: "generationStats", payload: null });
   }
 
   private async onPrompt(text: string, attachments?: Attachment[]): Promise<void> {
@@ -1522,6 +1527,7 @@ export class PhotonController {
     } catch (e) {
       this.safePost({ type: "error", payload: { message: (e as Error).message } });
     } finally {
+      this.turnCoord.finishTurn(signal);
       this.safePost({ type: "status", payload: { kind: "idle" } });
       this.safePost({ type: "generationStats", payload: null });
       // Finalize messages left mid-stream by an abort/error: without this a
@@ -1529,7 +1535,9 @@ export class PhotonController {
       // before any content arrived would linger forever.
       let touched = finalizeTurnMessages(session);
       if (this.ctxMgr) {
-        const lastUserMsg = [...session.messages].reverse().find((m) => m.role === "user");
+        const lastUserMsg = [...session.messages]
+          .reverse()
+          .find((m) => m.role === "user" && !m.hidden && !m.content.trimStart().startsWith("<tool_result"));
         const lastAsstMsg = [...session.messages].reverse().find((m) => m.role === "assistant" && m.content.trim());
         const toolsUsed: { name: string; args: Record<string, unknown>; ok: boolean }[] = [];
         for (const m of session.messages) {
@@ -1742,6 +1750,18 @@ export class PhotonController {
         if (!isLive()) return;
         this.safePost({ type: "messageDelta", payload: { id, delta } });
       },
+      onThinkingDelta: (id, delta) => {
+        const m = ensure(id);
+        m.thinking = (m.thinking ?? "") + delta;
+        if (!isLive()) return;
+        this.safePost({ type: "thinkingDelta", payload: { id, delta } });
+      },
+      onThinkingEnd: (id, elapsedMs) => {
+        const m = ensure(id);
+        m.thinkingElapsedMs = elapsedMs;
+        if (!isLive()) return;
+        this.safePost({ type: "thinkingDone", payload: { id, elapsedMs } });
+      },
       onContent: (id, content) => {
         const m = ensure(id);
         m.content = content;
@@ -1823,12 +1843,12 @@ export class PhotonController {
   /* ------------------------------ cloud mode ------------------------------ */
 
   /** A permissive plan for cloud models: the model's own context window,
-   *  native tool calling, no tool caps, but enforcing mode-governed step caps. */
+   *  native tool calling, no tool caps, and generous mode-governed loop ceilings. */
   private cloudPlan(model: ModelInfo, mode: Mode, prompt?: string): AdaptivePlan {
     const contextWindow = model.contextLength ?? 128_000;
     const task = analyzeTask(prompt ?? "", mode);
-    const MODE_CAPS: Record<Mode, number> = { chat: 6, plan: 10, agent: 25 };
-    const hardCap = MODE_CAPS[mode] ?? 25;
+    const MODE_CAPS: Record<Mode, number> = { chat: 100, plan: 150, agent: 200 };
+    const hardCap = MODE_CAPS[mode] ?? 200;
     const capabilities = capabilityForModel(model);
     const policy = buildExecutionPolicy(task, capabilities, hardCap, 100);
     return {
@@ -1866,12 +1886,17 @@ export class PhotonController {
     const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     emitter.onPhase("thinking", "Retrieving project context");
     const workspaceMap = await buildWorkspaceMap(root).catch(() => undefined);
-    // Classify tool policy here too so the system prompt matches the actual
-    // tool surface. The unifiedRuntime monkey-patch also sets it, but the
-    // system prompt is built before that patch runs.
-    const lastUserMsg = [...session.messages].reverse().find((m) => m.role === "user");
+    const lastUserMsg = [...session.messages]
+      .reverse()
+      .find((m) => m.role === "user" && !m.hidden && !m.content.trimStart().startsWith("<tool_result"));
     const lastUser = lastUserMsg?.content ?? "";
-    const toolPolicy = classifyCloudToolPolicyForPrompt(plan.mode, String(lastUser));
+    const hasConversationHistory = session.messages.some(
+      (m) => m !== lastUserMsg && !m.hidden && m.role === "assistant" && (m.content.trim().length > 0 || (m.toolCalls?.length ?? 0) > 0)
+    );
+    const toolPolicy = classifyCloudToolPolicy(plan.mode, String(lastUser), hasConversationHistory);
+    const mcpTools = this.registry
+      .all()
+      .filter((t) => t.spec.tags?.includes("mcp") || t.spec.name.startsWith("mcp_"));
     const projectContextDigest = this.ctxMgr?.buildPromptDigest({
       userQuery: String(lastUser),
       activeModel: plan.model,
@@ -1884,7 +1909,7 @@ export class PhotonController {
       toolPolicy,
       projectContextDigest,
     });
-    const MODE_CAPS: Record<Mode, number> = { chat: 6, plan: 10, agent: 25 };
+    const MODE_CAPS: Record<Mode, number> = { chat: 100, plan: 150, agent: 200 };
     const prevPolicy = getCloudToolPolicy();
     setCloudToolPolicy(toolPolicy);
     try {
@@ -1893,13 +1918,16 @@ export class PhotonController {
         model: plan.model,
         system,
         history: cloudHistoryFromSession(session.messages),
-        tools: cloudTools(plan.mode),
+        tools: cloudTools(plan.mode, mcpTools),
         contextWindow: model.contextLength ?? 128_000,
-        ctx: this.buildToolContext(signal, { sessionId: session.id, messageId: lastUserMsg?.id || "" }, plan.executionPolicy),
+        ctx: {
+          ...this.buildToolContext(signal, { sessionId: session.id, messageId: lastUserMsg?.id || "" }, plan.executionPolicy),
+          mode: plan.mode,
+        },
         emitter,
         signal,
         mode: plan.mode,
-        maxSteps: plan.executionPolicy?.stepBudget ?? (MODE_CAPS[plan.mode] ?? 25),
+        maxSteps: plan.executionPolicy?.stepBudget ?? (MODE_CAPS[plan.mode] ?? 200),
         onStepUsage: (usage) => {
           this.cloudUsageTracker.recordStep(usage);
           void this.context.globalState.update(
@@ -1923,6 +1951,7 @@ export class PhotonController {
   ): ToolContext {
     return {
       workspaceRoot: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+      mode: this.mode,
       signal,
       executionPolicy: executionPolicy ?? this.plan?.executionPolicy,
       log: (m) => this.output.appendLine(`[tool] ${m}`),
@@ -2281,18 +2310,4 @@ export class PhotonController {
   async sendPrompt(text: string, attachments?: Attachment[]): Promise<void> {
     return this.onPrompt(text, attachments);
   }
-}
-
-/** Classify cloud tool policy for the system prompt — mirrors unifiedRuntime's logic. */
-function classifyCloudToolPolicyForPrompt(mode: unknown, text: string): "all" | "web" | "none" {
-  const t = text.trim().toLowerCase();
-  if (!t) return "all";
-  if (/^(hi|hello|hey|hiya|yo|thanks|thank you|thx|ok|okay|great|cool|nice|good morning|good afternoon|good evening)[\s,!.?]*$/i.test(t)) {
-    return "none";
-  }
-  if (mode === "agent" || mode === "plan") return "all";
-  const workspaceIntent = /\b(file|files|folder|directory|workspace|repo|repository|codebase|code|class|function|symbol|bug|error|stack trace|edit|modify|change|implement|refactor|debug|fix|write|read|search files|list files|build|test|compile|lint|run command|search|find|show|open|list|get|create|add|remove|delete|rename|move|copy|update|set|configure|install|uninstall|run|start|stop|restart|check|test|debug|format|lint|deploy|push|pull|commit|merge|branch|clone|init|setup)\b/i.test(t);
-  const externalIntent = /\b(weather|temperature|forecast|news|current|today|tonight|latest|live|recent|price|prices|stock|stocks|market|release|version|time|date|traffic|search|lookup|find out|what is|what are|how to|who is|where is)\b/i.test(t);
-  if (externalIntent && !workspaceIntent) return "web";
-  return "all";
 }

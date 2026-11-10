@@ -17,13 +17,14 @@ export function getClaudeThinkingLabel(
   hasThinking?: boolean
 ): string {
   if (detail) {
+    if (/\(\d+s\)/.test(detail)) return detail;
     const d = detail.toLowerCase();
     if (d.includes("select") || d.includes("plan") || d.includes("routing")) return "Understanding request...";
     if (d.includes("retriev") || d.includes("context") || d.includes("read") || d.includes("analyz")) return "Understanding request...";
     if (d.includes("generat") || d.includes("respond")) return "Generating response...";
     if (d.includes("think") || d.includes("reason")) return "Thinking...";
     if (d.includes("tool") || d.includes("run") || d.includes("verif")) return "Working...";
-    return `${detail.replace(/\.+$/, "")}...`;
+    return `${detail.replace(/[.…]+$/, "")}...`;
   }
   if (hasThinking) return "Thinking...";
   if (streaming) return "Generating response...";

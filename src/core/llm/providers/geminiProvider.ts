@@ -101,7 +101,7 @@ export class GeminiProvider implements LLMProvider {
     const res = await fetchWithRetry(
       url,
       { method: "POST", headers: { "Content-Type": "application/json", ...geminiHeaders(this.apiKey) }, body: JSON.stringify(body), signal },
-      { retries: 2, signal }
+      { retries: 2, timeoutMs: 60_000, signal }
     );
     if (!res.ok || !res.body) {
       const detail = await res.text().catch(() => "");
@@ -111,7 +111,7 @@ export class GeminiProvider implements LLMProvider {
     let inputTokens = 0;
     let outputTokens = 0;
     let cachedTokens = 0;
-    for await (const payload of streamSse(res.body, signal)) {
+    for await (const payload of streamSse(res.body, signal, 90_000)) {
       const json = tryJson<{
         promptFeedback?: { blockReason?: string };
         usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; cachedContentTokenCount?: number };

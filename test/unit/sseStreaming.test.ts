@@ -86,6 +86,43 @@ describe("Phase 7.2: SSE Streaming, Watchdog, Framing & Retry Integrity", () => 
       assert.deepEqual(tryJson(payloads[0]), { valid: true });
     });
 
+    it("terminates immediately on [DONE] without stalling even when server leaves connection open", async () => {
+      const encoder = new TextEncoder();
+      for (const termination of ["data: [DONE]\n\n", "data: [DONE]\n"]) {
+        let pulls = 0;
+        let cancelled = false;
+        const keepAliveStream = new ReadableStream<Uint8Array>(
+          {
+            pull(controller) {
+              pulls++;
+              if (pulls === 1) {
+                controller.enqueue(encoder.encode(`data: {"chunk":1}\n\n${termination}`));
+                return;
+              }
+              // Simulate keep-alive gateway that never closes the TCP socket after [DONE]
+              return new Promise(() => {});
+            },
+            cancel() {
+              cancelled = true;
+            },
+          },
+          { highWaterMark: 0 }
+        );
+
+        const started = Date.now();
+        const payloads: string[] = [];
+        for await (const p of streamSse(keepAliveStream, undefined, { idleTimeoutMs: 50 })) {
+          payloads.push(p);
+        }
+
+        assert.equal(payloads.length, 1);
+        assert.deepEqual(tryJson(payloads[0]), { chunk: 1 });
+        assert.equal(cancelled, true, "Stream reader must be cancelled on [DONE]");
+        assert.equal(pulls, 1, "Must stop reading immediately after [DONE] instead of blocking on idle socket");
+        assert.ok(Date.now() - started < 45, "Must complete before idle timeout without stalling");
+      }
+    });
+
     it("flushes final frames even without trailing newline or blank line", async () => {
       const encoder = new TextEncoder();
       const raw = 'data: {"trailing":true}';

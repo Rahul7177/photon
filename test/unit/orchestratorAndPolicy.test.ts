@@ -334,7 +334,7 @@ describe("Phase 6.2: Orchestrator, Auto Mode & Policy Intelligence", () => {
   });
 
   describe("Engine Step & Tool Caps by Mode", () => {
-    it("enforces mode step caps in Cloud Engine", async () => {
+    it("allows multi-step work past 6 steps while honoring explicit maxSteps", async () => {
       let stepCount = 0;
       const mockProvider: LLMProvider = {
         id: "mock-cloud",
@@ -351,7 +351,7 @@ describe("Phase 6.2: Orchestrator, Auto Mode & Policy Intelligence", () => {
                   id: `call-${stepCount}`,
                   function: {
                     name: "read_file",
-                    arguments: { path: "test.ts" },
+                    arguments: { path: `file-${stepCount}.ts` },
                   },
                 },
               ],
@@ -402,7 +402,7 @@ describe("Phase 6.2: Orchestrator, Auto Mode & Policy Intelligence", () => {
         requestApproval: async () => true,
       };
 
-      // Test Chat mode step cap (Spec §5: hard cap 6)
+      // Explicit maxSteps beyond 6 completes without hitting an artificial 6-step wall
       await runCloudTurn({
         provider: mockProvider,
         model: "claude-3-5",
@@ -414,10 +414,11 @@ describe("Phase 6.2: Orchestrator, Auto Mode & Policy Intelligence", () => {
         emitter,
         signal: new AbortController().signal,
         mode: "chat",
+        maxSteps: 8,
       });
 
-      assert.equal(stepCount, 6, "Chat mode must stop at 6 steps");
-      assert.ok(errorMessage.includes("Reached the 6-step safety limit in chat mode"));
+      assert.equal(stepCount, 8, "Chat mode must support >6 steps when work requires it");
+      assert.ok(errorMessage.includes("Reached the 8-step safety limit in chat mode"));
     });
 
     it("rejects side-effecting tool calls in Cloud Engine during chat and plan modes", async () => {

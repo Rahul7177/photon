@@ -1,7 +1,9 @@
 import type { AdaptivePlan, BenchResult, ComplexityAssessment, ModelCapabilityProfile, ModelInfo, ModelTier, TaskAnalysis, ToolCall, ToolSpec, VerificationKind, VerificationPlan } from "../../shared/types";
 
-const LOCAL_CORE_TOOLS = ["query_project_context","list_dir","find_files","search_code","read_file","edit_file","write_file","get_diagnostics","run_command"] as const;
+const LOCAL_CORE_TOOLS = ["query_project_context","list_dir","find_files","search_code","read_file","edit_file","append_file","write_file","get_diagnostics","run_command"] as const;
 const LOCAL_EXTENDED_TOOLS = ["update_project_context","code_outline","move_path","todo_write","think","web_search","web_fetch"] as const;
+const CHAT_READONLY_TOOLS = new Set(["read_file","list_dir","find_files","search_code","code_outline","get_diagnostics","query_project_context","web_search","web_fetch","think"]);
+const PLAN_EXCLUDED_TOOLS = new Set(["todo_write","update_project_context"]);
 
 export function analyzeTask(prompt:string,mode:"chat"|"plan"|"agent",attachmentCount=0):TaskAnalysis{
   const text=(prompt??"").toLowerCase();
@@ -78,14 +80,27 @@ function scoreTool(tool:ToolSpec,task:TaskAnalysis,phase:string,verification:Set
  * tools to the front — they are the only way to answer a current/external
  * question, and a weak model otherwise picks the first spec it sees. */
 export function selectToolSpecs(specs:ToolSpec[],plan:AdaptivePlan,phase:"orient"|"edit"|"verify"|"final",freshInfo=false):ToolSpec[]{
-  let usable=plan.mode==="plan"?specs.filter(s=>!s.sideEffecting):[...specs];if(plan.mode==="chat")return usable.filter(s=>s.name==="web_search"||s.name==="web_fetch"||s.name==="query_project_context").slice(0,Math.max(1,plan.maxTools));
-  const byName=new Map(usable.map(s=>[s.name,s]));const core=LOCAL_CORE_TOOLS.map(n=>byName.get(n)).filter((s):s is ToolSpec=>!!s);const extended=LOCAL_EXTENDED_TOOLS.map(n=>byName.get(n)).filter((s):s is ToolSpec=>!!s);const task=plan.task??analyzeTask("",plan.mode);const coreRanked=rankTools(core,task,phase);const ranked=rankTools(usable,task,phase);const ordered:ToolSpec[]=[];const push=(s:ToolSpec)=>{if(!ordered.some(x=>x.name===s.name))ordered.push(s);};for(const s of coreRanked)push(s);
-  // Web tools are always available — they are the only way to get current/external facts.
-  // Other extended tools (code_outline, move_path, todo_write, think) are gated by intelligence.
+  let usable=plan.mode==="plan"
+    ?specs.filter(s=>!s.sideEffecting&&!PLAN_EXCLUDED_TOOLS.has(s.name))
+    :plan.mode==="chat"
+      ?specs.filter(s=>!s.sideEffecting&&CHAT_READONLY_TOOLS.has(s.name)&&!(s.tags?.includes("mcp")||s.name.startsWith("mcp_")))
+      :[...specs];
+  const byName=new Map(usable.map(s=>[s.name,s]));const core=LOCAL_CORE_TOOLS.map(n=>byName.get(n)).filter((s):s is ToolSpec=>!!s);const extended=LOCAL_EXTENDED_TOOLS.map(n=>byName.get(n)).filter((s):s is ToolSpec=>!!s);const task=plan.task??analyzeTask("",plan.mode);const coreRanked=rankTools(core,task,phase);const ranked=rankTools(usable,task,phase);const ordered:ToolSpec[]=[];const push=(s:ToolSpec)=>{if(!ordered.some(x=>x.name===s.name))ordered.push(s);};
   const webTools=extended.filter(s=>s.name==="web_search"||s.name==="web_fetch");
   const otherExtended=extended.filter(s=>s.name!=="web_search"&&s.name!=="web_fetch");
-  for(const s of webTools)push(s);
-  for(const s of otherExtended)push(s);for(const s of ranked)push(s);
+  if(plan.mode==="chat"&&freshInfo){
+    for(const s of webTools)push(s);
+    for(const s of coreRanked)push(s);
+    for(const s of otherExtended)push(s);
+    for(const s of ranked)push(s);
+  }else{
+    for(const s of coreRanked)push(s);
+    // Web tools are always available — they are the only way to get current/external facts.
+    // Other extended tools (code_outline, move_path, todo_write, think) are ordered after core + web.
+    for(const s of webTools)push(s);
+    for(const s of otherExtended)push(s);
+    for(const s of ranked)push(s);
+  }
   let out=ordered.slice(0,Math.max(1,plan.maxTools));
   if(freshInfo){
     const web=out.filter(s=>s.name==="web_search"||s.name==="web_fetch");
@@ -104,6 +119,8 @@ export function looksLikeNarration(text:string):boolean{
   if(/```/.test(t))return false;
   const lines=t.split("\n").map(l=>l.trim()).filter(Boolean);
   if(lines.filter(l=>/^(?:[-*•]|\d+[.)]|#{1,6}\s|>\s|\|)/.test(l)).length>=2)return false;
+  // Direct clarifying questions to the user are interactive conversation, not omitted-tool narration.
+  if(t.endsWith("?")||lines.some(l=>l.endsWith("?")&&!/^(?:let me|i['’]?ll|i will)\b/i.test(l)))return false;
   // Narration is a short burst of prose; anything long is a real answer.
   if(t.length>420||lines.length>6)return false;
   if(!/\b(?:i['’](?:ll|m going to)|i will|i am going to|let me|let['’]s|going to|now (?:i|let)|next,? i|then i)\b/i.test(t))return false;

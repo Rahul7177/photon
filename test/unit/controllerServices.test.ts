@@ -16,6 +16,8 @@ import {
 } from "../../src/host/sessionCoordinator";
 import { computeStatusInfo } from "../../webview-ui/src/components/StatusIndicator";
 import { computeSummary } from "../../webview-ui/src/components/TurnProcess";
+import { splitFences, computeCodeBlockPreview } from "../../webview-ui/src/components/Markdown";
+import { shouldShowTurnThinking } from "../../webview-ui/src/components/AssistantTurn";
 import type { ModelInfo, SessionState, ToolCall } from "../../src/shared/types";
 import type { LLMProvider } from "../../src/core/llm/types";
 import { CheckpointCoordinator } from "../../src/host/checkpointCoordinator";
@@ -478,6 +480,84 @@ describe("Agent Activity Visibility & TurnProcess Summary (Item 13)", () => {
     assert.equal(errSummary.state, "error");
     assert.equal(errSummary.badge, "Failed");
   });
+
+  it("keeps live thinking indicator active during generation even after partial prose arrives", () => {
+    assert.equal(shouldShowTurnThinking({ turnActive: true, activeHasRunningTool: false }), true);
+    assert.equal(shouldShowTurnThinking({ turnActive: true, activeHasRunningTool: true }), false);
+    assert.equal(shouldShowTurnThinking({ turnActive: false, activeHasRunningTool: false }), false);
+  });
+
+  it("keeps full Markdown/README files in one block across 4-backtick and nested 3-backtick fences", () => {
+    const fourTickReadme = [
+      "Here is the complete README:",
+      "",
+      "````markdown",
+      "# Photon",
+      "",
+      "## Quickstart",
+      "```bash",
+      "npm install",
+      "```",
+      "",
+      "## Structure",
+      "```",
+      "src/",
+      "```",
+      "````",
+      "",
+      "Done!",
+    ].join("\n");
+
+    const fourBlocks = splitFences(fourTickReadme);
+    assert.equal(fourBlocks.filter((b) => b.type === "code").length, 1);
+    const fourCode = fourBlocks.find((b) => b.type === "code");
+    assert.equal(fourCode?.lang, "markdown");
+    assert.ok(fourCode?.content.includes("```bash\nnpm install\n```"));
+    assert.ok(fourCode?.content.includes("```\nsrc/\n```"));
+
+    const threeTickReadme = [
+      "Here is the README:",
+      "",
+      "```markdown",
+      "# Photon",
+      "```bash",
+      "npm test",
+      "```",
+      "```",
+      "src/",
+      "```",
+      "## Footer",
+      "```",
+    ].join("\n");
+
+    const threeBlocks = splitFences(threeTickReadme);
+    const codeBlocks = threeBlocks.filter((b) => b.type === "code");
+    assert.equal(codeBlocks.length, 1, "Legacy 3-backtick markdown block must not fragment on nested code fences");
+    assert.ok(codeBlocks[0].content.includes("## Footer"));
+
+    // Separate markdown blocks stay distinct when not nested
+    const twoSeparate = splitFences("```markdown\n# A\n```\n\nMiddle text.\n\n```markdown\n# B\n```");
+    assert.equal(twoSeparate.filter((b) => b.type === "code").length, 2);
+
+    // Unclosed streaming code fence renders as a code block instead of raw jumping prose
+    const streamingFence = splitFences("````markdown\n# Streaming README\n```bash\nnpm run build");
+    assert.equal(streamingFence.length, 1);
+    assert.equal(streamingFence[0].type, "code");
+    assert.equal(streamingFence[0].closed, false);
+  });
+
+  it("collapses large file code blocks into a preview with See more line counts", () => {
+    const shortPreview = computeCodeBlockPreview("line 1\nline 2\nline 3");
+    assert.equal(shortPreview.isBig, false);
+    assert.equal(shortPreview.hiddenLines, 0);
+
+    const longContent = Array.from({ length: 45 }, (_, i) => `line ${i + 1}`).join("\n");
+    const longPreview = computeCodeBlockPreview(longContent);
+    assert.equal(longPreview.isBig, true);
+    assert.equal(longPreview.lineCount, 45);
+    assert.equal(longPreview.hiddenLines, 45 - 14);
+    assert.equal(longPreview.previewText.split("\n").length, 14);
+  });
 });
 
 describe("Phase 9: Architecture & Focused Services", () => {
@@ -519,13 +599,22 @@ describe("Phase 9: Architecture & Focused Services", () => {
       assert.ok(posted.some((m) => m.type === "status" && (m.payload as any).detail?.includes("Queued (1)")));
       assert.ok(posted.some((m) => m.type === "status" && (m.payload as any).detail?.includes("Queued (2)")));
 
-      // Resolve turn 1, allowing queue to drain
-      turnCoord.abortTurn(); // frees turn active flag
+      // Resolve turn 1 naturally (without abortTurn), allowing queue to drain
       finishTurn1();
       await Promise.all([p1, p2, p3]);
 
       assert.deepEqual(executedPrompts, ["turn 1", "turn 2", "turn 3"]);
       assert.equal(turnCoord.getQueueLength(), 0);
+      assert.equal(turnCoord.isTurnActive(), false);
+
+      // Sending a subsequent turn after previous turns finished must execute immediately (not queue!)
+      await turnCoord.enqueueOrRun({ text: "turn 4" }, async (t) => {
+        const sig = turnCoord.createTurnSignal();
+        executedPrompts.push(t);
+        turnCoord.finishTurn(sig);
+      });
+      assert.deepEqual(executedPrompts, ["turn 1", "turn 2", "turn 3", "turn 4"]);
+      assert.equal(turnCoord.isTurnActive(), false);
     });
 
     it("clears queued prompts when requested", () => {
