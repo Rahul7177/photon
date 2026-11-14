@@ -8,6 +8,7 @@ import { Hero } from "./components/Hero";
 import { LocalProviderHub } from "./components/LocalProviderHub";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { Approval } from "./components/Approval";
+import { TerminalTaskBanner } from "./components/TerminalTaskBanner";
 import { StatusIndicator } from "./components/StatusIndicator";
 import { ProjectContextModal } from "./components/ProjectContextModal";
 import { HardwareMetricsModal } from "./components/HardwareMetricsModal";
@@ -209,6 +210,7 @@ export function App() {
               />
             </div>
           )}
+          <TerminalTaskBanner state={state} actions={actions} />
           <Composer
             state={state}
             actions={actions}

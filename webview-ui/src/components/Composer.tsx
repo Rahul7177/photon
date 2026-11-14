@@ -542,25 +542,45 @@ export function Composer({
   };
 
   const onPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const items = Array.from(e.clipboardData.items);
+    const items = Array.from(e.clipboardData.items ?? []);
     const fileItems = items.filter((it) => it.kind === "file");
+    const directFiles = Array.from(e.clipboardData.files ?? []);
 
-    if (fileItems.length === 0) return;
+    if (fileItems.length === 0 && directFiles.length === 0) return;
 
     e.preventDefault();
     const files: File[] = [];
     for (const item of fileItems) {
-      let file = item.getAsFile();
-      if (!file && item.type.startsWith("image/")) {
-        file = new File(
-          [new Blob([], { type: item.type })],
-          `clipboard-${Date.now()}.${item.type.split("/")[1] ?? "png"}`,
-          { type: item.type }
-        );
-      }
-      if (file) files.push(file);
+      const file = item.getAsFile();
+      if (file && file.size > 0) files.push(file);
     }
-    if (files.length) await addFiles(files);
+    if (files.length === 0 && directFiles.length > 0) {
+      for (const f of directFiles) {
+        if (f.size > 0) files.push(f);
+      }
+    }
+    if (files.length === 0 && typeof navigator !== "undefined" && navigator.clipboard?.read) {
+      try {
+        const clipItems = await navigator.clipboard.read();
+        for (const ci of clipItems) {
+          const imgType = ci.types.find((t) => t.startsWith("image/"));
+          if (!imgType) continue;
+          const blob = await ci.getType(imgType);
+          if (blob.size > 0) {
+            files.push(
+              new File([blob], `clipboard-${Date.now()}.${imgType.split("/")[1] ?? "png"}`, { type: imgType })
+            );
+          }
+        }
+      } catch {
+        // Clipboard permission denied or unsupported in this webview context
+      }
+    }
+    if (files.length > 0) {
+      await addFiles(files);
+    } else {
+      setAttachError("Could not read clipboard image data (empty or blocked). Try attaching the file directly.");
+    }
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {

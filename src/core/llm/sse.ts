@@ -351,3 +351,20 @@ export function tryJson<T>(payload: string): T | undefined {
     return undefined;
   }
 }
+
+/**
+ * Parse accumulated streamed tool-call JSON arguments without dropping malformed calls.
+ * Malformed non-empty payloads return a structured error marker so the agent loop
+ * surfaces an actionable `[TOOL_ERROR]` instead of silently losing the tool call.
+ */
+export function parseStreamedToolArgs(raw: string): Record<string, unknown> {
+  if (!raw || !raw.trim()) return {};
+  const parsed = tryJson<unknown>(raw);
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    return parsed as Record<string, unknown>;
+  }
+  return {
+    __malformedToolArgs: true,
+    __parseError: `Malformed JSON arguments for tool call (${raw.trim().slice(0, 120)}).`,
+  };
+}

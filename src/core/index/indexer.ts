@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { EmbedFn, IndexedChunk, RetrievedChunk } from "./types";
-import { chunkText } from "./chunker";
+import { chunkText, formatChunkForEmbedding } from "./chunker";
 import { VectorStore } from "./vectorStore";
+
+const MAX_QUERY_CACHE = 32;
+const MAX_HITS_PER_FILE = 2;
 
 // Embed in batches so a big file doesn't produce one enormous /api/embed request.
 const EMBED_BATCH = 24;
@@ -205,6 +208,8 @@ export async function evaluateRetrieval(
  * back a CLI or another IDE unchanged.
  */
 export class WorkspaceIndex {
+  private readonly queryCache = new Map<string, number[]>();
+
   constructor(
     private readonly store: VectorStore,
     private readonly embed: EmbedFn
@@ -259,7 +264,7 @@ export class WorkspaceIndex {
     for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
       if (signal?.aborted) throw new Error("Indexing cancelled.");
       const batch = chunks.slice(i, i + EMBED_BATCH);
-      const vectors = await this.embed(batch.map((c) => c.text), signal);
+      const vectors = await this.embed(batch.map(formatChunkForEmbedding), signal);
       batch.forEach((c, j) => {
         const vector = vectors[j];
         if (Array.isArray(vector) && vector.length) {
@@ -275,33 +280,186 @@ export class WorkspaceIndex {
     return indexed.length;
   }
 
-  /** Retrieve the top-k most relevant chunks for a natural-language query. */
+  /**
+   * Batch-chunk and embed multiple files together so small files share /api/embed
+   * HTTP round-trips (up to EMBED_BATCH chunks per request).
+   */
+  async indexFilesBatch(
+    entries: Array<{ path: string; content: string; mtime?: number; size?: number; hash?: string }>,
+    signal?: AbortSignal
+  ): Promise<number> {
+    if (entries.length === 0) return 0;
+
+    type PendingChunk = {
+      fileIdx: number;
+      chunk: ReturnType<typeof chunkText>[number];
+    };
+
+    const validFiles: Array<{
+      path: string;
+      mtime?: number;
+      size?: number;
+      hash?: string;
+      indexed: IndexedChunk[];
+    }> = [];
+    const queue: PendingChunk[] = [];
+
+    for (const entry of entries) {
+      const check = shouldIndexFile(entry.path, entry.content);
+      if (!check.indexable) {
+        this.store.removeFile(entry.path);
+        continue;
+      }
+      let chunks = chunkText(entry.path, entry.content);
+      if (chunks.length === 0) {
+        this.store.removeFile(entry.path);
+        continue;
+      }
+      if (chunks.length > MAX_CHUNKS_PER_FILE) chunks = chunks.slice(0, MAX_CHUNKS_PER_FILE);
+      const fileIdx = validFiles.length;
+      validFiles.push({
+        path: entry.path,
+        mtime: entry.mtime,
+        size: entry.size,
+        hash: entry.hash,
+        indexed: [],
+      });
+      for (const c of chunks) {
+        queue.push({ fileIdx, chunk: c });
+      }
+    }
+
+    for (let i = 0; i < queue.length; i += EMBED_BATCH) {
+      if (signal?.aborted) throw new Error("Indexing cancelled.");
+      const batch = queue.slice(i, i + EMBED_BATCH);
+      const vectors = await this.embed(
+        batch.map((item) => formatChunkForEmbedding(item.chunk)),
+        signal
+      );
+      batch.forEach((item, j) => {
+        const vector = vectors[j];
+        if (Array.isArray(vector) && vector.length) {
+          validFiles[item.fileIdx].indexed.push({
+            ...item.chunk,
+            id: randomUUID(),
+            vector,
+          });
+        }
+      });
+    }
+
+    let totalStored = 0;
+    for (const f of validFiles) {
+      if (f.indexed.length > 0) {
+        this.store.setFile(f.path, f.indexed, f.mtime, f.size);
+        if (f.hash) this.store.setFileHash(f.path, f.hash);
+        totalStored += f.indexed.length;
+      } else {
+        this.store.removeFile(f.path);
+      }
+    }
+    return totalStored;
+  }
+
+  /** Retrieve the top-k most relevant chunks for a natural-language query using hybrid vector + lexical scoring. */
   async retrieve(query: string, k = 6, signal?: AbortSignal): Promise<RetrievedChunk[]> {
     const q = query.trim();
     if (!q || this.store.stats.chunks === 0) return [];
-    const [vector] = await this.embed([q], signal);
-    if (!Array.isArray(vector) || vector.length === 0) return [];
-    return this.store.query(vector, k);
+    let vector = this.queryCache.get(q);
+    if (!vector) {
+      const [embedded] = await this.embed([q], signal);
+      if (!Array.isArray(embedded) || embedded.length === 0) return [];
+      vector = embedded;
+      if (this.queryCache.size >= MAX_QUERY_CACHE) {
+        const oldestKey = this.queryCache.keys().next().value;
+        if (oldestKey !== undefined) this.queryCache.delete(oldestKey);
+      }
+      this.queryCache.set(q, vector);
+    }
+    return this.store.query(vector, k, q);
   }
 
   /**
-   * Format retrieved chunks as a compact context block for the system prompt.
-   * Bounded by `maxChars` so injected context never blows a small window; the
-   * caller's context-budget manager still trims the final prompt.
+   * Format retrieved chunks as a compact, non-redundant context block for the system prompt.
+   * Merges adjacent/overlapping regions from the same file and caps per-file hits so
+   * multiple distinct files fit inside `maxChars`.
    */
   async retrieveContext(query: string, maxChars = 4000, signal?: AbortSignal): Promise<string | undefined> {
-    const hits = await this.retrieve(query, 6, signal);
-    if (hits.length === 0) return undefined;
+    const rawHits = await this.retrieve(query, 12, signal);
+    const filtered = rawHits.filter((h) => h.score > 0.22);
+    if (filtered.length === 0) return undefined;
+
+    const hits = mergeOverlappingChunks(filtered, MAX_HITS_PER_FILE);
     const parts: string[] = [];
     let used = 0;
     for (const h of hits) {
-      if (h.score <= 0.2) continue; // drop weak matches
       const block = `// ${h.path}:${h.startLine}-${h.endLine}\n${h.text}`;
-      if (used + block.length > maxChars) break;
+      if (used + block.length > maxChars) {
+        if (parts.length === 0 && maxChars > 200) {
+          parts.push(block.slice(0, maxChars - 16) + "\n// ... (trimmed)");
+        }
+        break;
+      }
       parts.push(block);
       used += block.length;
     }
     if (parts.length === 0) return undefined;
     return parts.join("\n\n");
   }
+}
+
+/**
+ * Merge overlapping/adjacent retrieved chunks from the same file (keeping highest score)
+ * and cap the number of regions kept per file so retrieval remains diverse.
+ */
+export function mergeOverlappingChunks(
+  hits: RetrievedChunk[],
+  maxPerFile = MAX_HITS_PER_FILE
+): RetrievedChunk[] {
+  const result: RetrievedChunk[] = [];
+  const countByFile = new Map<string, number>();
+
+  for (const h of hits) {
+    const existingIdx = result.findIndex(
+      (r) =>
+        r.path === h.path &&
+        h.startLine <= r.endLine + 4 &&
+        h.endLine >= r.startLine - 4
+    );
+
+    if (existingIdx >= 0) {
+      const prev = result[existingIdx];
+      const earlier = prev.startLine <= h.startLine ? prev : h;
+      const later = prev.startLine <= h.startLine ? h : prev;
+      const mergedText = stitchChunkText(earlier, later);
+      result[existingIdx] = {
+        path: prev.path,
+        startLine: Math.min(prev.startLine, h.startLine),
+        endLine: Math.max(prev.endLine, h.endLine),
+        text: mergedText,
+        score: Math.max(prev.score, h.score),
+      };
+      continue;
+    }
+
+    const used = countByFile.get(h.path) ?? 0;
+    if (used >= maxPerFile) continue;
+    countByFile.set(h.path, used + 1);
+    result.push({ ...h });
+  }
+
+  return result;
+}
+
+function stitchChunkText(earlier: RetrievedChunk, later: RetrievedChunk): string {
+  if (later.endLine <= earlier.endLine) return earlier.text;
+  if (later.startLine > earlier.endLine) return `${earlier.text}\n${later.text}`;
+  const earlierLines = earlier.text.split("\n");
+  const laterLines = later.text.split("\n");
+  const stripHeader = (lines: string[]) =>
+    lines[0]?.startsWith("// Module imports:") ? lines.slice(1) : lines;
+  const cleanLater = stripHeader(laterLines);
+  const overlapCount = Math.max(0, earlier.endLine - later.startLine + 1);
+  const tail = cleanLater.slice(Math.min(cleanLater.length, overlapCount));
+  return tail.length > 0 ? [...earlierLines, ...tail].join("\n") : earlier.text;
 }

@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { createHash } from "node:crypto";
 import type { OllamaClient } from "../core/ollama/client";
 import { VectorStore } from "../core/index/vectorStore";
 import { WorkspaceIndex, shouldIndexFile, MAX_INDEXABLE_FILE_BYTES } from "../core/index/indexer";
@@ -47,6 +48,7 @@ export class IndexService {
   private renameSub?: vscode.Disposable;
   private activeAbort?: AbortController;
   private freshnessAbort?: AbortController;
+  private pendingAbort?: AbortController;
   private readonly pendingFiles = new Set<string>();
   private readonly fileModEpoch = new Map<string, number>();
   private debounceTimer?: ReturnType<typeof setTimeout>;
@@ -125,8 +127,8 @@ export class IndexService {
   /** (Re)bind the index to the current store + a local-Ollama embed function. */
   private makeIndex(): void {
     this.store.setEmbeddingModel(this.embeddingModel);
-    this.index = new WorkspaceIndex(this.store, (texts) =>
-      this.client.embed(this.embeddingModel, texts, 120_000)
+    this.index = new WorkspaceIndex(this.store, (texts, signal) =>
+      this.client.embed(this.embeddingModel, texts, 120_000, signal)
     );
   }
 
@@ -156,57 +158,23 @@ export class IndexService {
     }
 
     this.store.clear();
-    let done = 0;
-    let totalBytes = 0;
     this.setStatus({ phase: "indexing", filesIndexed: 0, chunks: 0, pending: files.length });
 
+    const candidates: Array<{ rel: string; uri: vscode.Uri; mtime: number; size: number }> = [];
     for (const uri of files) {
       if (abort.signal.aborted || this.disposed) return;
       const rel = vscode.workspace.asRelativePath(uri, false);
-      const startEpoch = this.fileModEpoch.get(rel) ?? 0;
       try {
         const stat = await vscode.workspace.fs.stat(uri);
-        if (stat.size > MAX_FILE_BYTES) {
-          done++;
-          continue;
+        if (stat.size <= MAX_FILE_BYTES) {
+          candidates.push({ rel, uri, mtime: stat.mtime, size: stat.size });
         }
-        if (totalBytes + stat.size > MAX_TOTAL_BYTES) {
-          this.log(
-            `[index] total indexed bytes budget reached (${Math.round(totalBytes / 1024 / 1024)}MB) — stopping full index.`
-          );
-          break;
-        }
-        const bytes = await vscode.workspace.fs.readFile(uri);
-        const content = Buffer.from(bytes).toString("utf8");
-
-        await this.index.indexFile(rel, content, abort.signal);
-
-        // Check whether a newer watcher event touched this file while indexing was in-flight
-        const latestEpoch = this.fileModEpoch.get(rel) ?? 0;
-        if (latestEpoch > startEpoch) {
-          this.log(`[index] skipping stale commit for ${rel} — newer file event arrived during indexing.`);
-          this.queueFile(rel);
-        } else {
-          this.store.setFileMtime(rel, stat.mtime);
-          this.store.setFileSize(rel, stat.size);
-          totalBytes += stat.size;
-        }
-      } catch (e) {
-        this.log(`[index] skip ${rel}: ${(e as Error).message}`);
-      }
-      done++;
-      if (done % 10 === 0 || done === files.length) {
-        const { files: f, chunks } = this.store.stats;
-        this.setStatus({
-          phase: "indexing",
-          filesIndexed: f,
-          chunks,
-          pending: files.length - done,
-          embeddingModel: this.embeddingModel,
-        });
-        await delay(0);
+      } catch {
+        // skip unreadable files
       }
     }
+
+    await this.indexFileBatchGroup(candidates, abort.signal, true);
 
     if (abort.signal.aborted || this.disposed) return;
     this.publishReady();
@@ -309,11 +277,13 @@ export class IndexService {
     if (!this.index || this.disposed) return;
     const files = [...this.pendingFiles];
     this.pendingFiles.clear();
+    this.pendingAbort?.abort();
     const abort = new AbortController();
+    this.pendingAbort = abort;
     const signal = abort.signal;
 
     for (const rel of files) {
-      if (this.disposed) return;
+      if (this.disposed || signal.aborted) return;
       const startEpoch = this.fileModEpoch.get(rel) ?? 0;
       try {
         const uri = this.relToUri(rel);
@@ -324,6 +294,12 @@ export class IndexService {
           continue;
         }
         const bytes = await vscode.workspace.fs.readFile(uri);
+        const hashVal = contentHash(bytes);
+        if (this.store.hasFile(rel) && this.store.getFileHash(rel) === hashVal) {
+          this.store.setFileMtime(rel, stat.mtime);
+          this.store.setFileSize(rel, stat.size);
+          continue;
+        }
         await this.index.indexFile(rel, Buffer.from(bytes).toString("utf8"), signal);
 
         // Check if newer watcher event arrived for this file while embedding
@@ -334,8 +310,10 @@ export class IndexService {
         } else {
           this.store.setFileMtime(rel, stat.mtime);
           this.store.setFileSize(rel, stat.size);
+          this.store.setFileHash(rel, hashVal);
         }
       } catch (e) {
+        if (signal.aborted) return;
         // Distinguish deletion from transient I/O or permissions errors (EPERM, EBUSY)
         if (isNotFoundError(e)) {
           this.index.removeFile(rel);
@@ -346,6 +324,100 @@ export class IndexService {
     }
     this.publishReady();
     this.scheduleSave();
+  }
+
+  /**
+   * Read and batch-embed prepared files while respecting total workspace byte caps,
+   * content-hash deduplication, and in-flight file modification epoch guards.
+   */
+  private async indexFileBatchGroup(
+    items: Array<{ rel: string; uri: vscode.Uri; mtime: number; size: number }>,
+    signal: AbortSignal,
+    updateStatusProgress: boolean
+  ): Promise<void> {
+    if (!this.index || items.length === 0) return;
+    const FILE_READ_GROUP = 8;
+    let done = 0;
+    let totalBytes = 0;
+
+    for (let i = 0; i < items.length; i += FILE_READ_GROUP) {
+      if (signal.aborted || this.disposed || !this.enabled) return;
+      const slice = items.slice(i, i + FILE_READ_GROUP);
+      const batch: Array<{
+        path: string;
+        content: string;
+        mtime: number;
+        size: number;
+        hash: string;
+        startEpoch: number;
+      }> = [];
+      let budgetReached = false;
+
+      for (const item of slice) {
+        if (signal.aborted || this.disposed) return;
+        if (totalBytes + item.size > MAX_TOTAL_BYTES) {
+          this.log(
+            `[index] total indexed bytes budget reached (${Math.round(totalBytes / 1024 / 1024)}MB) — stopping batch index.`
+          );
+          budgetReached = true;
+          break;
+        }
+        const startEpoch = this.fileModEpoch.get(item.rel) ?? 0;
+        try {
+          const bytes = await vscode.workspace.fs.readFile(item.uri);
+          const hashVal = contentHash(bytes);
+          if (this.store.hasFile(item.rel) && this.store.getFileHash(item.rel) === hashVal) {
+            this.store.setFileMtime(item.rel, item.mtime);
+            this.store.setFileSize(item.rel, item.size);
+            totalBytes += item.size;
+            done++;
+            continue;
+          }
+          batch.push({
+            path: item.rel,
+            content: Buffer.from(bytes).toString("utf8"),
+            mtime: item.mtime,
+            size: item.size,
+            hash: hashVal,
+            startEpoch,
+          });
+          totalBytes += item.size;
+        } catch (e) {
+          this.log(`[index] skip ${item.rel}: ${(e as Error).message}`);
+          done++;
+        }
+      }
+
+      if (batch.length > 0) {
+        try {
+          await this.index.indexFilesBatch(batch, signal);
+          for (const b of batch) {
+            const latestEpoch = this.fileModEpoch.get(b.path) ?? 0;
+            if (latestEpoch > b.startEpoch) {
+              this.log(`[index] re-queuing ${b.path} — newer file event arrived during indexing.`);
+              this.queueFile(b.path);
+            }
+          }
+        } catch (e) {
+          if (signal.aborted) return;
+          this.log(`[index] batch embed error: ${(e as Error).message}`);
+        }
+        done += batch.length;
+      }
+
+      if (updateStatusProgress) {
+        const { files: f, chunks } = this.store.stats;
+        this.setStatus({
+          phase: "indexing",
+          filesIndexed: f,
+          chunks,
+          pending: Math.max(0, items.length - done),
+          embeddingModel: this.embeddingModel,
+        });
+      }
+      if (budgetReached) break;
+      await delay(0);
+    }
   }
 
   private publishReady(): void {
@@ -371,6 +443,8 @@ export class IndexService {
     this.activeAbort = undefined;
     this.freshnessAbort?.abort();
     this.freshnessAbort = undefined;
+    this.pendingAbort?.abort();
+    this.pendingAbort = undefined;
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = undefined;
@@ -395,7 +469,10 @@ export class IndexService {
     if (this.disposed) return;
     this.saveVersion++;
     if (this.saveTimer) clearTimeout(this.saveTimer);
-    this.saveTimer = setTimeout(() => void this.save(), SAVE_DEBOUNCE_MS);
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = undefined;
+      void this.save();
+    }, SAVE_DEBOUNCE_MS);
   }
 
   /**
@@ -479,27 +556,7 @@ export class IndexService {
         `[index] startup freshness check: updating ${staleOrNewUris.length} modified/new files, evicted ${evictedCount} removed files.`
       );
 
-      for (const item of staleOrNewUris) {
-        if (abort.signal.aborted || this.disposed || !this.enabled) return;
-        const startEpoch = this.fileModEpoch.get(item.rel) ?? 0;
-        try {
-          const bytes = await vscode.workspace.fs.readFile(item.uri);
-          const content = Buffer.from(bytes).toString("utf8");
-          await this.index.indexFile(item.rel, content, abort.signal);
-
-          const latestEpoch = this.fileModEpoch.get(item.rel) ?? 0;
-          if (latestEpoch > startEpoch) {
-            this.log(`[index] skipping stale commit for ${item.rel} — newer file event arrived during reindexing.`);
-            this.queueFile(item.rel);
-          } else {
-            this.store.setFileMtime(item.rel, item.mtime);
-            this.store.setFileSize(item.rel, item.size);
-          }
-        } catch (e) {
-          this.log(`[index] failed reindexing stale ${item.rel}: ${(e as Error).message}`);
-        }
-        await delay(5);
-      }
+      await this.indexFileBatchGroup(staleOrNewUris, abort.signal, false);
 
       if (abort.signal.aborted || this.disposed) return;
       this.publishReady();
@@ -523,22 +580,35 @@ export class IndexService {
     }
   }
 
-  /** Serialized snapshot save: ensures older saves never overwrite newer snapshots. */
+  /** Serialized atomic snapshot save: ensures older saves never overwrite newer snapshots or leave corrupt JSON. */
   private async save(): Promise<void> {
     const versionToSave = this.saveVersion;
     if (versionToSave <= this.lastSavedVersion || this.disposed) return;
     const uri = this.storageUri();
-    if (!uri || this.store.stats.chunks === 0) return;
+    const folder = vscode.workspace.workspaceFolders?.[0];
+    if (!uri || !folder || this.store.stats.chunks === 0) return;
 
     this.saveChain = this.saveChain.then(async () => {
-      if (versionToSave <= this.lastSavedVersion || this.disposed) return;
+      if (this.saveVersion <= this.lastSavedVersion || this.disposed) return;
+      if (this.saveTimer && this.saveVersion > versionToSave) return;
+      const serializedVersion = this.saveVersion;
+      const tmpUri = vscode.Uri.joinPath(
+        this.context.globalStorageUri,
+        `.index-${hash(folder.uri.fsPath)}.${serializedVersion}.tmp`
+      );
       try {
         await vscode.workspace.fs.createDirectory(this.context.globalStorageUri);
         const json = JSON.stringify(this.store.toJSON());
-        await vscode.workspace.fs.writeFile(uri, Buffer.from(json, "utf8"));
-        this.lastSavedVersion = versionToSave;
+        await vscode.workspace.fs.writeFile(tmpUri, Buffer.from(json, "utf8"));
+        await vscode.workspace.fs.rename(tmpUri, uri, { overwrite: true });
+        this.lastSavedVersion = serializedVersion;
       } catch (e) {
         this.log(`[index] save failed: ${(e as Error).message}`);
+        try {
+          await vscode.workspace.fs.delete(tmpUri, { useTrash: false });
+        } catch {
+          // ignore cleanup failure
+        }
       }
     });
 
@@ -548,6 +618,11 @@ export class IndexService {
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Small stable hash for file bytes to avoid re-embedding when only mtime changes. */
+function contentHash(bytes: Uint8Array): string {
+  return createHash("sha1").update(bytes).digest("hex");
 }
 
 /** Small stable hash for the workspace path (persistence file name). */

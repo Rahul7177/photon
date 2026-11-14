@@ -1,6 +1,7 @@
 import type { ModelInfo } from "../shared/types";
 import type { LLMProvider, ProviderModel } from "../core/llm/types";
 import {
+  normalizeOpenAICompatBaseUrl,
   OpenAICompatProvider,
   type OpenAICompatConfig,
 } from "../core/llm/providers/openaiCompatProvider";
@@ -12,12 +13,29 @@ import {
   isRecommendedModel,
 } from "../core/llm/catalogs";
 
+const BUILTIN_PROVIDER_IDS = [
+  "ollama",
+  "llamacpp",
+  "gemini",
+  "claude",
+  "nvidia",
+  "openai",
+  "openrouter",
+  "opencode",
+  "blackbox",
+];
+
 export interface ProviderStatusInfo {
   id: string;
   label: string;
   enabled: boolean;
   configured: boolean;
   modelCount: number;
+  isCustom?: boolean;
+  isLocal?: boolean;
+  baseUrl?: string;
+  requireApiKey?: boolean;
+  supportsLiveModels?: boolean;
 }
 
 export interface ProviderCatalogStorage {
@@ -31,6 +49,7 @@ export interface ProviderCatalogStorage {
   setSecretApiKey(id: string, apiKey: string): Promise<void>;
   deleteSecretApiKey(id: string): Promise<void>;
   getLlamaCppBaseUrl(): string;
+  getLlamaCppRequestTimeoutMs?(): number;
   getCustomProviders(): OpenAICompatConfig[];
   setCustomProviders(providers: OpenAICompatConfig[]): Promise<void>;
 }
@@ -41,19 +60,31 @@ export interface ProviderCatalogStorage {
 export function toProviderModels(added: ModelInfo[], providerId: string): ProviderModel[] {
   return added
     .filter((m) => m.provider === providerId)
-    .map((m) => ({
-      id: m.name.startsWith(`${providerId}:`) ? m.name.slice(providerId.length + 1) : m.name,
-      name: m.name,
-      paramsB: m.paramsB,
-      contextLength: m.contextLength,
-      toolTrained: m.toolTrained,
-      vision: m.vision,
-      audio: m.audio,
-      video: m.video,
-      thinking: m.thinking,
-      capabilities: m.capabilities,
-      tier: m.tier,
-    }));
+    .map((m) => {
+      const id = m.name.startsWith(`${providerId}:`) ? m.name.slice(providerId.length + 1) : m.name;
+      const inferred = customModel(id, providerId);
+      return {
+        id,
+        name: m.name,
+        paramsB: m.paramsB,
+        contextLength: m.contextLength,
+        toolTrained: m.toolTrained,
+        vision: m.vision,
+        audio: m.audio,
+        video: m.video,
+        thinking: m.thinking,
+        thinkingLevels:
+          m.thinkingLevels && m.thinkingLevels.length > 0
+            ? m.thinkingLevels
+            : m.thinking
+              ? inferred.thinkingLevels && inferred.thinkingLevels.length > 0
+                ? inferred.thinkingLevels
+                : ["off", "low", "medium", "high"]
+              : [],
+        capabilities: m.capabilities,
+        tier: m.tier,
+      };
+    });
 }
 
 /**
@@ -137,6 +168,107 @@ export class ProviderCatalogService {
     await this.storage.setAddedModels(models);
   }
 
+  /** Enable or disable either a built-in or a custom provider consistently. */
+  async setProviderEnabledState(id: string, enabled: boolean): Promise<void> {
+    const custom = this.storage.getCustomProviders();
+    const idx = custom.findIndex((c) => c.id === id);
+    if (idx >= 0) {
+      const next = custom.map((c, i) => (i === idx ? { ...c, enabled } : c));
+      await this.storage.setCustomProviders(next);
+      return;
+    }
+    await this.storage.setProviderEnabled(id, enabled);
+  }
+
+  /** Store or clear a provider API key, auto-enabling on connect and clearing legacy inline custom keys. */
+  async setProviderApiKeyState(id: string, apiKey: string): Promise<void> {
+    const trimmed = apiKey.trim();
+    if (trimmed) {
+      await this.storage.setSecretApiKey(id, trimmed);
+      await this.setProviderEnabledState(id, true);
+    } else {
+      await this.storage.deleteSecretApiKey(id);
+      const custom = this.storage.getCustomProviders();
+      const idx = custom.findIndex((c) => c.id === id);
+      if (idx >= 0 && custom[idx].apiKey) {
+        await this.storage.setCustomProviders(
+          custom.map((c, i) => (i === idx ? { ...c, apiKey: "" } : c))
+        );
+      }
+      this.liveModelCache.delete(id);
+    }
+  }
+
+  /** Add a custom OpenAI-compatible provider with URL normalization and unique ID derivation. */
+  async addCustomProvider(input: {
+    label: string;
+    baseUrl: string;
+    apiKey?: string;
+    requireApiKey?: boolean;
+  }): Promise<string | null> {
+    const label = input.label.trim();
+    const baseUrl = normalizeOpenAICompatBaseUrl(input.baseUrl);
+    if (!label || !baseUrl) return null;
+    const existing = this.storage.getCustomProviders();
+    const id = deriveCustomProviderId(label, [...BUILTIN_PROVIDER_IDS, ...existing.map((c) => c.id)]);
+    const requireApiKey = input.requireApiKey ?? true;
+    await this.storage.setCustomProviders([
+      ...existing,
+      { id, label, baseUrl, enabled: true, requireApiKey } as OpenAICompatConfig,
+    ]);
+    if (input.apiKey?.trim()) {
+      await this.storage.setSecretApiKey(id, input.apiKey.trim());
+    }
+    return id;
+  }
+
+  /** Update an existing custom provider's label, endpoint URL, auth mode, or API key. */
+  async updateCustomProvider(input: {
+    id: string;
+    label: string;
+    baseUrl: string;
+    apiKey?: string;
+    clearApiKey?: boolean;
+    requireApiKey?: boolean;
+  }): Promise<boolean> {
+    const label = input.label.trim();
+    const baseUrl = normalizeOpenAICompatBaseUrl(input.baseUrl);
+    if (!label || !baseUrl) return false;
+    const existing = this.storage.getCustomProviders();
+    const idx = existing.findIndex((c) => c.id === input.id);
+    if (idx < 0) return false;
+    const next = existing.map((c, i) => {
+      if (i !== idx) return c;
+      // Clear any legacy plaintext key so SecretStorage remains the single source of truth.
+      return {
+        ...c,
+        apiKey: "",
+        label,
+        baseUrl,
+        requireApiKey: input.requireApiKey ?? c.requireApiKey ?? true,
+      };
+    });
+    await this.storage.setCustomProviders(next);
+    if (input.clearApiKey || (input.apiKey !== undefined && !input.apiKey.trim())) {
+      await this.storage.deleteSecretApiKey(input.id);
+    } else if (input.apiKey !== undefined && input.apiKey.trim()) {
+      await this.storage.setSecretApiKey(input.id, input.apiKey.trim());
+    }
+    this.liveModelCache.delete(input.id);
+    return true;
+  }
+
+  /** Remove a custom provider along with its secret key and associated added/cached models. */
+  async removeCustomProvider(id: string): Promise<boolean> {
+    const existing = this.storage.getCustomProviders();
+    if (!existing.some((c) => c.id === id)) return false;
+    await this.storage.setCustomProviders(existing.filter((c) => c.id !== id));
+    await this.storage.deleteSecretApiKey(id);
+    await this.setAddedModels(this.addedModels().filter((m) => m.provider !== id));
+    this.liveModelCache.delete(id);
+    return true;
+  }
+
   /** Add a model to a provider's active picker list and ensure the provider is enabled. */
   async addModelToPicker(providerId: string, model: ModelInfo): Promise<{ bare: string; prefixed: string }> {
     const bare = model.name.startsWith(`${providerId}:`)
@@ -153,7 +285,7 @@ export class ProviderCatalogService {
       });
       await this.setAddedModels(added);
     }
-    await this.storage.setProviderEnabled(providerId, true);
+    await this.setProviderEnabledState(providerId, true);
     return { bare, prefixed };
   }
 
@@ -172,6 +304,7 @@ export class ProviderCatalogService {
     const normalized = baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "") + "/v1";
     const enabled = this.storage.getProviderEnabled("llamacpp");
     const apiKey = await this.storage.getSecretApiKey("llamacpp");
+    const idleTimeoutMs = this.storage.getLlamaCppRequestTimeoutMs?.() ?? 300_000;
     const models = toProviderModels(this.addedModels(), "llamacpp");
     return new OpenAICompatProvider({
       id: "llamacpp",
@@ -181,6 +314,7 @@ export class ProviderCatalogService {
       enabled,
       models,
       requireApiKey: false,
+      idleTimeoutMs,
     });
   }
 
@@ -277,11 +411,12 @@ export class ProviderCatalogService {
           id: c.id,
           label: c.label || c.id,
           baseUrl: c.baseUrl,
-          apiKey: c.apiKey || (await apiKey(c.id)),
+          apiKey: (await apiKey(c.id)) || c.apiKey,
           enabled: c.enabled !== false,
           models: addedFor(c.id),
           extraHeaders: c.extraHeaders,
           keyInBody: c.keyInBody,
+          requireApiKey: c.requireApiKey ?? true,
         })
       );
     }
@@ -291,16 +426,26 @@ export class ProviderCatalogService {
 
   /** Compute status summary of every registered provider for the settings UI. */
   providerStatuses(providers: LLMProvider[], allLoadedModels: ModelInfo[]): ProviderStatusInfo[] {
-    return providers.map((p) => ({
-      id: p.id,
-      label: p.label,
-      enabled: p.enabled,
-      configured: p.isConfigured(),
-      modelCount:
-        p.enabled && p.isConfigured()
-          ? allLoadedModels.filter((m) => m.provider === p.id).length
-          : 0,
-    }));
+    const customMap = new Map(this.storage.getCustomProviders().map((c) => [c.id, c] as const));
+    return providers.map((p) => {
+      const customCfg = customMap.get(p.id);
+      const compat = p instanceof OpenAICompatProvider ? p : undefined;
+      return {
+        id: p.id,
+        label: p.label,
+        enabled: p.enabled,
+        configured: p.isConfigured(),
+        modelCount:
+          p.enabled && p.isConfigured()
+            ? allLoadedModels.filter((m) => m.provider === p.id).length
+            : 0,
+        isCustom: Boolean(customCfg),
+        isLocal: p.id === "ollama" || p.id === "llamacpp",
+        baseUrl: customCfg?.baseUrl ?? compat?.baseUrl,
+        requireApiKey: customCfg ? (customCfg.requireApiKey ?? true) : (compat?.requireApiKey ?? true),
+        supportsLiveModels: Boolean(p.fetchLiveModels),
+      };
+    });
   }
 
   /**

@@ -2,7 +2,7 @@ import type { AdaptivePlan, BenchResult, IntelligenceLevel, IntelligenceSetting,
 import { analyzeTask, buildExecutionPolicy, buildVerificationPlan, capabilityForModel, isFreshInfoRequest, shouldUseNativeToolProtocol } from "../intelligence/policy";
 import { bytesPerParamForQuant, normalizeQuantization } from "./modelAdvisor";
 
-export interface OrchestratorInput{model:ModelInfo;machine:MachineProfile|null;mode:Mode;prompt?:string;userNumCtx?:number;intelligence:IntelligenceSetting;reserveOutputTokens:number;adaptiveEnabled:boolean;cloudNativeTools?:boolean;task?:TaskAnalysis;bench?:BenchResult;}
+export interface OrchestratorInput{model:ModelInfo;machine:MachineProfile|null;mode:Mode;prompt?:string;userNumCtx?:number;intelligence:IntelligenceSetting;reserveOutputTokens:number;adaptiveEnabled:boolean;cloudNativeTools?:boolean;task?:TaskAnalysis;bench?:BenchResult;sampling?:{temp?:number;topP?:number;seed?:number};}
 interface LevelProfile{maxTools:number;allowParallelTools:boolean;outputCap:number;chatTemp:number;taskTemp:number;}
 // High non-blocking safety ceilings so complex tasks finish naturally; duplicate-call and runaway guards prevent spin loops.
 const MODE_CAPS:Record<Mode,number>={chat:100,plan:150,agent:200};
@@ -87,7 +87,16 @@ export function buildPlan(input:OrchestratorInput):AdaptivePlan{
   // Never starve small models of tools; cap only by mode or total available tools
   const maxTools=profile.maxTools;
   // Lower temperature for smaller models / high-scaffolding turns reduces tool & fact hallucination
-  const temperature=mode==="chat"?profile.chatTemp:profile.taskTemp;
+  const defaultTemp=mode==="chat"?profile.chatTemp:profile.taskTemp;
+  const temperature=(typeof input.sampling?.temp==="number"&&Number.isFinite(input.sampling.temp))
+    ? Math.max(0,Math.min(2,input.sampling.temp))
+    : defaultTemp;
+  const topP=(typeof input.sampling?.topP==="number"&&Number.isFinite(input.sampling.topP)&&input.sampling.topP>0&&input.sampling.topP<=1)
+    ? input.sampling.topP
+    : .9;
+  const seed=(typeof input.sampling?.seed==="number"&&Number.isFinite(input.sampling.seed)&&input.sampling.seed>=0)
+    ? Math.floor(input.sampling.seed)
+    : undefined;
   const policy=buildExecutionPolicy(task,capabilities,hardCap,maxTools)!;
   policy.maxConcurrent=task.risk==="destructive"?1:1;
   policy.stepBudget=hardCap;
@@ -100,9 +109,12 @@ export function buildPlan(input:OrchestratorInput):AdaptivePlan{
   if(model.vision)rationale.push(`${model.name} accepts images.`);
   if(model.thinking)rationale.push(`${model.name} exposes native thinking/reasoning capability; Photon will bound it per task.`);
   if(input.bench)rationale.push("Photon Bench capability profile applied.");
+  if(input.sampling && (input.sampling.temp!==undefined||input.sampling.topP!==undefined||input.sampling.seed!==undefined)){
+    rationale.push(`Per-model sampling override applied: temp=${temperature}, topP=${topP}${seed!==undefined?`, seed=${seed}`:""}.`);
+  }
   rationale.push(`Execution: temp=${temperature}, generationBudget=${policy.generationBudgetTokens} tok, stepBudget=${policy.stepBudget}.`);
 
-  return{model:model.name,mode,contextWindow:numCtx,numCtx,temperature,topP:.9,maxOutputTokens,toolProtocol,maxTools,allowParallelTools:false,intelligence:level,intelligenceAuto:auto,rationale,task,modelCapabilities:capabilities,executionPolicy:policy,verification};
+  return{model:model.name,mode,contextWindow:numCtx,numCtx,temperature,topP,...(seed!==undefined?{seed}:{}),maxOutputTokens,toolProtocol,maxTools,allowParallelTools:false,intelligence:level,intelligenceAuto:auto,rationale,task,modelCapabilities:capabilities,executionPolicy:policy,verification};
 }
 
 /**

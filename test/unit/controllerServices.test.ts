@@ -73,6 +73,7 @@ function makeInMemoryCatalogStorage(): ProviderCatalogStorage & {
       delete state.secrets[id];
     },
     getLlamaCppBaseUrl: () => "http://localhost:8080",
+    getLlamaCppRequestTimeoutMs: () => 450_000,
     getCustomProviders: () => state.customProviders,
     setCustomProviders: async (providers) => {
       state.customProviders = [...providers];
@@ -151,6 +152,7 @@ describe("ProviderCatalogService (Item 12)", () => {
           tier: "large",
           contextLength: 128000,
           toolTrained: true,
+          thinking: true,
         },
       ],
       "openai"
@@ -158,6 +160,75 @@ describe("ProviderCatalogService (Item 12)", () => {
     assert.equal(converted.length, 1);
     assert.equal(converted[0].id, "gpt-4o");
     assert.equal(converted[0].name, "openai:gpt-4o");
+    assert.deepEqual(converted[0].thinkingLevels, ["off", "low", "medium", "high"]);
+  });
+
+  it("manages custom provider lifecycle: add, enable/disable, update, clear key, and remove", async () => {
+    const storage = makeInMemoryCatalogStorage();
+    const service = new ProviderCatalogService(storage);
+
+    // Built-in ID collision avoided; /chat/completions stripped; requireApiKey preserved
+    const id = await service.addCustomProvider({
+      label: "OpenAI",
+      baseUrl: "http://localhost:1234/v1/chat/completions/",
+      requireApiKey: false,
+    });
+    assert.ok(id);
+    assert.notEqual(id, "openai");
+    assert.equal(storage.getCustomProviders().length, 1);
+    assert.equal(storage.getCustomProviders()[0].baseUrl, "http://localhost:1234/v1");
+    assert.equal(storage.getCustomProviders()[0].enabled, true);
+    assert.equal(storage.getCustomProviders()[0].requireApiKey, false);
+
+    // Toggle disabled & re-enabled persists on customProviders array
+    await service.setProviderEnabledState(id!, false);
+    assert.equal(storage.getCustomProviders()[0].enabled, false);
+    await service.setProviderApiKeyState(id!, "sk-custom-key");
+    assert.equal(storage.secrets[id!], "sk-custom-key");
+    assert.equal(storage.getCustomProviders()[0].enabled, true);
+
+    // Update custom provider URL, auth mode, and explicitly clear SecretStorage key
+    const updated = await service.updateCustomProvider({
+      id: id!,
+      label: "Local LM Studio",
+      baseUrl: "http://127.0.0.1:1234/v1/models",
+      requireApiKey: false,
+      clearApiKey: true,
+    });
+    assert.equal(updated, true);
+    assert.equal(storage.getCustomProviders()[0].label, "Local LM Studio");
+    assert.equal(storage.getCustomProviders()[0].baseUrl, "http://127.0.0.1:1234/v1");
+    assert.equal(storage.secrets[id!], undefined);
+
+    // Legacy plaintext apiKey must NOT override SecretStorage when building cloud providers
+    await storage.setSecretApiKey(id!, "sk-secret-wins");
+    await storage.setCustomProviders([
+      { ...storage.getCustomProviders()[0], apiKey: "sk-legacy-plaintext" },
+    ]);
+    const builtProviders = await service.buildCloudProviders();
+    const rebuiltCustom = builtProviders.find((p) => p.id === id!);
+    assert.ok(rebuiltCustom);
+    assert.equal((rebuiltCustom as any).apiKey, "sk-secret-wins");
+
+    // Add picker model, then clear key and remove custom provider
+    await service.addModelToPicker(id!, { name: "qwen2.5-coder", tier: "medium" });
+    assert.equal(service.addedModels().length, 1);
+    await service.setProviderApiKeyState(id!, "");
+    assert.equal(storage.secrets[id!], undefined);
+
+    const removed = await service.removeCustomProvider(id!);
+    assert.equal(removed, true);
+    assert.equal(storage.getCustomProviders().length, 0);
+    assert.equal(service.addedModels().length, 0);
+  });
+
+  it("passes configured llamacpp request timeout to built OpenAICompatProvider", async () => {
+    const storage = makeInMemoryCatalogStorage();
+    storage.enabledMap["llamacpp"] = true;
+    const service = new ProviderCatalogService(storage);
+    const provider = await service.buildLlamaCppProvider();
+    assert.ok(provider);
+    assert.equal((provider as any).idleTimeoutMs, 450_000);
   });
 });
 
@@ -189,15 +260,28 @@ describe("ApprovalService & parseMcpConfigJson (Item 12)", () => {
 
     const resolution = approvals.resolveApproval("c2", true, true, "write_file");
     assert.equal(resolution.resolved, true);
-    assert.equal(resolution.autoApproveChanged, true);
+    assert.equal(resolution.autoApproveChanged, false);
     assert.equal(await p, true);
-    assert.equal(approvals.autoApprove, true);
-    assert.equal(approvals.isSessionAutoApprove, true);
+    assert.equal(approvals.autoApprove, false);
+    assert.equal(approvals.isSessionAutoApprove, false);
     assert.equal(approvals.isUserConfiguredAutoApprove, false);
 
-    // Session clearing resets session-level autoApprove cleanly
+    // Subsequent write_file is auto-approved in session, while unrelated edit_file / run_command still prompt
+    assert.equal(await approvals.requestApproval({ ...writeCall, id: "c2b" }, (c) => posted.push(c)), true);
+    assert.equal(posted.length, 1);
+
+    let editPosted = false;
+    const pEdit = approvals.requestApproval(
+      { id: "c2c", name: "edit_file", args: { path: "a.txt" }, status: "pending", sideEffecting: true },
+      () => { editPosted = true; }
+    );
+    assert.equal(editPosted, true);
+    approvals.resolveApproval("c2c", false);
+    assert.equal(await pEdit, false);
+
+    // Session clearing resets session-approved tool names cleanly
     const clearResult = approvals.clearSessionApprovals();
-    assert.equal(clearResult.autoApproveChanged, true);
+    assert.equal(clearResult.autoApproveChanged, false);
     assert.equal(approvals.autoApprove, false);
     assert.equal(approvals.isSessionAutoApprove, false);
 
@@ -628,6 +712,46 @@ describe("Phase 9: Architecture & Focused Services", () => {
       assert.equal(turnCoord.getQueueLength(), 2);
       turnCoord.clearQueue();
       assert.equal(turnCoord.getQueueLength(), 0);
+    });
+
+    it("queues subsequent turns sequentially if abortTurn is called before in-flight cleanup finishes", async () => {
+      const turnCoord = new TurnCoordinator({
+        post: () => {},
+        output: { appendLine: () => {} },
+      });
+
+      const order: string[] = [];
+      let releaseTurn1Cleanup!: () => void;
+      const turn1CleanupBarrier = new Promise<void>((r) => (releaseTurn1Cleanup = r));
+
+      const p1 = turnCoord.enqueueOrRun({ text: "first" }, async () => {
+        const sig = turnCoord.createTurnSignal();
+        order.push("start:first");
+        await new Promise<void>((resolve) => {
+          sig.addEventListener("abort", () => resolve(), { once: true });
+        });
+        await turn1CleanupBarrier;
+        order.push("end:first");
+      });
+
+      await new Promise((r) => setImmediate(r));
+      assert.equal(turnCoord.isTurnActive(), true);
+
+      turnCoord.abortTurn();
+      assert.equal(turnCoord.isTurnActive(), true, "Turn remains active until unwinding finally finishes");
+
+      const p2 = turnCoord.enqueueOrRun({ text: "second" }, async () => {
+        order.push("start:second");
+        order.push("end:second");
+      });
+
+      await new Promise((r) => setImmediate(r));
+      assert.deepEqual(order, ["start:first"]);
+
+      releaseTurn1Cleanup();
+      await Promise.all([p1, p2]);
+      assert.deepEqual(order, ["start:first", "end:first", "start:second", "end:second"]);
+      assert.equal(turnCoord.isTurnActive(), false);
     });
   });
 

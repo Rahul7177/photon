@@ -14,6 +14,7 @@ export interface TurnEmitter {
   onPhase(phase: "thinking" | "working", detail?: string): void;
   onToolCall(messageId: string, call: ToolCall): void;
   onToolUpdate(messageId: string, call: ToolCall): void;
+  onQueuedTools?(calls: ToolCall[]): void;
   onUsage(usage: import("../../shared/types").TokenUsage): void;
   onGenerationStats(stats: import("../../shared/types").GenerationStats | null): void;
   onDone(messageId: string, notice?: string): void;

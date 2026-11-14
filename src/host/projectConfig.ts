@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
-import * as vscode from "vscode";
+import * as path from "node:path";
 import type { IntelligenceSetting, PerModelConfig } from "../shared/types";
+import type { ProjectConfigStatus } from "../shared/protocol";
 
 /**
  * Checked-in, team-shareable project configuration (Module 5). Lives at
@@ -42,47 +43,105 @@ export interface LoadResult {
   error?: string;
 }
 
-/** Load + validate the project config, trying JSON then the flat-YAML form. */
-export function loadProjectConfig(): LoadResult {
-  const root = vscode.workspace.workspaceFolders?.[0]?.uri;
-  if (!root) return { config: null };
+export const DEFAULT_PROJECT_CONFIG_TEMPLATE = JSON.stringify(
+  {
+    version: 1,
+    intelligence: "auto",
+    indexing: true,
+    modelConfigs: {},
+  },
+  null,
+  2
+);
+
+/** Summarize a loaded project config for UI status display. */
+export function summarizeProjectConfig(
+  result: LoadResult,
+  workspaceRoot?: string
+): ProjectConfigStatus {
+  const relPath =
+    result.path && workspaceRoot
+      ? path.relative(workspaceRoot, result.path).replace(/\\/g, "/")
+      : result.path;
+  if (!result.config) {
+    return {
+      loaded: false,
+      ...(result.path ? { path: result.path, relativePath: relPath } : {}),
+      ...(result.error ? { error: result.error } : {}),
+      fields: [],
+      modelConfigKeys: [],
+    };
+  }
+  const fields: string[] = [];
+  if (result.config.model) fields.push(`model: ${result.config.model}`);
+  if (result.config.intelligence) fields.push(`scaffolding: ${result.config.intelligence}`);
+  if (result.config.numCtx) fields.push(`numCtx: ${result.config.numCtx}`);
+  if (result.config.indexing !== undefined) fields.push(`indexing: ${result.config.indexing ? "on" : "off"}`);
+  const modelConfigKeys = Object.keys(result.config.modelConfigs ?? {});
+  return {
+    loaded: true,
+    ...(result.path ? { path: result.path, relativePath: relPath } : {}),
+    ...(result.error ? { error: result.error } : {}),
+    fields,
+    modelConfigKeys,
+    ...(result.config.autoApprove ? { autoApproveIgnored: true } : {}),
+  };
+}
+
+/** Load + validate the project config for a specific workspace directory. */
+export function loadProjectConfigFromDir(workspaceRoot: string): LoadResult {
+  if (!workspaceRoot) return { config: null };
 
   for (const file of ["config.json", "config.yaml", "config.yml"]) {
-    const path = vscode.Uri.joinPath(root, ".photon", file).fsPath;
+    const filePath = path.join(workspaceRoot, ".photon", file);
     let raw: string;
     try {
-      raw = fs.readFileSync(path, "utf8");
+      raw = fs.readFileSync(filePath, "utf8");
     } catch {
       continue; // not present — try the next
     }
     try {
       const parsed = file.endsWith(".json") ? JSON.parse(raw) : parseFlatYaml(raw);
-      const config = validate(parsed);
+      const config = validateProjectConfig(parsed);
       // A YAML file that parsed to zero keys means we couldn't read the user's
       // actual config (e.g. nested YAML). Report it — never silently default.
       if (!file.endsWith(".json") && Object.keys(parsed).length === 0) {
         return {
           config: null,
-          path,
+          path: filePath,
           error: `.photon/${file} contained no recognizable settings. This parser supports only flat "key: value" pairs — use .photon/config.json for nested YAML.`,
         };
       }
       // Phase 1.4: Return per-model configs for file-wins merging
-      return { config, modelConfigs: config.modelConfigs, path };
+      return { config, modelConfigs: config.modelConfigs, path: filePath };
     } catch (e) {
-      return { config: null, path, error: `Could not parse .photon/${file}: ${(e as Error).message}` };
+      return { config: null, path: filePath, error: `Could not parse .photon/${file}: ${(e as Error).message}` };
     }
   }
   return { config: null };
 }
 
+/** Load + validate the project config, trying JSON then the flat-YAML form. */
+export function loadProjectConfig(): LoadResult {
+  // Deferred require keeps validateProjectConfig / summarizeProjectConfig / loadProjectConfigFromDir runnable in Node tests.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const vscode = require("vscode") as typeof import("vscode");
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!root) return { config: null };
+  return loadProjectConfigFromDir(root);
+}
+
 /** Coerce + validate a raw object into a ProjectConfig, ignoring unknown keys. */
-function validate(raw: unknown): ProjectConfig {
-  if (!raw || typeof raw !== "object") throw new Error("expected a top-level object");
+export function validateProjectConfig(raw: unknown): ProjectConfig {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("expected a top-level object");
+  }
   const o = raw as Record<string, unknown>;
-  const version = typeof o.version === "number" ? o.version : CURRENT_VERSION;
-  if (version > CURRENT_VERSION) {
-    throw new Error(`version ${version} is newer than this Photon supports (${CURRENT_VERSION})`);
+  const version = o.version === undefined ? CURRENT_VERSION : Number(o.version);
+  if (!Number.isInteger(version) || version < 1 || version > CURRENT_VERSION) {
+    throw new Error(
+      `unsupported config version "${String(o.version)}" (supported: 1..${CURRENT_VERSION})`
+    );
   }
   const config: ProjectConfig = { version };
 
@@ -90,40 +149,64 @@ function validate(raw: unknown): ProjectConfig {
   if (typeof o.intelligence === "string" && VALID_INTELLIGENCE.includes(o.intelligence as IntelligenceSetting)) {
     config.intelligence = o.intelligence as IntelligenceSetting;
   }
-  if (typeof o.numCtx === "number" && o.numCtx > 0) config.numCtx = Math.floor(o.numCtx);
+  if (typeof o.numCtx === "number" && Number.isFinite(o.numCtx) && o.numCtx > 0) {
+    config.numCtx = Math.floor(o.numCtx);
+  }
   if (typeof o.indexing === "boolean") config.indexing = o.indexing;
   if (typeof o.autoApprove === "boolean") config.autoApprove = o.autoApprove;
 
   // Phase 1.4: Per-model configs — a map of model-name → PerModelConfig
   // Example: { "llamacpp:gemma": { "numCtx": 32768, "llamacpp": { "ngl": "all" }, "sampling": { "temp": 0.7 } } }
-  if (o.modelConfigs && typeof o.modelConfigs === "object") {
+  if (o.modelConfigs && typeof o.modelConfigs === "object" && !Array.isArray(o.modelConfigs)) {
     const mc = o.modelConfigs as Record<string, unknown>;
     const validated: Record<string, PerModelConfig> = {};
     for (const [key, val] of Object.entries(mc)) {
-      if (!key.trim() || typeof val !== "object" || !val) continue;
+      if (!key.trim() || typeof val !== "object" || !val || Array.isArray(val)) continue;
       const parsed = val as Record<string, unknown>;
       const cfg: PerModelConfig = {};
-      if (typeof parsed.numCtx === "number" && parsed.numCtx > 0) cfg.numCtx = Math.floor(parsed.numCtx);
-      if (typeof parsed.note === "string") cfg.note = parsed.note;
-      if (parsed.llamacpp && typeof parsed.llamacpp === "object") {
+      if (typeof parsed.numCtx === "number" && Number.isFinite(parsed.numCtx) && parsed.numCtx > 0) {
+        cfg.numCtx = Math.floor(parsed.numCtx);
+      }
+      if (typeof parsed.note === "string" && parsed.note.trim()) cfg.note = parsed.note.trim();
+      if (parsed.llamacpp && typeof parsed.llamacpp === "object" && !Array.isArray(parsed.llamacpp)) {
         const lc = parsed.llamacpp as Record<string, unknown>;
         cfg.llamacpp = {};
-        if (typeof lc.ctx === "number" && lc.ctx > 0) cfg.llamacpp.ctx = lc.ctx;
-        if (lc.ngl !== undefined) cfg.llamacpp.ngl = typeof lc.ngl === "number" ? lc.ngl : (lc.ngl === "all" ? "all" : Number(lc.ngl) || undefined);
+        if (typeof lc.ctx === "number" && Number.isFinite(lc.ctx) && lc.ctx > 0) {
+          cfg.llamacpp.ctx = Math.floor(lc.ctx);
+        }
+        if (lc.ngl !== undefined) {
+          const nglRaw = typeof lc.ngl === "string" ? lc.ngl.trim().toLowerCase() : lc.ngl;
+          if (nglRaw === "all") {
+            cfg.llamacpp.ngl = "all";
+          } else if (nglRaw !== "") {
+            const n = Number(nglRaw);
+            if (Number.isFinite(n) && n >= 0) {
+              cfg.llamacpp.ngl = Math.floor(n);
+            }
+          }
+        }
         if (typeof lc.fit === "boolean") cfg.llamacpp.fit = lc.fit;
-        if (typeof lc.np === "number" && lc.np > 0) cfg.llamacpp.np = lc.np;
+        if (typeof lc.np === "number" && Number.isFinite(lc.np) && lc.np > 0) {
+          cfg.llamacpp.np = Math.floor(lc.np);
+        }
         if (typeof lc.fa === "boolean") cfg.llamacpp.fa = lc.fa;
-        if (typeof lc.ctk === "string") cfg.llamacpp.ctk = lc.ctk;
-        if (typeof lc.ctv === "string") cfg.llamacpp.ctv = lc.ctv;
-        if (typeof lc.extraArgs === "string") cfg.llamacpp.extraArgs = lc.extraArgs;
+        if (typeof lc.ctk === "string" && lc.ctk.trim()) cfg.llamacpp.ctk = lc.ctk.trim();
+        if (typeof lc.ctv === "string" && lc.ctv.trim()) cfg.llamacpp.ctv = lc.ctv.trim();
+        if (typeof lc.extraArgs === "string" && lc.extraArgs.trim()) cfg.llamacpp.extraArgs = lc.extraArgs.trim();
         if (Object.keys(cfg.llamacpp).length === 0) delete cfg.llamacpp;
       }
-      if (parsed.sampling && typeof parsed.sampling === "object") {
+      if (parsed.sampling && typeof parsed.sampling === "object" && !Array.isArray(parsed.sampling)) {
         const sp = parsed.sampling as Record<string, unknown>;
         cfg.sampling = {};
-        if (typeof sp.temp === "number") cfg.sampling.temp = sp.temp;
-        if (typeof sp.topP === "number") cfg.sampling.topP = sp.topP;
-        if (typeof sp.seed === "number") cfg.sampling.seed = sp.seed;
+        if (typeof sp.temp === "number" && Number.isFinite(sp.temp) && sp.temp >= 0 && sp.temp <= 2) {
+          cfg.sampling.temp = sp.temp;
+        }
+        if (typeof sp.topP === "number" && Number.isFinite(sp.topP) && sp.topP > 0 && sp.topP <= 1) {
+          cfg.sampling.topP = sp.topP;
+        }
+        if (typeof sp.seed === "number" && Number.isFinite(sp.seed) && sp.seed >= 0) {
+          cfg.sampling.seed = Math.floor(sp.seed);
+        }
         if (Object.keys(cfg.sampling).length === 0) delete cfg.sampling;
       }
       if (Object.keys(cfg).length > 0) validated[key.trim()] = cfg;

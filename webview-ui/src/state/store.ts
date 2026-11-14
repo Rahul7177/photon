@@ -48,6 +48,8 @@ export interface AppState {
   usage: TokenUsage | null;
   generationStats: GenerationStats | null;
   pendingApproval: ToolCall | null;
+  queuedTools: ToolCall[];
+  toolStartTimes: Record<string, number>;
   config: PhotonConfig;
   tools: ToolSummary[];
   error: string | null;
@@ -110,6 +112,8 @@ export const initial: AppState = {
   usage: null,
   generationStats: null,
   pendingApproval: null,
+  queuedTools: [],
+  toolStartTimes: {},
   config: initialConfig,
   tools: [],
   error: null,
@@ -160,7 +164,7 @@ export function reducer(state: AppState, msg: Action): AppState {
     case "_setModel": return { ...state, selectedModel: msg.model, config: { ...state.config, autoSelectModel: false } };
     case "_fetchProviderModels": return { ...state, providerModelsFetching: [...state.providerModelsFetching, msg.id], providerModelsError: { ...state.providerModelsError, [msg.id]: "" } };
     case "_testModel": return { ...state, modelTestRunning: [...state.modelTestRunning, modelTestKey(msg.providerId, msg.model.name)] };
-    case "init": return { ...state, ready: true, ollamaReachable: msg.payload.ollamaReachable, models: msg.payload.models, selectedModel: msg.payload.selectedModel, mode: msg.payload.mode, machine: msg.payload.machine, plan: msg.payload.plan, messages: msg.payload.session.messages, sessions: msg.payload.sessions, activeSessionId: msg.payload.session.id, config: msg.payload.config, tools: msg.payload.tools, benchResults: msg.payload.benchResults, indexStatus: msg.payload.indexStatus, mcpServers: msg.payload.mcpServers, modelConfigs: (msg.payload as any).modelConfigs ?? {}, ollamaRuntime: msg.payload.ollamaRuntime ?? [], hardwareMetrics: msg.payload.hardwareMetrics ?? null, cloudUsage: msg.payload.cloudUsage ?? null, projectContext: msg.payload.projectContext ?? state.projectContext, usage: msg.payload.session.usage ?? state.usage, showOnboarding: Boolean(msg.payload.showOnboarding) };
+    case "init": return { ...state, ready: true, ollamaReachable: msg.payload.ollamaReachable, models: msg.payload.models, selectedModel: msg.payload.selectedModel, mode: msg.payload.mode, machine: msg.payload.machine, plan: msg.payload.plan, messages: msg.payload.session.messages, sessions: msg.payload.sessions, activeSessionId: msg.payload.session.id, config: msg.payload.config, tools: msg.payload.tools, benchResults: msg.payload.benchResults, indexStatus: msg.payload.indexStatus, mcpServers: msg.payload.mcpServers, modelConfigs: (msg.payload as any).modelConfigs ?? {}, ollamaRuntime: msg.payload.ollamaRuntime ?? [], hardwareMetrics: msg.payload.hardwareMetrics ?? null, cloudUsage: msg.payload.cloudUsage ?? null, projectContext: msg.payload.projectContext ?? state.projectContext, usage: msg.payload.session.usage ?? state.usage, queuedTools: [], toolStartTimes: {}, showOnboarding: Boolean(msg.payload.showOnboarding) };
     case "models": return { ...state, models: msg.payload.models, selectedModel: msg.payload.selected, ollamaReachable: msg.payload.ollamaReachable };
     case "sessionLoaded": {
       const isSameSession = msg.payload.id === state.activeSessionId;
@@ -178,6 +182,9 @@ export function reducer(state: AppState, msg: Action): AppState {
         error: state.error && state.status === "idle" ? state.error : null,
         usage: msg.payload.usage ?? (isSameSession ? state.usage : null),
         generationStats: null,
+        queuedTools: [],
+        toolStartTimes: isSameSession ? state.toolStartTimes : {},
+        decision: isSameSession ? state.decision : null,
       };
     }
     case "sessionList": return { ...state, sessions: msg.payload.sessions, activeSessionId: msg.payload.activeId };
@@ -190,20 +197,37 @@ export function reducer(state: AppState, msg: Action): AppState {
     case "messageDone": return { ...state, messages: state.messages.map((m) => m.id === msg.payload.id ? { ...m, streaming: false } : m) };
     case "messageRemoved": return { ...state, messages: state.messages.filter((m) => m.id !== msg.payload.id) };
     case "toolUpdate": {
+      const callId = msg.payload.call.id;
+      const isRunning = msg.payload.call.status === "running";
+      const nextStartTimes =
+        isRunning && !state.toolStartTimes[callId]
+          ? { ...state.toolStartTimes, [callId]: Date.now() }
+          : state.toolStartTimes;
+      const nextQueued =
+        state.queuedTools.length > 0
+          ? state.queuedTools.filter((q) => q.id !== callId)
+          : state.queuedTools;
       const clearedApproval =
-        state.pendingApproval?.id === msg.payload.call.id &&
+        state.pendingApproval?.id === callId &&
         ["done", "error", "denied", "cancelled"].includes(msg.payload.call.status)
           ? null
           : state.pendingApproval;
       const existing = state.messages.find((m) => m.id === msg.payload.messageId);
       if (!existing) {
-        const isCurrentTurn = state.status !== "idle" || state.pendingApproval?.id === msg.payload.call.id;
+        const isCurrentTurn = state.status !== "idle" || state.pendingApproval?.id === callId;
         if (!isCurrentTurn || state.messages.length >= 500) {
-          return { ...state, pendingApproval: clearedApproval };
+          return {
+            ...state,
+            pendingApproval: clearedApproval,
+            queuedTools: nextQueued,
+            toolStartTimes: nextStartTimes,
+          };
         }
         return {
           ...state,
           pendingApproval: clearedApproval,
+          queuedTools: nextQueued,
+          toolStartTimes: nextStartTimes,
           messages: [
             ...state.messages,
             {
@@ -220,11 +244,14 @@ export function reducer(state: AppState, msg: Action): AppState {
       return {
         ...state,
         pendingApproval: clearedApproval,
+        queuedTools: nextQueued,
+        toolStartTimes: nextStartTimes,
         messages: state.messages.map((m) =>
           m.id === msg.payload.messageId ? applyToolUpdate(m, msg.payload.call) : m
         ),
       };
     }
+    case "queuedTools": return { ...state, queuedTools: msg.payload };
     case "toolApprovalRequest": return { ...state, pendingApproval: msg.payload.call };
     case "tokenUsage": return { ...state, usage: msg.payload };
     case "generationStats": return { ...state, generationStats: msg.payload };
@@ -240,6 +267,8 @@ export function reducer(state: AppState, msg: Action): AppState {
         statusDetail: msg.payload.detail ?? null,
         error: nextKind === "error" ? msg.payload.detail ?? state.error : state.error,
         pendingApproval: isIdleOrError ? null : state.pendingApproval,
+        queuedTools: isIdleOrError ? [] : state.queuedTools,
+        toolStartTimes: isIdleOrError ? {} : state.toolStartTimes,
         messages: nextMessages,
       };
     }
@@ -315,6 +344,8 @@ export function reducer(state: AppState, msg: Action): AppState {
         status: "idle",
         statusDetail: null,
         pendingApproval: null,
+        queuedTools: [],
+        toolStartTimes: {},
         generationStats: null,
         isCompacting: false,
         messages: nextMessages,
@@ -394,6 +425,8 @@ export function useAppState() {
     newSession: () => post({ type: "newSession" }),
     switchSession: (id: string) => post({ type: "switchSession", payload: { id } }),
     deleteSession: (id: string) => post({ type: "deleteSession", payload: { id } }),
+    togglePinSession: (id: string) => post({ type: "togglePinSession", payload: { id } }),
+    renameSession: (id: string, title: string) => post({ type: "renameSession", payload: { id, title } }),
     refreshModels: () => post({ type: "refreshModels" }),
     approve: (callId: string, approved: boolean, remember?: boolean, toolName?: string) => post({ type: "toolApproval", payload: { callId, approved, remember, toolName } }),
     setContextWindow: (numCtx: number) => post({ type: "setContextWindow", payload: { numCtx } }),
@@ -429,15 +462,31 @@ export function useAppState() {
     addProjectNote: (payload: { category: ProjectMemoryNote["category"]; title: string; content: string; relatedFiles?: string[] }) => post({ type: "addProjectNote", payload }),
     deleteProjectNote: (id: string) => post({ type: "deleteProjectNote", payload: { id } }),
     clearWorkingMemory: () => post({ type: "clearWorkingMemory" }),
+    setEmbeddingModel: (model: string) => post({ type: "setEmbeddingModel", payload: { model } }),
     reindex: () => post({ type: "reindex" }),
-    approveMcpServer: (id: string) => post({ type: "approveMcpServer", payload: { id } }),
+    approveMcpServer: (
+      id: string,
+      expectedFingerprint?: string,
+      scope: "persistent" | "session" | "one_time" = "persistent"
+    ) => post({ type: "approveMcpServer", payload: { id, expectedFingerprint, scope } }),
     revokeMcpServer: (id: string) => post({ type: "revokeMcpServer", payload: { id } }),
     diagnostics: () => post({ type: "openDiagnostics" }),
+    openProjectConfig: () => post({ type: "openProjectConfig" }),
+    createProjectConfig: () => post({ type: "createProjectConfig" }),
     fetchProviderModels: (id: string) => { dispatch({ type: "_fetchProviderModels", id }); post({ type: "fetchProviderModels", payload: { id } }); },
     testModel: (providerId: string, model: ModelInfo) => { dispatch({ type: "_testModel", providerId, model }); post({ type: "testModel", payload: { providerId, model } }); },
     addAvailableModel: (providerId: string, model: ModelInfo) => post({ type: "addAvailableModel", payload: { providerId, model } }),
     removeAvailableModel: (name: string) => post({ type: "removeAvailableModel", payload: { name } }),
-    addCustomProvider: (label: string, baseUrl: string, apiKey?: string) => post({ type: "addCustomProvider", payload: { label, baseUrl, apiKey } }),
+    addCustomProvider: (label: string, baseUrl: string, apiKey?: string, requireApiKey?: boolean) =>
+      post({ type: "addCustomProvider", payload: { label, baseUrl, apiKey, requireApiKey } }),
+    updateCustomProvider: (
+      id: string,
+      label: string,
+      baseUrl: string,
+      apiKey?: string,
+      requireApiKey?: boolean,
+      clearApiKey?: boolean
+    ) => post({ type: "updateCustomProvider", payload: { id, label, baseUrl, apiKey, requireApiKey, clearApiKey } }),
     removeCustomProvider: (id: string) => post({ type: "removeCustomProvider", payload: { id } }),
     compactContext: (focus?: string) => post({ type: "compactContext", payload: { focus } }),
     rollbackCheckpoint: (checkpointId: string, rewindChat = true) => post({ type: "rollbackCheckpoint", payload: { checkpointId, rewindChat } }),

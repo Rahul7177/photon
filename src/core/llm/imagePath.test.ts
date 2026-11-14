@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { OpenAICompatProvider } from "./providers/openaiCompatProvider";
 import { GeminiProvider } from "./providers/geminiProvider";
+import { normalizeAnthropicMessages, normalizeGeminiMessages, normalizeImageData } from "./normalizeMessages";
 import type { LLMMessage } from "./types";
 // readClipboardBlobToAttachment is defined in the webview-ui attachments module
 // Import via relative path from the test file's perspective
@@ -179,4 +180,30 @@ test("image 06: readClipboardBlobToAttachment rejects oversized images", async (
   const result = await readClipboardBlobToAttachment(bigBlob);
   assert.ok(result.error, "Should return error for oversized image");
   assert.ok(result.error!.includes("too large"), "Error should mention size");
+});
+
+test("image 07: normalizeImageData detects JPEG, GIF, WebP, PNG and strips data URI prefix", () => {
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]).toString("base64");
+  const gif = Buffer.from("GIF89a\x01\x00").toString("base64");
+  const webp = Buffer.from("RIFF\x00\x00\x00\x00WEBP").toString("base64");
+
+  assert.deepEqual(normalizeImageData(jpeg), { mimeType: "image/jpeg", data: jpeg });
+  assert.deepEqual(normalizeImageData(gif), { mimeType: "image/gif", data: gif });
+  assert.deepEqual(normalizeImageData(webp), { mimeType: "image/webp", data: webp });
+  assert.deepEqual(normalizeImageData(`data:image/jpeg;base64,${jpeg}`), { mimeType: "image/jpeg", data: jpeg });
+
+  const anthropic = normalizeAnthropicMessages([{ role: "user", content: "hi", images: [jpeg] }]);
+  const block = (anthropic.messages[0].content as Array<Record<string, unknown>>).find((b) => b.type === "image");
+  assert.equal((block?.source as { media_type?: string }).media_type, "image/jpeg");
+
+  const gemini = normalizeGeminiMessages([{ role: "user", content: "hi", images: [webp] }]);
+  const gImg = gemini.contents[0].parts.find((p) => "inlineData" in p);
+  assert.equal((gImg?.inlineData as { mimeType?: string }).mimeType, "image/webp");
+});
+
+test("image 08: readClipboardBlobToAttachment rejects empty 0-byte image blobs", async () => {
+  const emptyBlob = new Blob([], { type: "image/png" });
+  const result = await readClipboardBlobToAttachment(emptyBlob);
+  assert.ok(result.error, "Should return error for empty 0-byte blob");
+  assert.match(result.error!, /empty/i);
 });

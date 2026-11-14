@@ -596,10 +596,15 @@ export const editFileTool: Tool = {
       const approved = await ctx.requestApproval(mkCall("edit_file", args, ctx.pendingCallId));
       if (!approved) return toolError("permission_denied", "User declined the edit.");
       try {
-        const recheck = resolveInWorkspace(ctx.workspaceRoot, rel);
-        if ("error" in recheck) return toolError("not_found", recheck.error);
+        await ctx.checkpointTracker?.recordBeforeChange(rel);
         const sep = original.length === 0 || original.endsWith("\n") ? "" : "\n";
-        await fs.appendFile(recheck.abs, sep + newStr, "utf8");
+        const updatedText = (hasBom ? "\uFEFF" : "") + original + sep + newStr;
+        await atomicWriteFile(ctx.workspaceRoot!, rel, updatedText);
+        const addedLines = newStr.split("\n").length;
+        void getProjectContextManager(ctx.workspaceRoot)?.recordFileEdit(
+          rel,
+          `Appended +${addedLines} line${addedLines === 1 ? "" : "s"}`
+        );
         return ok(`Appended to ${rel}.`);
       } catch (e: any) {
         if (e?.code === "EACCES" || e?.code === "EPERM") {
@@ -633,6 +638,10 @@ export const editFileTool: Tool = {
         const toWrite = hasBom ? "\uFEFF" + newStr : newStr;
         await atomicWriteFile(ctx.workspaceRoot!, rel, toWrite);
         const lines = newStr.split("\n").length;
+        void getProjectContextManager(ctx.workspaceRoot)?.recordFileEdit(
+          rel,
+          `Replaced whole file (${lines} line${lines === 1 ? "" : "s"})`
+        );
         return ok(`Replaced ${rel} (whole file, ${lines} line${lines === 1 ? "" : "s"}).`);
       } catch (e: any) {
         if (e?.code === "EACCES" || e?.code === "EPERM") {
@@ -735,6 +744,10 @@ export const appendFileTool: Tool = {
 
       await ctx.checkpointTracker?.recordBeforeChange(rel);
       await fs.appendFile(recheck.abs, separator + content, "utf8");
+      const ctxMgr = getProjectContextManager(ctx.workspaceRoot);
+      if (ctxMgr) {
+        await ctxMgr.recordFileEdit(rel, `Appended ${content.length} chars`);
+      }
       return ok(`Appended content to ${rel}. Existing content was preserved.`);
     } catch (e: any) {
       if (e?.code === "EACCES" || e?.code === "EPERM") return toolError("permission_denied", `Permission denied appending to "${rel}": file is read-only.`);
@@ -791,12 +804,14 @@ export const movePathTool: Tool = {
       await ctx.checkpointTracker?.recordBeforeChange(toRel);
       await fs.mkdir(path.dirname(recheckDst.abs), { recursive: true });
       await fs.rename(recheckSrc.abs, recheckDst.abs);
+      getProjectContextManager(ctx.workspaceRoot)?.renameFile(fromRel, toRel);
       return ok(`Moved ${fromRel} → ${toRel}.`);
     } catch (e: any) {
       if (e?.code === "EXDEV") {
         try {
           await fs.cp(src.abs, dst.abs, { recursive: true });
           await fs.rm(src.abs, { recursive: true });
+          getProjectContextManager(ctx.workspaceRoot)?.renameFile(fromRel, toRel);
           return ok(`Moved ${fromRel} → ${toRel}.`);
         } catch (e2) {
           return toolError("execution_error", `Could not move "${fromRel}" to "${toRel}": ${(e2 as Error).message}`);

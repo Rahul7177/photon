@@ -11,42 +11,61 @@ export interface CloudPricing {
 
 const MODEL_PRICING: Record<string, Omit<CloudPricing, "source">> = {
   // Anthropic
+  "claude-opus-4": { inputPerMillion: 15.0, outputPerMillion: 75.0, cachedInputPerMillion: 1.5 },
+  "claude-sonnet-4": { inputPerMillion: 3.0, outputPerMillion: 15.0, cachedInputPerMillion: 0.3 },
+  "claude-haiku-4": { inputPerMillion: 1.0, outputPerMillion: 5.0, cachedInputPerMillion: 0.1 },
   "claude-3-7-sonnet": { inputPerMillion: 3.0, outputPerMillion: 15.0, cachedInputPerMillion: 0.3 },
   "claude-3-5-sonnet": { inputPerMillion: 3.0, outputPerMillion: 15.0, cachedInputPerMillion: 0.3 },
   "claude-3-5-haiku": { inputPerMillion: 0.8, outputPerMillion: 4.0, cachedInputPerMillion: 0.08 },
   "claude-3-opus": { inputPerMillion: 15.0, outputPerMillion: 75.0, cachedInputPerMillion: 1.5 },
   // OpenAI
-  "gpt-4o": { inputPerMillion: 2.5, outputPerMillion: 10.0, cachedInputPerMillion: 1.25 },
+  "gpt-5": { inputPerMillion: 1.25, outputPerMillion: 10.0, cachedInputPerMillion: 0.125 },
+  "gpt-4.1-mini": { inputPerMillion: 0.4, outputPerMillion: 1.6, cachedInputPerMillion: 0.1 },
+  "gpt-4.1": { inputPerMillion: 2.0, outputPerMillion: 8.0, cachedInputPerMillion: 0.5 },
   "gpt-4o-mini": { inputPerMillion: 0.15, outputPerMillion: 0.6, cachedInputPerMillion: 0.075 },
-  "o1": { inputPerMillion: 15.0, outputPerMillion: 60.0, cachedInputPerMillion: 7.5 },
+  "gpt-4o": { inputPerMillion: 2.5, outputPerMillion: 10.0, cachedInputPerMillion: 1.25 },
+  "o4-mini": { inputPerMillion: 1.1, outputPerMillion: 4.4, cachedInputPerMillion: 0.275 },
   "o3-mini": { inputPerMillion: 1.1, outputPerMillion: 4.4, cachedInputPerMillion: 0.55 },
+  "o3": { inputPerMillion: 2.0, outputPerMillion: 8.0, cachedInputPerMillion: 0.5 },
+  "o1": { inputPerMillion: 15.0, outputPerMillion: 60.0, cachedInputPerMillion: 7.5 },
   // Google Gemini
+  "gemini-2.5-pro": { inputPerMillion: 1.25, outputPerMillion: 10.0, cachedInputPerMillion: 0.31 },
+  "gemini-2.5-flash-lite": { inputPerMillion: 0.1, outputPerMillion: 0.4, cachedInputPerMillion: 0.025 },
+  "gemini-2.5-flash": { inputPerMillion: 0.3, outputPerMillion: 2.5, cachedInputPerMillion: 0.075 },
   "gemini-2.0-flash": { inputPerMillion: 0.1, outputPerMillion: 0.4, cachedInputPerMillion: 0.025 },
   "gemini-1.5-pro": { inputPerMillion: 1.25, outputPerMillion: 5.0, cachedInputPerMillion: 0.3125 },
   "gemini-1.5-flash": { inputPerMillion: 0.075, outputPerMillion: 0.3, cachedInputPerMillion: 0.01875 },
   // DeepSeek
-  "deepseek-chat": { inputPerMillion: 0.14, outputPerMillion: 0.28, cachedInputPerMillion: 0.014 },
+  "deepseek-chat": { inputPerMillion: 0.27, outputPerMillion: 1.1, cachedInputPerMillion: 0.07 },
+  "deepseek-v3": { inputPerMillion: 0.27, outputPerMillion: 1.1, cachedInputPerMillion: 0.07 },
   "deepseek-reasoner": { inputPerMillion: 0.55, outputPerMillion: 2.19, cachedInputPerMillion: 0.14 },
+  "deepseek-r1": { inputPerMillion: 0.55, outputPerMillion: 2.19, cachedInputPerMillion: 0.14 },
+  // xAI
+  "grok-4": { inputPerMillion: 3.0, outputPerMillion: 15.0, cachedInputPerMillion: 0.75 },
+  "grok-3-mini": { inputPerMillion: 0.3, outputPerMillion: 0.5 },
+  "grok-3": { inputPerMillion: 3.0, outputPerMillion: 15.0 },
 };
 
 const USER_PRICING_OVERRIDES = new Map<string, CloudPricing>();
 
+function normalizePricingKey(modelName: string): string {
+  return (modelName ?? "").toLowerCase().replace(/^[a-z0-9-]+:/, "");
+}
+
 export function setUserModelPricing(modelName: string, pricing: Omit<CloudPricing, "source">): void {
-  const norm = (modelName ?? "").toLowerCase().replace(/^(openai|anthropic|gemini|openrouter|custom):/, "");
-  USER_PRICING_OVERRIDES.set(norm, { ...pricing, source: "user-configured" });
+  USER_PRICING_OVERRIDES.set(normalizePricingKey(modelName), { ...pricing, source: "user-configured" });
 }
 
 export function clearUserModelPricing(modelName?: string): void {
   if (modelName) {
-    const norm = (modelName ?? "").toLowerCase().replace(/^(openai|anthropic|gemini|openrouter|custom):/, "");
-    USER_PRICING_OVERRIDES.delete(norm);
+    USER_PRICING_OVERRIDES.delete(normalizePricingKey(modelName));
   } else {
     USER_PRICING_OVERRIDES.clear();
   }
 }
 
 export function getModelPricing(modelName: string): CloudPricing {
-  const norm = (modelName ?? "").toLowerCase().replace(/^(openai|anthropic|gemini|openrouter|custom):/, "");
+  const norm = normalizePricingKey(modelName);
 
   const userOverride = USER_PRICING_OVERRIDES.get(norm);
   if (userOverride) return userOverride;

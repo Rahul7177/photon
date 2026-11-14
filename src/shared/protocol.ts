@@ -57,13 +57,14 @@ export type HostMessage =
   | { type: "messageDone"; payload: { id: string } }
   | { type: "messageRemoved"; payload: { id: string } }
   | { type: "toolUpdate"; payload: { messageId: string; call: ToolCall } }
+  | { type: "queuedTools"; payload: ToolCall[] }
   | { type: "toolApprovalRequest"; payload: { messageId: string; call: ToolCall } }
   | { type: "tokenUsage"; payload: TokenUsage }
   | { type: "generationStats"; payload: GenerationStats | null }
   | { type: "planUpdated"; payload: AdaptivePlan }
   | { type: "config"; payload: PhotonConfig }
   | { type: "status"; payload: { kind: "idle" | "thinking" | "running" | "error"; detail?: string } }
-  | { type: "decision"; payload: AutoDecision }
+  | { type: "decision"; payload: AutoDecision | null }
   | { type: "benchStatus"; payload: { model: string; phase: BenchPhase; message?: string } }
   | { type: "benchResults"; payload: BenchResult[] }
   | { type: "indexStatus"; payload: IndexStatus }
@@ -112,6 +113,16 @@ export interface CheckpointSummary {
   unrestorableFiles?: string[];
 }
 
+export interface ProjectConfigStatus {
+  loaded: boolean;
+  path?: string;
+  relativePath?: string;
+  error?: string;
+  fields: string[];
+  modelConfigKeys: string[];
+  autoApproveIgnored?: boolean;
+}
+
 export interface PhotonConfig {
   autoApprove: boolean;
   adaptiveEnabled: boolean;
@@ -127,6 +138,10 @@ export interface PhotonConfig {
   interfaceMode: "local" | "cloud";
   /** User-facing reasoning control. Auto leaves the model/provider default policy unchanged. */
   thinkingLevel: ThinkingSetting;
+  /** Optional checked-in `.photon/config.*` summary & validation status. */
+  projectConfig?: ProjectConfigStatus;
+  /** Model names currently overridden by `.photon/config.json`. */
+  fileModelConfigKeys?: string[];
 }
 
 export interface ProviderStatus {
@@ -135,6 +150,11 @@ export interface ProviderStatus {
   enabled: boolean;
   configured: boolean;
   modelCount: number;
+  isCustom?: boolean;
+  isLocal?: boolean;
+  baseUrl?: string;
+  requireApiKey?: boolean;
+  supportsLiveModels?: boolean;
 }
 
 export interface ToolSummary {
@@ -176,6 +196,8 @@ export type ViewMessage =
   | { type: "newSession" }
   | { type: "switchSession"; payload: { id: string } }
   | { type: "deleteSession"; payload: { id: string } }
+  | { type: "togglePinSession"; payload: { id: string } }
+  | { type: "renameSession"; payload: { id: string; title: string } }
   | { type: "refreshModels" }
   | { type: "toolApproval"; payload: { callId: string; approved: boolean; remember?: boolean; toolName?: string } }
   | { type: "setContextWindow"; payload: { numCtx: number } }
@@ -204,9 +226,12 @@ export type ViewMessage =
   | { type: "testModel"; payload: { providerId: string; model: ModelInfo } }
   | { type: "addAvailableModel"; payload: { providerId: string; model: ModelInfo } }
   | { type: "removeAvailableModel"; payload: { name: string } }
-  | { type: "addCustomProvider"; payload: { label: string; baseUrl: string; apiKey?: string } }
+  | { type: "addCustomProvider"; payload: { label: string; baseUrl: string; apiKey?: string; requireApiKey?: boolean } }
+  | { type: "updateCustomProvider"; payload: { id: string; label: string; baseUrl: string; apiKey?: string; clearApiKey?: boolean; requireApiKey?: boolean } }
   | { type: "removeCustomProvider"; payload: { id: string } }
   | { type: "openDiagnostics" }
+  | { type: "openProjectConfig" }
+  | { type: "createProjectConfig" }
   /** Files dragged in from VS Code's Explorer arrive as URIs, not File objects. */
   | { type: "attachPaths"; payload: { paths: string[] } }
   | { type: "setPerModelConfig"; payload: { model: string; config: PerModelConfig } }
@@ -237,6 +262,7 @@ export type ViewMessage =
   | { type: "installProvider"; payload: { id: LocalRuntimeInfo["id"]; optionIndex: number } }
   | { type: "requestHardwareMetrics" }
   | { type: "resetCloudUsage" }
+  | { type: "setEmbeddingModel"; payload: { model: string } }
   | { type: "requestProjectContext" }
   | { type: "refreshProjectContext" }
   | { type: "addProjectNote"; payload: { category: ProjectMemoryNote["category"]; title: string; content: string; relatedFiles?: string[] } }

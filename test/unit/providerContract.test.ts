@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { OpenAICompatProvider } from "../../src/core/llm/providers/openaiCompatProvider";
+import {
+  OpenAICompatProvider,
+  normalizeOpenAICompatBaseUrl,
+} from "../../src/core/llm/providers/openaiCompatProvider";
 import { AnthropicProvider } from "../../src/core/llm/providers/anthropicProvider";
 import { GeminiProvider } from "../../src/core/llm/providers/geminiProvider";
 import { OllamaProvider } from "../../src/core/llm/providers/ollamaProvider";
 import { ProviderManager } from "../../src/core/llm/providerManager";
+import { isLocalModel } from "../../src/shared/types";
 import {
   LLMProviderError,
   classifyHttpError,
@@ -266,6 +270,75 @@ Error details: invalid key ${explicitKey} or token nvapi-123456789012345678`;
         globalThis.fetch = originalFetch;
       }
     });
+
+    it("surfaces malformed streamed tool JSON arguments as __malformedToolArgs error instead of dropping", async () => {
+      const originalFetch = globalThis.fetch;
+      try {
+        globalThis.fetch = (async () => {
+          const ssePayload = [
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_bad","name":"read_file"}}\n\n',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\": \\"unterminated"}}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+          ].join("");
+          return new Response(ssePayload, {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          });
+        }) as any;
+
+        const provider = new AnthropicProvider({
+          apiKey: "sk-ant-testKey12345",
+          enabled: true,
+          models: [{ id: "claude-3-5-sonnet-latest", name: "claude:claude-3-5-sonnet-latest", contextLength: 200000, toolTrained: true, tier: "large" }],
+        });
+        const chunks: any[] = [];
+        for await (const chunk of provider.chatStream({
+          model: "claude:claude-3-5-sonnet-latest",
+          messages: [{ role: "user", content: "read file" }],
+        })) {
+          chunks.push(chunk);
+        }
+        const toolChunk = chunks.find((c) => c.message?.tool_calls?.length > 0);
+        assert.ok(toolChunk, "Malformed tool call should still be emitted");
+        assert.equal(toolChunk.message.tool_calls[0].function.name, "read_file");
+        assert.equal(toolChunk.message.tool_calls[0].function.arguments.__malformedToolArgs, true);
+        assert.match(String(toolChunk.message.tool_calls[0].function.arguments.__parseError), /Malformed JSON/);
+
+        globalThis.fetch = (async () => {
+          const openaiSse = [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_bad","function":{"name":"edit_file","arguments":"{\\"path\\": 123"}}]},"finish_reason":null}]}\n\n',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+            'data: [DONE]\n\n',
+          ].join("");
+          return new Response(openaiSse, {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          });
+        }) as any;
+
+        const oaiProvider = new OpenAICompatProvider({
+          id: "openai",
+          label: "OpenAI",
+          baseUrl: "https://api.openai.com/v1",
+          apiKey: "sk-testKey12345",
+          enabled: true,
+          models: [{ id: "gpt-4o", name: "openai:gpt-4o", contextLength: 128000, toolTrained: true, tier: "large" }],
+        });
+        const oaiChunks: any[] = [];
+        for await (const chunk of oaiProvider.chatStream({
+          model: "openai:gpt-4o",
+          messages: [{ role: "user", content: "edit file" }],
+        })) {
+          oaiChunks.push(chunk);
+        }
+        const oaiToolChunk = oaiChunks.find((c) => c.message?.tool_calls?.length > 0);
+        assert.ok(oaiToolChunk, "OpenAI malformed tool call should still be emitted");
+        assert.equal(oaiToolChunk.message.tool_calls[0].function.arguments.__malformedToolArgs, true);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
   });
 
   describe("Gemini Provider Contract", () => {
@@ -430,6 +503,211 @@ Error details: invalid key ${explicitKey} or token nvapi-123456789012345678`;
       } finally {
         clearUserModelPricing("custom:unknown-model-xyz");
       }
+    });
+  });
+
+  describe("BYOK Cloud Streaming, Thinking Controls, and Routing Fixes", () => {
+    it("normalizeOpenAICompatBaseUrl strips endpoint paths and trailing slashes", () => {
+      assert.equal(
+        normalizeOpenAICompatBaseUrl("https://api.groq.com/openai/v1/chat/completions/"),
+        "https://api.groq.com/openai/v1"
+      );
+      assert.equal(
+        normalizeOpenAICompatBaseUrl("https://api.deepseek.com/v1/models"),
+        "https://api.deepseek.com/v1"
+      );
+      assert.equal(
+        normalizeOpenAICompatBaseUrl("http://localhost:1234/v1///"),
+        "http://localhost:1234/v1"
+      );
+    });
+
+    it("AnthropicProvider preserves thinkingLevels and maps thinking budget safely in chatStream", async () => {
+      const capturedBodies: any[] = [];
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async (_url: any, init: any) => {
+        capturedBodies.push(JSON.parse(String(init?.body ?? "{}")));
+        const encoder = new TextEncoder();
+        const sse = [
+          'data: {"type":"message_start","message":{"usage":{"input_tokens":120}}}\n\n',
+          'data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"step 1"}}\n\n',
+          'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"done"}}\n\n',
+          'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15}}\n\n',
+        ].join("");
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoder.encode(sse));
+              controller.close();
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } }
+        );
+      };
+
+      try {
+        const provider = new AnthropicProvider({
+          apiKey: "sk-ant-test-123456",
+          enabled: true,
+          models: [
+            {
+              id: "claude-sonnet-4-20250514",
+              name: "Claude Sonnet 4",
+              tier: "large",
+              capabilities: ["chat", "code", "tools", "thinking"],
+              thinking: true,
+              thinkingLevels: ["off", "low", "medium", "high"],
+            },
+          ],
+        });
+
+        const listed = await provider.listModels();
+        assert.deepEqual(listed[0].thinkingLevels, ["off", "low", "medium", "high"]);
+
+        const chunks: any[] = [];
+        for await (const c of provider.chatStream({
+          model: "claude-sonnet-4-20250514",
+          messages: [{ role: "user", content: "reason" }],
+          options: { num_predict: 2048, temperature: 0.7, thinkingLevel: "high" },
+        })) {
+          chunks.push(c);
+        }
+
+        assert.equal(capturedBodies.length, 1);
+        assert.deepEqual(capturedBodies[0].thinking, { type: "enabled", budget_tokens: 8192 });
+        assert.ok(capturedBodies[0].max_tokens > 8192);
+        assert.equal(capturedBodies[0].temperature, undefined);
+        assert.equal(chunks.find((c) => c.message?.thinking)?.message.thinking, "step 1");
+        assert.equal(chunks[chunks.length - 1].eval_count, 15);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it("OpenAICompatProvider captures trailing usage chunks, prevents duplicate tool names, and configures o3 max_completion_tokens", async () => {
+      const capturedBodies: any[] = [];
+      let callCount = 0;
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async (_url: any, init: any) => {
+        callCount += 1;
+        capturedBodies.push(JSON.parse(String(init?.body ?? "{}")));
+        const encoder = new TextEncoder();
+        const sse =
+          callCount === 1
+            ? [
+                'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\\"path\\":"}}]}}]}\n\n',
+                'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":"\\"a.ts\\"}"}}]}}]}\n\n',
+                'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+                'data: {"choices":[],"usage":{"prompt_tokens":200,"completion_tokens":30}}\n\n',
+                "data: [DONE]\n\n",
+              ].join("")
+            : [
+                'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n',
+                'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}\n\n',
+                "data: [DONE]\n\n",
+              ].join("");
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(encoder.encode(sse));
+              controller.close();
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "text/event-stream" } }
+        );
+      };
+
+      try {
+        const openrouter = new OpenAICompatProvider({
+          id: "openrouter",
+          label: "OpenRouter",
+          baseUrl: "https://openrouter.ai/api/v1",
+          apiKey: "sk-or-test-123",
+          models: [],
+          enabled: true,
+        });
+
+        const chunks1: any[] = [];
+        for await (const c of openrouter.chatStream({
+          model: "anthropic/claude-sonnet-4",
+          messages: [{ role: "user", content: "hi" }],
+        })) {
+          chunks1.push(c);
+        }
+
+        assert.deepEqual(capturedBodies[0].stream_options, { include_usage: true });
+        const toolChunk1 = chunks1.find((c) => c.message?.tool_calls?.length);
+        assert.ok(toolChunk1, "Tool calls chunk should be emitted");
+        assert.equal(toolChunk1.message.tool_calls[0].function.name, "read_file");
+        assert.deepEqual(toolChunk1.message.tool_calls[0].function.arguments, { path: "a.ts" });
+        const terminal1 = chunks1[chunks1.length - 1];
+        assert.equal(terminal1.done, true);
+        assert.equal(terminal1.prompt_eval_count, 200);
+        assert.equal(terminal1.eval_count, 30);
+
+        const openai = new OpenAICompatProvider({
+          id: "openai",
+          label: "OpenAI",
+          baseUrl: "https://api.openai.com/v1",
+          apiKey: "sk-proj-test",
+          models: [],
+          enabled: true,
+        });
+        for await (const _ of openai.chatStream({
+          model: "o3-mini",
+          messages: [{ role: "user", content: "hi" }],
+          options: { num_predict: 4096, temperature: 0.7, thinkingLevel: "high" },
+        })) {
+          // drain
+        }
+        assert.equal(capturedBodies[1].max_completion_tokens, 4096);
+        assert.equal(capturedBodies[1].max_tokens, undefined);
+        assert.equal(capturedBodies[1].temperature, undefined);
+        assert.equal(capturedBodies[1].reasoning_effort, "high");
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+
+    it("ProviderManager never silently routes unknown cloud prefixes to Ollama and classifies known cloud prefixes cleanly", async () => {
+      assert.equal(isLocalModel({ name: "groq:llama-3.3-70b-versatile", size: 0 }), false);
+      assert.equal(isLocalModel({ name: "deepseek:deepseek-chat", size: 0 }), false);
+      assert.equal(isLocalModel({ name: "lmstudio:qwen2.5-coder-7b", size: 0 }), true);
+
+      const mockOllama: any = {
+        id: "ollama",
+        label: "Ollama",
+        enabled: true,
+        isConfigured: () => true,
+        chatStream: async function* () {
+          throw new Error("Should not route cloud models to Ollama");
+        },
+      };
+      const disabledGroq: any = {
+        id: "groq",
+        label: "Groq",
+        enabled: false,
+        isConfigured: () => true,
+        chatStream: async function* () {
+          yield { message: { role: "assistant", content: "bad" }, done: true };
+        },
+      };
+
+      const manager = new ProviderManager([mockOllama, disabledGroq]);
+      assert.equal(manager.providerFor("groq:llama-3.3-70b-versatile"), disabledGroq);
+      assert.equal(manager.providerFor("custom-unknown:foo"), undefined);
+
+      await assert.rejects(
+        async () => {
+          for await (const _ of manager.chatStream({
+            model: "groq:llama-3.3-70b-versatile",
+            messages: [{ role: "user", content: "hi" }],
+          })) {
+            // iterate
+          }
+        },
+        /disabled/i
+      );
     });
   });
 });

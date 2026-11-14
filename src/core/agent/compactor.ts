@@ -52,6 +52,8 @@ export interface CompactionOptions {
   recentTurnsToKeep?: number;
   keepRecentUserTurns?: number;
   signal?: AbortSignal;
+  /** Optional timeout (ms) for model-assisted summarization; scales by provider if omitted. */
+  summarizationTimeoutMs?: number;
 }
 
 /**
@@ -702,6 +704,17 @@ function retainMissingStructuredFacts(
   return `${summary}\n\n### ✅ Retained Structured Facts\n${missing.join("\n")}`;
 }
 
+const failedSummarizerCandidates = new WeakMap<LLMProvider, Set<string>>();
+
+/** Resolve summarization timeout (ms): local runtimes get a wider budget for long prompt eval. */
+export function resolveSummarizationTimeoutMs(providerId: string, overrideMs?: number): number {
+  if (typeof overrideMs === "number" && Number.isFinite(overrideMs) && overrideMs > 0) {
+    return overrideMs;
+  }
+  const p = providerId.toLowerCase();
+  return p === "ollama" || p === "llamacpp" ? 120_000 : 45_000;
+}
+
 /**
  * Model-Assisted Compaction:
  * Attempts to summarize conversation turns using the provider's fastest/lightest model.
@@ -713,12 +726,14 @@ export async function summarizeWithProviderModel(
   messages: ChatMessage[],
   focus?: string,
   anchorPrompt?: string,
-  timeoutMs = 30_000,
+  timeoutMs = resolveSummarizationTimeoutMs(provider.id),
   extraOpts: { contextWindow?: number; signal?: AbortSignal } = {}
 ): Promise<string | null> {
   try {
     if (extraOpts.signal?.aborted) return null;
-    const candidates = chooseSummarizerCandidates(provider.id, model);
+    const skipped = failedSummarizerCandidates.get(provider);
+    const candidates = chooseSummarizerCandidates(provider.id, model).filter((c) => !skipped?.has(c));
+    if (candidates.length === 0) candidates.push(model);
     const data = extractStructuredCompactionData(messages);
 
     const systemPrompt =
@@ -809,8 +824,24 @@ export async function summarizeWithProviderModel(
           usableResult = result.trim();
           break;
         }
+        if (candidateModel !== model) {
+          let set = failedSummarizerCandidates.get(provider);
+          if (!set) {
+            set = new Set();
+            failedSummarizerCandidates.set(provider, set);
+          }
+          set.add(candidateModel);
+        }
       } catch {
-        // Fall through to next candidate (e.g. user's active model) or native heuristic
+        // Remember unavailable sibling models on this provider to avoid repeated futile 404 probes
+        if (candidateModel !== model && !controller.signal.aborted && !extraOpts.signal?.aborted) {
+          let set = failedSummarizerCandidates.get(provider);
+          if (!set) {
+            set = new Set();
+            failedSummarizerCandidates.set(provider, set);
+          }
+          set.add(candidateModel);
+        }
       } finally {
         clearTimeout(timeout);
         extraOpts.signal?.removeEventListener("abort", onParentAbort);
@@ -908,6 +939,7 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
     recentTurnsToKeep,
     keepRecentUserTurns,
     signal,
+    summarizationTimeoutMs,
   } = options;
 
   const effectiveRecentTurns = recentTurnsToKeep ?? keepRecentUserTurns;
@@ -978,7 +1010,7 @@ export async function compactSessionMessages(options: CompactionOptions): Promis
       toCompact,
       focus,
       anchorText,
-      30_000,
+      resolveSummarizationTimeoutMs(provider.id, summarizationTimeoutMs),
       { contextWindow, signal }
     );
     if (summary) strategy = "provider-model";
@@ -1130,6 +1162,7 @@ export interface MidTurnCompactionOptions {
   signal?: AbortSignal;
   maxRecentMessages?: number;
   useProviderSummarizer?: boolean;
+  summarizationTimeoutMs?: number;
 }
 
 export interface MidTurnCompactionResult {
@@ -1147,7 +1180,16 @@ export interface MidTurnCompactionResult {
 export async function compactMidTurnLLMHistory(
   opts: MidTurnCompactionOptions
 ): Promise<MidTurnCompactionResult> {
-  const { history, contextWindow, model, provider, signal, maxRecentMessages = 6, useProviderSummarizer = true } = opts;
+  const {
+    history,
+    contextWindow,
+    model,
+    provider,
+    signal,
+    maxRecentMessages = 6,
+    useProviderSummarizer = true,
+    summarizationTimeoutMs,
+  } = opts;
   if (history.length < 6) {
     return { compacted: false, history, strategy: "native-heuristic" };
   }
@@ -1189,7 +1231,7 @@ export async function compactMidTurnLLMHistory(
       middleChat,
       "Mid-turn compaction: preserve all file edits, read findings, failed checks, and unresolved steps so work continues seamlessly.",
       anchor?.content,
-      25_000,
+      resolveSummarizationTimeoutMs(provider.id, summarizationTimeoutMs),
       { contextWindow, signal }
     );
     if (summary) strategy = "provider-model";

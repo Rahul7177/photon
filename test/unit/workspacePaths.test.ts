@@ -175,6 +175,25 @@ describe("Phase 2.4: Workspace Path Safety & Filesystem Boundaries", () => {
       // Existing destination content must remain untouched
       assert.strictEqual(await fs.readFile(dstAbs, "utf8"), "existing destination content");
     });
+
+    it("cloudReplaceInFile and cloudWriteFile write atomically and preserve UTF-8 BOM", async () => {
+      const { cloudWriteFile, cloudReplaceInFile } = await import("../../src/core/tools/cloud/cloudTools");
+      const rel = "src/cloud_bom.txt";
+      const abs = path.join(tmpWorkspace, rel);
+      const writeRes = await cloudWriteFile.execute(
+        { path: rel, content: "\uFEFFline one\nline two\n" },
+        ctx
+      );
+      assert.strictEqual(writeRes.ok, true);
+      const replaceRes = await cloudReplaceInFile.execute(
+        { path: rel, find: "line two", replace: "line two updated" },
+        ctx
+      );
+      assert.strictEqual(replaceRes.ok, true);
+      const finalText = await fs.readFile(abs, "utf8");
+      assert.strictEqual(finalText.startsWith("\uFEFF"), true);
+      assert.ok(finalText.includes("line two updated"));
+    });
   });
 });
 

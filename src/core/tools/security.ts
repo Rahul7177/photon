@@ -20,6 +20,7 @@ const DESTRUCTIVE_PATTERNS: Array<{
 }> = [
   // File and filesystem destruction
   { regex: /\b(rm|del|rmdir|erase)\s+.*(-r|-f|\/s|\/q)/i, reason: "Recursive / force file deletion", category: "destructive" },
+  { regex: /\bremove-item\b.*(-recurse|-force)/i, reason: "Recursive / force PowerShell item removal", category: "destructive" },
   { regex: /\b(git\s+clean\s+-[a-z]*f)/i, reason: "Untracked files removal via git clean force", category: "destructive" },
   { regex: /\b(git\s+reset\s+--hard)/i, reason: "Hard git reset discarding uncommitted changes", category: "destructive" },
   { regex: /\b(git\s+push\s+.*(-f|--force))\b/i, reason: "Force push overwriting remote git history", category: "destructive" },
@@ -93,7 +94,50 @@ const UNATTENDED_ALLOWLIST_PREFIXES = [
   "where",
 ];
 
+/**
+ * Detect shell chaining, substitution, redirection, or multi-command syntax
+ * outside single and double quotes. Returns the offending token or null.
+ */
+export function findShellChaining(cmd: string): string | null {
+  let sq = false;
+  let dq = false;
+  let esc = false;
+
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (esc) {
+      esc = false;
+      continue;
+    }
+    // Only honor backslash escapes inside double quotes; unquoted backslashes
+    // (such as Windows path separators) must never swallow "&", "|", or ";".
+    if (dq && c === "\\") {
+      esc = true;
+      continue;
+    }
+    if (c === "'" && !dq) {
+      sq = !sq;
+      continue;
+    }
+    if (c === '"' && !sq) {
+      dq = !dq;
+      continue;
+    }
+    if (sq || dq) continue;
+
+    const two = cmd.slice(i, i + 2);
+    if (two === "&&" || two === "||" || two === "|&") return two;
+    if (two === ">>" || two === "2>" || two === "<(" || two === ">(") return two;
+    if (c === ";" || c === "|" || c === "&" || c === "`" || c === ">" || c === "<") return c;
+    if (two === "$(" || two === "@(") return two;
+    if (c === "\n" || c === "\r") return "\\n";
+  }
+
+  return null;
+}
+
 export function isUnattendedCommandAllowed(command: string): boolean {
+  if (findShellChaining(command)) return false;
   const norm = command.trim().toLowerCase();
   const sec = analyzeCommandSecurity(norm);
   if (sec.isDangerous) return false;

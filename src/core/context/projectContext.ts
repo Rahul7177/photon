@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
+import { atomicWriteResolvedPath } from "../tools/paths";
 import type {
   ModelHandoffRecord,
   ProjectContextSummary,
@@ -92,6 +93,7 @@ const CODE_EXTENSIONS = new Set([
   ".php",
   ".swift",
   ".kt",
+  ".scala",
   ".vue",
   ".svelte",
   ".md",
@@ -99,6 +101,22 @@ const CODE_EXTENSIONS = new Set([
   ".yaml",
   ".yml",
 ]);
+
+/**
+ * Returns true if a workspace-relative path belongs to trackable source/config files
+ * (not inside ignored/hidden directories and matching a tracked extension).
+ */
+export function isTrackableProjectPath(relPath: string): boolean {
+  const clean = relPath.replace(/\\/g, "/").replace(/^\/+/, "");
+  if (!clean) return false;
+  const parts = clean.split("/");
+  for (let i = 0; i < parts.length; i++) {
+    const seg = parts[i];
+    if (!seg || seg.startsWith(".")) return false;
+    if (i < parts.length - 1 && IGNORE_DIRS.has(seg)) return false;
+  }
+  return CODE_EXTENSIONS.has(path.extname(clean).toLowerCase());
+}
 
 /**
  * Global registry of workspace ProjectContextManager instances so tools and engines
@@ -134,6 +152,7 @@ export class ProjectContextManager {
   private storageFilePath?: string;
   private scanPromise: Promise<void> | null = null;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private saveChain: Promise<void> = Promise.resolve();
   private initialized = false;
   private listeners = new Set<(summary: ProjectContextSummary) => void>();
 
@@ -289,6 +308,10 @@ export class ProjectContextManager {
    */
   async indexSingleFile(relPath: string): Promise<ProjectFileEntry | undefined> {
     const normRel = normalizeRelPath(relPath);
+    if (!isTrackableProjectPath(normRel)) {
+      this.removeFile(normRel);
+      return undefined;
+    }
     const abs = path.resolve(this.workspaceRoot, normRel);
     if (!abs.toLowerCase().startsWith(path.resolve(this.workspaceRoot).toLowerCase())) {
       return undefined;
@@ -306,6 +329,7 @@ export class ProjectContextManager {
       this.notify();
       return entry;
     } catch {
+      this.removeFile(normRel);
       return undefined;
     }
   }
@@ -1084,19 +1108,21 @@ export class ProjectContextManager {
 
   async saveToDisk(): Promise<void> {
     if (!this.storageFilePath) return;
-    try {
-      // Bound memory and persisted fields
-      if (this.data.notes.length > 50) this.data.notes = this.data.notes.slice(-50);
-      if (this.data.recentEdits.length > 20) this.data.recentEdits = this.data.recentEdits.slice(-20);
-      if (this.data.activeFiles.length > 15) this.data.activeFiles = this.data.activeFiles.slice(-15);
+    const run = this.saveChain.then(async () => {
+      if (!this.storageFilePath) return;
+      try {
+        // Bound memory and persisted fields
+        if (this.data.notes.length > 50) this.data.notes = this.data.notes.slice(-50);
+        if (this.data.recentEdits.length > 20) this.data.recentEdits = this.data.recentEdits.slice(-20);
+        if (this.data.activeFiles.length > 15) this.data.activeFiles = this.data.activeFiles.slice(-15);
 
-      await fs.mkdir(path.dirname(this.storageFilePath), { recursive: true });
-      const tmpPath = `${this.storageFilePath}.${randomUUID()}.tmp`;
-      await fs.writeFile(tmpPath, JSON.stringify(this.data), "utf8");
-      await fs.rename(tmpPath, this.storageFilePath);
-    } catch {
-      // ignore disk write errors
-    }
+        await atomicWriteResolvedPath(this.storageFilePath, JSON.stringify(this.data));
+      } catch {
+        // ignore disk write errors
+      }
+    });
+    this.saveChain = run.catch(() => undefined);
+    return run;
   }
 
   private async loadFromDisk(): Promise<void> {
@@ -1197,7 +1223,7 @@ function extractSymbols(lines: string[], ext: string): ProjectSymbol[] {
     } else if ((match = /^(?:async\s+)?(?:function|fn|func)\s+([A-Za-z_$][A-Za-z0-9_$]*)/.exec(cleaned))) {
       kind = /^[A-Z]/.test(match[1]) && (ext === ".tsx" || ext === ".jsx") ? "component" : "function";
     } else if (
-      (match = /^(?:const|let)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::\s*[^=]+)?\s*=\s*(?:memo\(|forwardRef\(|async\s*\(|\([^)]*\)\s*=>|function\b)/.exec(
+      (match = /^(?:const|let)\s+([A-Z_$a-z][A-Za-z0-9_$]*)\s*(?::\s*[^=]+)?\s*=\s*(?:memo\(|forwardRef\(|async\s*\(|\([^)]*\)\s*=>|function\b)/.exec(
         cleaned
       ))
     ) {
@@ -1219,7 +1245,7 @@ function extractSymbols(lines: string[], ext: string): ProjectSymbol[] {
         exported: isExported,
         signature: line.replace(/\{.*$/, "").trim().slice(0, 100),
       });
-      if (symbols.length >= 40) break;
+      if (symbols.length >= 60) break;
     }
   }
 
@@ -1229,12 +1255,48 @@ function extractSymbols(lines: string[], ext: string): ProjectSymbol[] {
 function findBraceBlockEnd(lines: string[], startIndex: number): number {
   let depth = 0;
   let opened = false;
+  let inBlockComment = false;
+  let stringQuote: "'" | '"' | "`" | null = null;
   const maxLookahead = Math.min(lines.length, startIndex + 500);
 
   for (let i = startIndex; i < maxLookahead; i++) {
     const l = lines[i];
     for (let c = 0; c < l.length; c++) {
       const ch = l[c];
+      const next = l[c + 1];
+
+      if (inBlockComment) {
+        if (ch === "*" && next === "/") {
+          inBlockComment = false;
+          c++;
+        }
+        continue;
+      }
+
+      if (stringQuote) {
+        if (ch === "\\") {
+          c++;
+          continue;
+        }
+        if (ch === stringQuote) {
+          stringQuote = null;
+        }
+        continue;
+      }
+
+      if (ch === "/" && next === "/") {
+        break; // rest of line is a comment
+      }
+      if (ch === "/" && next === "*") {
+        inBlockComment = true;
+        c++;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === "`") {
+        stringQuote = ch;
+        continue;
+      }
+
       if (ch === "{") {
         depth++;
         opened = true;
@@ -1245,7 +1307,7 @@ function findBraceBlockEnd(lines: string[], startIndex: number): number {
         }
       }
     }
-    if (!opened && l.trim().endsWith(";")) {
+    if (!opened && !inBlockComment && !stringQuote && l.trim().endsWith(";")) {
       return i + 1;
     }
   }

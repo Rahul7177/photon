@@ -20,6 +20,11 @@ interface ProviderStatus {
   enabled: boolean;
   configured: boolean;
   modelCount: number;
+  isCustom?: boolean;
+  isLocal?: boolean;
+  baseUrl?: string;
+  requireApiKey?: boolean;
+  supportsLiveModels?: boolean;
 }
 
 interface ProviderMeta {
@@ -81,34 +86,67 @@ const PROVIDER_META: Record<string, ProviderMeta> = {
   },
 };
 
-const CUSTOM_ENDPOINT_PRESETS: { label: string; id: string; baseUrl: string; docsUrl: string }[] = [
+export interface EndpointPreset {
+  label: string;
+  id: string;
+  baseUrl: string;
+  docsUrl: string;
+  requireApiKey?: boolean;
+  hint?: string;
+}
+
+export const CUSTOM_ENDPOINT_PRESETS: EndpointPreset[] = [
   { label: "Groq", id: "groq", baseUrl: "https://api.groq.com/openai/v1", docsUrl: "https://console.groq.com/keys" },
   { label: "DeepSeek", id: "deepseek", baseUrl: "https://api.deepseek.com/v1", docsUrl: "https://platform.deepseek.com/api_keys" },
-  { label: "Together AI", id: "together", baseUrl: "https://api.together.xyz/v1", docsUrl: "https://api.together.ai/settings/api-keys" },
   { label: "Mistral", id: "mistral", baseUrl: "https://api.mistral.ai/v1", docsUrl: "https://console.mistral.ai/api-keys" },
+  { label: "Together AI", id: "together", baseUrl: "https://api.together.xyz/v1", docsUrl: "https://api.together.ai/settings/api-keys" },
   { label: "Fireworks AI", id: "fireworks", baseUrl: "https://api.fireworks.ai/inference/v1", docsUrl: "https://fireworks.ai/account/api-keys" },
   { label: "xAI Grok", id: "xai", baseUrl: "https://api.x.ai/v1", docsUrl: "https://console.x.ai" },
   { label: "Cerebras", id: "cerebras", baseUrl: "https://api.cerebras.ai/v1", docsUrl: "https://cloud.cerebras.ai" },
+  { label: "Perplexity", id: "perplexity", baseUrl: "https://api.perplexity.ai", docsUrl: "https://www.perplexity.ai/settings/api" },
+  { label: "Moonshot / Kimi", id: "moonshot", baseUrl: "https://api.moonshot.ai/v1", docsUrl: "https://platform.moonshot.ai/console/api-keys" },
+  { label: "SiliconFlow", id: "siliconflow", baseUrl: "https://api.siliconflow.cn/v1", docsUrl: "https://cloud.siliconflow.cn/account/ak" },
+  { label: "DeepInfra", id: "deepinfra", baseUrl: "https://api.deepinfra.com/v1/openai", docsUrl: "https://deepinfra.com/dash/api_keys" },
+  { label: "SambaNova", id: "sambanova", baseUrl: "https://api.sambanova.ai/apis", docsUrl: "https://cloud.sambanova.ai/apis" },
+  { label: "Hugging Face", id: "huggingface", baseUrl: "https://router.huggingface.co/v1", docsUrl: "https://huggingface.co/settings/tokens" },
+  { label: "LM Studio (Local)", id: "lmstudio", baseUrl: "http://localhost:1234/v1", docsUrl: "https://lmstudio.ai", requireApiKey: false, hint: "Local LM Studio OpenAI server" },
+  { label: "vLLM (Local)", id: "vllm", baseUrl: "http://localhost:8000/v1", docsUrl: "https://docs.vllm.ai", requireApiKey: false, hint: "Local vLLM OpenAI-compatible server" },
 ];
 
+export function looksLikeLocalUrl(url: string): boolean {
+  const lower = url.trim().toLowerCase();
+  return (
+    /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::|\/|$)/.test(lower) ||
+    /^https?:\/\/192\.168\./.test(lower) ||
+    /^https?:\/\/10\./.test(lower)
+  );
+}
+
 const RECOMMENDED_PATTERNS = [
+  "gemini-2.5",
   "gemini-2.0-flash",
-  "gemini-2.0-flash-lite",
-  "gemini-1.5-pro",
-  "gemini-1.5-flash",
+  "claude-sonnet-4",
+  "claude-opus-4",
+  "claude-3-7-sonnet",
   "claude-3-5-sonnet",
   "claude-3-5-haiku",
-  "claude-3-opus",
+  "gpt-5",
+  "gpt-4.1",
   "gpt-4o",
-  "gpt-4o-mini",
-  "o3-mini",
-  "o1",
-  "chatgpt-4o",
-  "nemotron",
-  "llama-3.1-70b",
-  "llama-3.3-70b",
+  "o4-mini",
+  "o3",
+  "grok-4",
+  "grok-3",
   "deepseek-r1",
+  "deepseek-v3",
+  "deepseek-chat",
+  "deepseek-reasoner",
+  "qwen3",
   "qwen2.5-coder",
+  "llama-4",
+  "llama-3.3-70b",
+  "nemotron",
+  "kimi",
   "blackboxai-pro",
 ];
 
@@ -119,17 +157,23 @@ function isRecommended(name: string): boolean {
 
 function hasReasoning(m: ModelInfo): boolean {
   const n = m.name.toLowerCase();
-  return m.thinking === true || /r1|o1|o3|reasoning|thinking|qwq/.test(n);
+  return (
+    m.thinking === true ||
+    /r1|o1|o3|o4|gpt-5|claude-.*(4|3-7)|gemini-2\.5|reason|thinking|qwq|grok-3-mini|grok-4/.test(n)
+  );
 }
 
 function hasVision(m: ModelInfo): boolean {
   const n = m.name.toLowerCase();
-  return m.vision === true || /vision|vl|multimodal|4o|gemini|pixtral/.test(n);
+  return (
+    m.vision === true ||
+    /vision|\bvl\b|multimodal|gpt-4o|gpt-4\.1|gpt-5|claude-|gemini|pixtral|llama-4|grok-2-vision|grok-4/.test(n)
+  );
 }
 
 function isFast(m: ModelInfo): boolean {
   const n = m.name.toLowerCase();
-  return /flash|mini|haiku|lite|8b|7b|small|instant|turbo/.test(n);
+  return /flash|mini|nano|haiku|lite|8b|7b|small|instant|turbo|fast/.test(n);
 }
 
 function formatContext(ctx?: number): string | null {
@@ -150,12 +194,15 @@ export function CloudProviderCard({
   actions: Actions;
   state: AppState;
 }) {
-  const isCustom = !(provider.id in PROVIDER_META);
+  const isCustom = provider.isCustom ?? !(provider.id in PROVIDER_META);
+  const requiresKey = provider.requireApiKey !== false;
   const meta = PROVIDER_META[provider.id] ?? {
     id: provider.id,
     docsUrl: "",
-    hint: "Custom OpenAI-compatible endpoint.",
-    live: true,
+    hint: provider.baseUrl
+      ? `OpenAI-compatible endpoint (${provider.baseUrl})`
+      : "Custom OpenAI-compatible endpoint.",
+    live: provider.supportsLiveModels ?? true,
   };
 
   const [expanded, setExpanded] = useState(false);
@@ -168,6 +215,11 @@ export function CloudProviderCard({
   const [category, setCategory] = useState<FilterCategory>("all");
   const [pingingAll, setPingingAll] = useState(false);
   const [pingProgress, setPingProgress] = useState<{ current: number; total: number } | null>(null);
+  const [editingEndpoint, setEditingEndpoint] = useState(false);
+  const [editLabel, setEditLabel] = useState(provider.label);
+  const [editUrl, setEditUrl] = useState(provider.baseUrl ?? "");
+  const [editRequireKey, setEditRequireKey] = useState(requiresKey);
+  const [clearStoredKey, setClearStoredKey] = useState(false);
 
   const fetching = state.providerModelsFetching.includes(provider.id);
   const fetchError = state.providerModelsError[provider.id];
@@ -181,10 +233,26 @@ export function CloudProviderCard({
   const handleSave = () => {
     if (!key.trim()) return;
     actions.setProviderApiKey(provider.id, key.trim());
-    actions.setProviderEnabled(provider.id, true);
     setKey("");
     setSaved(true);
     setTimeout(() => setSaved(false), 2200);
+  };
+
+  const handleSaveEndpointEdit = () => {
+    const cleanLabel = editLabel.trim();
+    const cleanUrl = editUrl.trim();
+    if (!cleanLabel || !/^https?:\/\//i.test(cleanUrl)) return;
+    actions.updateCustomProvider(
+      provider.id,
+      cleanLabel,
+      cleanUrl,
+      key.trim() || undefined,
+      editRequireKey,
+      clearStoredKey || undefined
+    );
+    setKey("");
+    setClearStoredKey(false);
+    setEditingEndpoint(false);
   };
 
   const handleClear = () => {
@@ -278,7 +346,7 @@ export function CloudProviderCard({
       {/* ── Header row with Official Logo ── */}
       <div className="provider-header" onClick={() => setExpanded((v) => !v)}>
         <div className="provider-logo-wrap" title={provider.label}>
-          <ProviderLogo providerId={provider.id} label={provider.label} size={22} />
+          <ProviderLogo providerId={provider.id} label={provider.label} baseUrl={provider.baseUrl} size={22} />
         </div>
 
         <div className="provider-info">
@@ -291,7 +359,12 @@ export function CloudProviderCard({
             )}
           </div>
           <div className="provider-badges">
-            {provider.configured ? (
+            {!requiresKey ? (
+              <span className="provider-badge badge-ok" title="API key optional for this endpoint">
+                <CheckIcon size={10} />
+                <span>{provider.configured ? "Key Stored" : "No Key Needed"}</span>
+              </span>
+            ) : provider.configured ? (
               <span className="provider-badge badge-ok">
                 <CheckIcon size={10} />
                 <span>Key Stored</span>
@@ -341,10 +414,81 @@ export function CloudProviderCard({
       {/* ── Expandable Configuration & Models View ── */}
       {expanded && (
         <div className="provider-expand">
+          <div className="provider-hint-bar">
+            <span className="provider-hint-text">{meta.hint}</span>
+            {isCustom && (
+              <button
+                type="button"
+                className="btn btn-sm ghost provider-edit-endpoint-btn"
+                onClick={() => {
+                  setEditLabel(provider.label);
+                  setEditUrl(provider.baseUrl ?? "");
+                  setEditRequireKey(requiresKey);
+                  setClearStoredKey(false);
+                  setEditingEndpoint((v) => !v);
+                }}
+              >
+                {editingEndpoint ? "Cancel Edit" : "Edit Endpoint"}
+              </button>
+            )}
+          </div>
+
+          {isCustom && editingEndpoint && (
+            <div className="provider-edit-endpoint-form">
+              <label className="custom-endpoint-field">
+                <span>Name</span>
+                <input
+                  value={editLabel}
+                  onChange={(e) => setEditLabel(e.target.value)}
+                  spellCheck={false}
+                />
+              </label>
+              <label className="custom-endpoint-field">
+                <span>Base URL</span>
+                <input
+                  value={editUrl}
+                  onChange={(e) => setEditUrl(e.target.value)}
+                  placeholder="https://api.example.com/v1"
+                  spellCheck={false}
+                />
+              </label>
+              <label className="custom-endpoint-checkbox">
+                <input
+                  type="checkbox"
+                  checked={editRequireKey}
+                  onChange={(e) => setEditRequireKey(e.target.checked)}
+                />
+                <span>Requires API key</span>
+              </label>
+              {provider.configured && (
+                <label className="custom-endpoint-checkbox">
+                  <input
+                    type="checkbox"
+                    checked={clearStoredKey}
+                    onChange={(e) => setClearStoredKey(e.target.checked)}
+                  />
+                  <span>Clear stored API key</span>
+                </label>
+              )}
+              <div className="custom-endpoint-actions">
+                <button
+                  type="button"
+                  className="btn btn-sm primary"
+                  disabled={!editLabel.trim() || !/^https?:\/\//i.test(editUrl.trim())}
+                  onClick={handleSaveEndpointEdit}
+                >
+                  Save Endpoint
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* API Key Input Section */}
           <div className="key-input-section">
             <div className="key-header-row">
-              <label className="key-label">API Key</label>
+              <label className="key-label">
+                {requiresKey ? "API Key" : "API Key (Optional)"}
+              </label>
               {meta.docsUrl && (
                 <a
                   className="key-docs-link"
@@ -364,7 +508,9 @@ export function CloudProviderCard({
                 placeholder={
                   provider.configured
                     ? "••••••••••••••••••••••••  (securely stored in keychain)"
-                    : "Paste API key…"
+                    : requiresKey
+                    ? "Paste API key…"
+                    : "Optional bearer token for local/custom server…"
                 }
                 value={key}
                 onChange={(e) => setKey(e.target.value)}
@@ -406,11 +552,22 @@ export function CloudProviderCard({
                   {clearing ? "Cleared" : "Clear Key"}
                 </button>
               )}
+              {meta.live && (!requiresKey || provider.configured) && !hasFetched && (
+                <button
+                  type="button"
+                  className="btn btn-sm ghost"
+                  onClick={dispatchFetch}
+                  disabled={fetching}
+                >
+                  <RefreshIcon />
+                  <span>{fetching ? "Fetching…" : "Fetch Models"}</span>
+                </button>
+              )}
             </div>
           </div>
 
           {/* Models Browser & Selector Section */}
-          {(provider.configured || hasFetched) && (
+          {(provider.configured || !requiresKey || hasFetched || !meta.live) && (
             <div className="provider-models-section">
               <div className="provider-models-header">
                 <div className="provider-models-title-wrap">
@@ -690,15 +847,39 @@ export function AddCustomEndpoint({ actions }: { actions: Actions }) {
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [docsUrl, setDocsUrl] = useState("");
-  const valid = label.trim() !== "" && /^https?:\/\//.test(baseUrl.trim());
+  const [requireApiKey, setRequireApiKey] = useState(true);
+  const [presetFilter, setPresetFilter] = useState("");
+
+  const trimmedUrl = baseUrl.trim();
+  const urlValid = /^https?:\/\/[^/\s]+/i.test(trimmedUrl);
+  const keyValid = !requireApiKey || apiKey.trim().length > 0;
+  const valid = label.trim() !== "" && urlValid;
+
+  const filteredPresets = useMemo(() => {
+    const q = presetFilter.trim().toLowerCase();
+    if (!q) return CUSTOM_ENDPOINT_PRESETS;
+    return CUSTOM_ENDPOINT_PRESETS.filter(
+      (p) =>
+        p.label.toLowerCase().includes(q) ||
+        p.id.toLowerCase().includes(q) ||
+        p.baseUrl.toLowerCase().includes(q)
+    );
+  }, [presetFilter]);
 
   const submit = () => {
     if (!valid) return;
-    actions.addCustomProvider(label.trim(), baseUrl.trim(), apiKey.trim() || undefined);
+    actions.addCustomProvider(
+      label.trim(),
+      trimmedUrl,
+      apiKey.trim() || undefined,
+      requireApiKey
+    );
     setLabel("");
     setBaseUrl("");
     setApiKey("");
     setDocsUrl("");
+    setRequireApiKey(true);
+    setPresetFilter("");
     setOpen(false);
   };
 
@@ -712,20 +893,30 @@ export function AddCustomEndpoint({ actions }: { actions: Actions }) {
 
   return (
     <div className="custom-endpoint-form">
-      <div className="custom-endpoint-title">Endpoint Presets</div>
+      <div className="custom-endpoint-header-row">
+        <div className="custom-endpoint-title">1-Click Provider Presets</div>
+        <input
+          className="preset-filter-input"
+          value={presetFilter}
+          onChange={(e) => setPresetFilter(e.target.value)}
+          placeholder="Filter presets…"
+          spellCheck={false}
+        />
+      </div>
       <div className="preset-chip-row">
-        {CUSTOM_ENDPOINT_PRESETS.map((p) => (
+        {filteredPresets.map((p) => (
           <button
-            key={p.label}
+            key={p.id}
             type="button"
             className={`preset-chip ${label === p.label ? "active" : ""}`}
             onClick={() => {
               setLabel(p.label);
               setBaseUrl(p.baseUrl);
               setDocsUrl(p.docsUrl);
+              setRequireApiKey(p.requireApiKey !== false);
             }}
           >
-            <ProviderLogo providerId={p.id} label={p.label} size={14} />
+            <ProviderLogo providerId={p.id} label={p.label} baseUrl={p.baseUrl} size={14} />
             <span>{p.label}</span>
           </button>
         ))}
@@ -735,7 +926,7 @@ export function AddCustomEndpoint({ actions }: { actions: Actions }) {
         <input
           value={label}
           onChange={(e) => setLabel(e.target.value)}
-          placeholder="e.g. Groq, DeepSeek"
+          placeholder="e.g. Groq, DeepSeek, LM Studio"
           autoFocus
           spellCheck={false}
         />
@@ -744,17 +935,36 @@ export function AddCustomEndpoint({ actions }: { actions: Actions }) {
         <span>Base URL</span>
         <input
           value={baseUrl}
-          onChange={(e) => setBaseUrl(e.target.value)}
+          onChange={(e) => {
+            const next = e.target.value;
+            setBaseUrl(next);
+            if (looksLikeLocalUrl(next)) {
+              setRequireApiKey(false);
+            }
+          }}
           placeholder="https://api.example.com/v1"
           spellCheck={false}
         />
+        {trimmedUrl && !urlValid && (
+          <span className="custom-endpoint-validation">
+            Enter a valid http:// or https:// base URL
+          </span>
+        )}
+      </label>
+      <label className="custom-endpoint-checkbox">
+        <input
+          type="checkbox"
+          checked={requireApiKey}
+          onChange={(e) => setRequireApiKey(e.target.checked)}
+        />
+        <span>Requires API key (uncheck for local LM Studio / vLLM servers)</span>
       </label>
       <label className="custom-endpoint-field">
-        <span>API Key</span>
+        <span>{requireApiKey ? "API Key" : "API Key (Optional)"}</span>
         <input
           value={apiKey}
           onChange={(e) => setApiKey(e.target.value)}
-          placeholder="Paste API key…"
+          placeholder={requireApiKey ? "Paste API key (can also be added later)…" : "Optional bearer token…"}
           type="password"
           autoComplete="off"
           spellCheck={false}
@@ -766,8 +976,9 @@ export function AddCustomEndpoint({ actions }: { actions: Actions }) {
           className="btn btn-sm primary"
           onClick={submit}
           disabled={!valid}
+          title={!keyValid ? "Saves endpoint; add API key afterwards to fetch models" : undefined}
         >
-          Save &amp; Connect
+          {apiKey.trim() || !requireApiKey ? "Save & Connect" : "Add Endpoint"}
         </button>
         <button
           type="button"

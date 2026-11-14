@@ -113,6 +113,10 @@ export function SettingsPanel({
   const [confirmUnload, setConfirmUnload] = useState<string | null>(null);
 
   useEffect(() => {
+    setNumCtxInput(state.config.numCtxOverride ? String(state.config.numCtxOverride) : "");
+  }, [state.config.numCtxOverride]);
+
+  useEffect(() => {
     if (tab === "models" && !state.recommendations) {
       actions.requestRecommendations();
     }
@@ -257,6 +261,77 @@ export function SettingsPanel({
                     placeholder={state.config.interfaceMode === "cloud" ? "native" : "auto"}
                   />
                 </Row>
+              </Category>
+
+              <Category title="Project Configuration" iconNode={<FolderIcon />}>
+                {state.config.projectConfig?.error ? (
+                  <div className="project-config-status error">
+                    <div className="project-config-head">
+                      <span>Config error</span>
+                      <code>{state.config.projectConfig.relativePath || ".photon/config"}</code>
+                    </div>
+                    <div className="settings-hint">{state.config.projectConfig.error}</div>
+                    <div className="project-config-actions">
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        onClick={() => actions.openProjectConfig()}
+                      >
+                        Fix Config File
+                      </button>
+                    </div>
+                  </div>
+                ) : state.config.projectConfig?.loaded ? (
+                  <div className="project-config-status loaded">
+                    <div className="project-config-head">
+                      <span className="project-config-pill">Active</span>
+                      <code>{state.config.projectConfig.relativePath || ".photon/config.json"}</code>
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        style={{ marginLeft: "auto" }}
+                        onClick={() => actions.openProjectConfig()}
+                      >
+                        Edit File
+                      </button>
+                    </div>
+                    {state.config.projectConfig.fields.length > 0 && (
+                      <div className="project-config-chips">
+                        {state.config.projectConfig.fields.map((f) => (
+                          <span key={f} className="project-config-chip">
+                            {f}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    {state.config.projectConfig.modelConfigKeys.length > 0 && (
+                      <div className="settings-hint">
+                        Per-model overrides ({state.config.projectConfig.modelConfigKeys.length}):{" "}
+                        <code>{state.config.projectConfig.modelConfigKeys.join(", ")}</code>
+                      </div>
+                    )}
+                    {state.config.projectConfig.autoApproveIgnored && (
+                      <div className="settings-hint">
+                        Note: <code>autoApprove</code> in repository config is ignored for security.
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="project-config-status empty">
+                    <div className="settings-hint">
+                      No checked-in <code>.photon/config.json</code> found in this workspace. Create one to share team defaults and per-model overrides.
+                    </div>
+                    <div className="project-config-actions">
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        onClick={() => actions.createProjectConfig()}
+                      >
+                        Create .photon/config.json
+                      </button>
+                    </div>
+                  </div>
+                )}
               </Category>
             </>
           )}
@@ -705,16 +780,25 @@ export function SettingsPanel({
                           </span>
                         </div>
 
-                        {(isStopped || isConflict || (isNotInstalled && r.installOptions?.length)) ? (
+                        {(isStopped || isConflict || (isRunning && state.providerLifecycle[r.id]?.managed) || (isNotInstalled && r.installOptions?.length)) ? (
                           <div className="sensed-runtime-actions">
-                            {r.id === "ollama" && isStopped && (
+                            {(r.id === "ollama" || r.id === "llamacpp") && isStopped && (
                               <button
                                 type="button"
                                 className="btn btn-sm primary"
-                                onClick={() => actions.startProvider("ollama")}
+                                onClick={() => actions.startProvider(r.id as "ollama" | "llamacpp")}
                               >
                                 <BoltIcon />
                                 <span>Start</span>
+                              </button>
+                            )}
+                            {isRunning && (r.id === "ollama" || r.id === "llamacpp") && state.providerLifecycle[r.id]?.managed && (
+                              <button
+                                type="button"
+                                className="btn btn-sm danger"
+                                onClick={() => actions.stopProvider(r.id as "ollama" | "llamacpp")}
+                              >
+                                <span>Stop</span>
                               </button>
                             )}
                             {isConflict && (r.id === "ollama" || r.id === "llamacpp") && (
@@ -757,7 +841,7 @@ export function SettingsPanel({
               <Category title="Cloud Providers" iconNode={<LinkIcon />}>
                 <div className="provider-list">
                   {state.config.providers
-                    .filter((p) => p.id !== "ollama")
+                    .filter((p) => !p.isLocal && p.id !== "ollama" && p.id !== "llamacpp")
                     .map((p) => (
                       <CloudProviderCard
                         key={p.id}
@@ -828,10 +912,51 @@ export function SettingsPanel({
                     onChange={actions.setIndexingEnabled}
                   />
                 </Row>
+                <Row label="Embedding model">
+                  <select
+                    className="settings-select"
+                    value={state.config.embeddingModel}
+                    onChange={(e) => actions.setEmbeddingModel(e.target.value)}
+                  >
+                    {[
+                      "nomic-embed-text",
+                      "mxbai-embed-large",
+                      "bge-m3",
+                      "snowflake-arctic-embed",
+                      "all-minilm",
+                      ...(state.config.embeddingModel &&
+                      ![
+                        "nomic-embed-text",
+                        "mxbai-embed-large",
+                        "bge-m3",
+                        "snowflake-arctic-embed",
+                        "all-minilm",
+                      ].includes(state.config.embeddingModel)
+                        ? [state.config.embeddingModel]
+                        : []),
+                    ].map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </select>
+                </Row>
                 <div className="settings-row">
                   <span className="settings-hint">{indexSummary(state.indexStatus)}</span>
+                  {state.config.indexingEnabled && state.indexStatus.phase === "unavailable" && (
+                    <button
+                      type="button"
+                      className="btn btn-sm primary"
+                      disabled={state.pullProgress !== null}
+                      onClick={() => actions.pullModel(state.config.embeddingModel || "nomic-embed-text")}
+                    >
+                      {state.pullProgress?.model === state.config.embeddingModel
+                        ? "Pulling…"
+                        : `Pull ${state.config.embeddingModel || "nomic-embed-text"}`}
+                    </button>
+                  )}
                   {state.config.indexingEnabled && state.indexStatus.phase !== "unavailable" && (
-                    <button className="btn btn-sm" onClick={actions.reindex}>
+                    <button type="button" className="btn btn-sm" onClick={actions.reindex}>
                       Re-index
                     </button>
                   )}
@@ -845,17 +970,53 @@ export function SettingsPanel({
                   </div>
                 ) : (
                   <div className="mcp-list">
-                    {state.mcpServers.map((s) => (
-                      <div key={s.id} className="mcp-row">
-                        <div className="mcp-info">
-                          <span className="mcp-name">{s.id}</span>
-                          <span className={`mcp-status mcp-${s.status}`}>{s.status}</span>
-                          {s.toolCount > 0 && (
-                            <span className="mcp-tools">{s.toolCount} tools</span>
+                    {state.mcpServers.map((s) => {
+                      const canApprove = s.status === "pending" || s.status === "revoked" || s.status === "error";
+                      const canRevoke = s.status === "approved" || s.status === "connected";
+                      return (
+                        <div key={s.id} className="mcp-row">
+                          <div className="mcp-info">
+                            <span className="mcp-name">{s.id}</span>
+                            <span className={`mcp-status mcp-${s.status}`}>{s.status}</span>
+                            {s.toolCount > 0 && (
+                              <span className="mcp-tools">{s.toolCount} tools</span>
+                            )}
+                          </div>
+                          {s.message && (
+                            <div className="mcp-msg">{s.message}</div>
                           )}
+                          <div className="mcp-actions">
+                            {canApprove && (
+                              <>
+                                <button
+                                  type="button"
+                                  className="btn btn-sm primary"
+                                  onClick={() => actions.approveMcpServer(s.id, s.fingerprint, "persistent")}
+                                >
+                                  {s.status === "error" ? "Retry" : "Approve"}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn btn-sm ghost"
+                                  onClick={() => actions.approveMcpServer(s.id, s.fingerprint, "session")}
+                                >
+                                  Session
+                                </button>
+                              </>
+                            )}
+                            {canRevoke && (
+                              <button
+                                type="button"
+                                className="btn btn-sm danger"
+                                onClick={() => actions.revokeMcpServer(s.id)}
+                              >
+                                Revoke
+                              </button>
+                            )}
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </Category>

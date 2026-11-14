@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ChatMessage, Mode, ToolCall, TokenUsage } from "../../shared/types";
-import type { LLMMessage, LLMProvider } from "../llm/types";
+import type { LLMChatOptions, LLMMessage, LLMProvider } from "../llm/types";
 import { toNativeTools } from "../protocol/serialize";
 import { estimateTokens, estimateToolSchemasTokens } from "../adaptive/tokens";
 import { fitToWindow } from "./contextManager";
@@ -84,6 +84,7 @@ export interface CloudTurnInput {
   onStepUsage?: (usage: CloudStepUsageEvent) => void;
   mode?: Mode;
   maxSteps?: number;
+  options?: LLMChatOptions;
 }
 
 export interface PendingCall {
@@ -644,7 +645,12 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
     }, 3_000);
     try {
       for await (const chunk of provider.chatStream(
-        { model, messages, ...(activeNativeTools ? { tools: activeNativeTools } : {}) },
+        {
+          model,
+          messages,
+          ...(input.options && Object.keys(input.options).length > 0 ? { options: input.options } : {}),
+          ...(activeNativeTools ? { tools: activeNativeTools } : {}),
+        },
         signal
       )) {
         if (chunk.message?.thinking) {
@@ -949,7 +955,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
     // Separate lifecycle calls (for legacy/external models) from executable tool calls
     const executableCalls: { pending: PendingCall; tool?: Tool; callObj: ToolCall }[] = [];
     for (const c of normalizedCalls) {
-      if (c.name === "attempt_completion") {
+      if (!c.args.__malformedToolArgs && c.name === "attempt_completion") {
         completion = typeof c.args.result === "string" ? c.args.result : "";
         history.push({
           role: "tool",
@@ -959,7 +965,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
         });
         continue;
       }
-      if (c.name === "ask_followup_question") {
+      if (!c.args.__malformedToolArgs && c.name === "ask_followup_question") {
         followup = typeof c.args.question === "string" ? c.args.question : "I have a question.";
         history.push({
           role: "tool",
@@ -992,7 +998,10 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
 
     const runOneCall = async (ec: { pending: PendingCall; tool?: Tool; callObj: ToolCall }) => {
       const { pending: c, tool, callObj } = ec;
-      emitter.onPhase("working", c.name);
+      const isVerification =
+        c.name === "get_diagnostics" ||
+        ((c.name === "run_command" || c.name === "execute_command") && mutationEpoch > 0);
+      emitter.onPhase("working", isVerification ? `Verifying changes (${c.name})` : c.name);
       emitter.onToolUpdate(assistantId, { ...callObj, status: "running" });
       let output: string;
       let okResult: boolean;
@@ -1031,6 +1040,11 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
         okResult = false;
       } else if (!tool) {
         output = `Unknown tool "${c.name}". Available: ${tools.map((t) => t.spec.name).join(", ")}.`;
+        okResult = false;
+      } else if (c.args.__malformedToolArgs) {
+        output = typeof c.args.__parseError === "string"
+          ? `${c.args.__parseError} Re-emit "${c.name}" with valid JSON object arguments.`
+          : `Malformed JSON arguments for tool "${c.name}". Re-emit the tool call with valid JSON object arguments.`;
         okResult = false;
       } else if (ctx.executionPolicy?.blockTerminalCommands && (c.name === "run_command" || c.name === "execute_command" || tool.spec.risk === "execute")) {
         output = `Terminal command execution is disabled by current execution policy.`;

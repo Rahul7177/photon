@@ -89,15 +89,14 @@ export function toWorkspaceRelative(
  * Writes to a temporary file in the target directory, re-verifies destination symlinks,
  * and atomically renames the temporary file into place.
  */
-export async function atomicWriteFile(
-  workspaceRoot: string,
-  rel: string,
+/**
+ * Atomically writes content to an already-resolved workspace path via temp file,
+ * Windows-safe rename retry, copyFile fallback, and guaranteed temp-file cleanup.
+ */
+export async function atomicWriteResolvedPath(
+  targetAbs: string,
   content: string | Buffer
-): Promise<{ abs: string }> {
-  const initial = resolveInWorkspace(workspaceRoot, rel);
-  if ("error" in initial) throw new Error(initial.error);
-
-  const targetAbs = initial.abs;
+): Promise<void> {
   const targetDir = path.dirname(targetAbs);
   await fsp.mkdir(targetDir, { recursive: true });
 
@@ -108,26 +107,6 @@ export async function atomicWriteFile(
 
   try {
     await fsp.writeFile(tmpPath, content, { mode: 0o666 });
-
-    // Revalidate destination immediately before mutation to prevent symlink TOCTOU
-    const recheck = resolveInWorkspace(workspaceRoot, rel);
-    if ("error" in recheck) {
-      throw new Error(`Symlink TOCTOU race detected: ${recheck.error}`);
-    }
-
-    // If destination exists, verify it is not a symlink pointing outside workspace
-    try {
-      const lstat = await fsp.lstat(targetAbs);
-      if (lstat.isSymbolicLink()) {
-        const real = await fsp.realpath(targetAbs);
-        const resolvedTarget = resolveInWorkspace(workspaceRoot, real);
-        if ("error" in resolvedTarget) {
-          throw new Error(`Target is a symlink pointing outside workspace: ${targetAbs} -> ${real}`);
-        }
-      }
-    } catch (e: any) {
-      if (e?.code !== "ENOENT") throw e;
-    }
 
     // Atomic rename into place (retrying for transient Windows file lock delays)
     let renamed = false;
@@ -149,9 +128,48 @@ export async function atomicWriteFile(
       await fsp.copyFile(tmpPath, targetAbs);
       await fsp.unlink(tmpPath).catch(() => undefined);
     }
-
-    return { abs: targetAbs };
   } finally {
     await fsp.unlink(tmpPath).catch(() => undefined);
   }
+}
+
+/**
+ * Safely writes to a workspace-relative path:
+ * 1. Resolves initial path inside workspace
+ * 2. Writes content to a temporary file
+ * 3. Re-validates the resolved path & checks target isn't an external symlink (TOCTOU guard)
+ * 4. Atomically renames (with retry + guaranteed cleanup)
+ */
+export async function atomicWriteFile(
+  workspaceRoot: string,
+  rel: string,
+  content: string | Buffer
+): Promise<{ abs: string }> {
+  const initial = resolveInWorkspace(workspaceRoot, rel);
+  if ("error" in initial) throw new Error(initial.error);
+
+  const targetAbs = initial.abs;
+
+  // Revalidate destination immediately before mutation to prevent symlink TOCTOU
+  const recheck = resolveInWorkspace(workspaceRoot, rel);
+  if ("error" in recheck) {
+    throw new Error(`Symlink TOCTOU race detected: ${recheck.error}`);
+  }
+
+  // If destination exists, verify it is not a symlink pointing outside workspace
+  try {
+    const lstat = await fsp.lstat(targetAbs);
+    if (lstat.isSymbolicLink()) {
+      const real = await fsp.realpath(targetAbs);
+      const resolvedTarget = resolveInWorkspace(workspaceRoot, real);
+      if ("error" in resolvedTarget) {
+        throw new Error(`Target is a symlink pointing outside workspace: ${targetAbs} -> ${real}`);
+      }
+    }
+  } catch (e: any) {
+    if (e?.code !== "ENOENT") throw e;
+  }
+
+  await atomicWriteResolvedPath(targetAbs, content);
+  return { abs: targetAbs };
 }

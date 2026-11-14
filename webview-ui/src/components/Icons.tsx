@@ -69,6 +69,20 @@ export function TrashIcon() {
   );
 }
 
+export function PencilIcon({ size = 12 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path
+        d="M11.3 2.4a1.4 1.4 0 0 1 2 2L5.6 12.1 2.5 13l.9-3.1 7.9-7.5z"
+        stroke="currentColor"
+        strokeWidth="1.2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 export function LightbulbIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -686,9 +700,9 @@ export function LockIcon({ size = 13 }: { size?: number }) {
   );
 }
 
-export function PinIcon({ size = 13 }: { size?: number }) {
+export function PinIcon({ size = 13, filled = false }: { size?: number; filled?: boolean }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <svg width={size} height={size} viewBox="0 0 16 16" fill={filled ? "currentColor" : "none"} xmlns="http://www.w3.org/2000/svg">
       <path
         d="M9.8 2.5L13.5 6.2L11.5 8.2L11 11.5L8 8.5L4.5 12L4 10.5L7.5 7L4.5 4L7.8 4.5L9.8 2.5Z"
         stroke="currentColor"

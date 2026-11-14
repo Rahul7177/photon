@@ -289,6 +289,67 @@ describe("Phase 5.2: VectorStore Fidelity, Validation & Model Migration", () => 
       assert.equal(VectorStore.fromJSON("string").stats.chunks, 0);
       assert.equal(VectorStore.fromJSON({ version: 3, chunks: [] }).stats.chunks, 0);
     });
+
+    it("supports hybrid dense+lexical query boosting while preserving pure cosine similarity when queryText is omitted", () => {
+      const store = new VectorStore();
+      store.setFile(
+        "src/auth/tokens.ts",
+        [
+          {
+            path: "src/auth/tokens.ts",
+            startLine: 10,
+            endLine: 25,
+            text: "export function verifyRefreshToken(token: string) { return true; }",
+            vector: [0.9, 0.4359, 0],
+          },
+        ],
+        1000
+      );
+      store.setFile(
+        "src/billing/invoice.ts",
+        [
+          {
+            path: "src/billing/invoice.ts",
+            startLine: 1,
+            endLine: 15,
+            text: "export function computeMonthlyTotal(items: number[]) { return 0; }",
+            vector: [0.95, 0.3122, 0],
+          },
+        ],
+        1000
+      );
+
+      // Without queryText -> pure dense cosine ranking (invoice.ts has higher dot product)
+      const denseOnly = store.query([1, 0, 0], 2);
+      assert.equal(denseOnly[0].path, "src/billing/invoice.ts");
+      assert.ok(Math.abs(denseOnly[0].score - dot(normalize([1, 0, 0]), normalize([0.95, 0.3122, 0]))) < 1e-3);
+
+      // With queryText matching exact symbol/path -> tokens.ts wins via hybrid boost
+      const hybrid = store.query([1, 0, 0], 2, "verifyRefreshToken");
+      assert.equal(hybrid[0].path, "src/auth/tokens.ts");
+      assert.ok(hybrid[0].score > hybrid[1].score);
+    });
+
+    it("persists content hashes across serialization and prunes them on removeFile/clear", () => {
+      const store = new VectorStore();
+      store.setEmbeddingModel("nomic-embed-text");
+      store.setFile(
+        "src/a.ts",
+        [{ path: "src/a.ts", startLine: 1, endLine: 5, text: "export const A = 1;", vector: [1, 0] }],
+        1234
+      );
+      store.setFileHash("src/a.ts", "abc123sha1");
+
+      const restored = VectorStore.fromJSON(store.toJSON(), "nomic-embed-text");
+      assert.equal(restored.getFileHash("src/a.ts"), "abc123sha1");
+
+      restored.removeFile("src/a.ts");
+      assert.equal(restored.getFileHash("src/a.ts"), undefined);
+
+      restored.setFileHash("src/b.ts", "def456sha1");
+      restored.clear();
+      assert.equal(restored.getFileHash("src/b.ts"), undefined);
+    });
   });
 });
 

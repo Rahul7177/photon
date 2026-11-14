@@ -497,6 +497,18 @@ describe("Cloud Model Optimization & Native Speed", () => {
       const call2Updates = events.filter((e) => e.type === "update" && e.call.id === "call_w2");
       assert.ok(call2Updates.some((u) => u.call.status === "error" && u.call.error === "Operation cancelled."));
     });
+
+    it("injects retrievedContext snippets into buildCloudSystemPrompt when provided", async () => {
+      const { buildCloudSystemPrompt } = await import("../../src/core/prompts/cloudSystem");
+      const prompt = buildCloudSystemPrompt({
+        mode: "agent",
+        workspaceName: "Photon",
+        toolPolicy: "all",
+        retrievedContext: "### src/core/index/indexer.ts:10-20\n```ts\nexport class WorkspaceIndex {}\n```",
+      });
+      assert.ok(prompt.includes("# Retrieved Code Snippets"));
+      assert.ok(prompt.includes("export class WorkspaceIndex"));
+    });
   });
 });
 

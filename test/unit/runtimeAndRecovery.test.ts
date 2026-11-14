@@ -711,63 +711,64 @@ describe("Consolidated Agent Runtime, Failure Recovery & Long Sessions (P1 Items
       assert.equal(isLocalModel({ name: "custom-provider:mistral-large" }), false);
     });
 
-    it("ApprovalService remembers approvals by tool name when remember=true is specified", async () => {
+    it("ApprovalService remembers approvals strictly per non-shell tool without escalating global autoApprove", async () => {
       const approvals = new ApprovalService(false);
       assert.equal(approvals.autoApprove, false);
 
-      const call1: ToolCall = {
+      // 1. Remembering write_file allows subsequent write_file without turning on autoApprove
+      const write1: ToolCall = {
+        id: "call-write-remember",
+        name: "write_file",
+        args: { path: "a.txt", content: "1" },
+        status: "proposed",
+        sideEffecting: true,
+      };
+      let postedWrite1 = false;
+      const pWrite1 = approvals.requestApproval(write1, () => {
+        postedWrite1 = true;
+      });
+      assert.equal(postedWrite1, true);
+      approvals.resolveApproval(write1.id, true, true, "write_file");
+      assert.equal(await pWrite1, true);
+      assert.equal(approvals.autoApprove, false);
+
+      let postedWrite2 = false;
+      const resWrite2 = await approvals.requestApproval(
+        { ...write1, id: "call-write-2", args: { path: "b.txt", content: "2" } },
+        () => { postedWrite2 = true; }
+      );
+      assert.equal(postedWrite2, false, "Remembered tool should not prompt again in session");
+      assert.equal(resWrite2, true);
+
+      // 2. Shell commands (run_command / execute_command) cannot be remembered across arbitrary commands
+      const cmd1: ToolCall = {
         id: "call-cmd-1",
         name: "run_command",
         args: { command: "npm test" },
         status: "proposed",
         sideEffecting: true,
       };
+      const pCmd1 = approvals.requestApproval(cmd1, () => {});
+      approvals.resolveApproval(cmd1.id, true, true, "run_command");
+      assert.equal(await pCmd1, true);
 
-      let posted = false;
-      const p1 = approvals.requestApproval(call1, () => {
-        posted = true;
-      });
-      assert.equal(posted, true);
-      assert.equal(approvals.pendingCount, 1);
+      let postedCmd2 = false;
+      const pCmd2 = approvals.requestApproval(
+        { id: "call-cmd-2", name: "run_command", args: { command: "git status" }, status: "proposed", sideEffecting: true },
+        () => { postedCmd2 = true; }
+      );
+      assert.equal(postedCmd2, true, "run_command must prompt again even if remember=true was sent");
+      approvals.resolveApproval("call-cmd-2", false);
+      assert.equal(await pCmd2, false);
 
-      // Resolve with remember = true and toolName = "run_command"
-      approvals.resolveApproval(call1.id, true, true, "run_command");
-      const res1 = await p1;
-      assert.equal(res1, true);
-
-      // Next call with run_command should be auto-approved without posting
-      const call2: ToolCall = {
-        id: "call-cmd-2",
-        name: "run_command",
-        args: { command: "git status" },
-        status: "proposed",
-        sideEffecting: true,
-      };
-
-      let posted2 = false;
-      const res2 = await approvals.requestApproval(call2, () => {
-        posted2 = true;
-      });
-      assert.equal(posted2, false, "Should not post approval request for remembered tool");
-      assert.equal(res2, true);
-
-      // An unapproved tool name (e.g. "write_file") still requires approval
-      const call3: ToolCall = {
-        id: "call-write-1",
-        name: "write_file",
-        args: { path: "test.txt", content: "data" },
-        status: "proposed",
-        sideEffecting: true,
-      };
-      // Note: when remember=true was passed above, autoApprove is also enabled as session-wide allow.
-      // Reset autoApprove to verify tool name memory independently:
-      approvals.autoApprove = false;
+      // 3. Unremembered edit_file still prompts
       let posted3 = false;
-      const p3 = approvals.requestApproval(call3, () => {
-        posted3 = true;
-      });
+      const p3 = approvals.requestApproval(
+        { id: "call-edit-1", name: "edit_file", args: { path: "test.txt" }, status: "proposed", sideEffecting: true },
+        () => { posted3 = true; }
+      );
       assert.equal(posted3, true, "Unremembered tool must prompt when autoApprove is false");
-      approvals.resolveApproval(call3.id, false);
+      approvals.resolveApproval("call-edit-1", false);
       const res3 = await p3;
       assert.equal(res3, false);
     });

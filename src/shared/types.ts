@@ -1,7 +1,7 @@
 // Domain types shared between the extension host and the webview UI.
 // Keep this file dependency-free (no vscode / node imports) so the webview can import it directly.
 export type Mode="chat"|"plan"|"agent";export type Role="system"|"user"|"assistant"|"tool";
-export interface ChatMessage{id:string;role:Role;content:string;toolCalls?:ToolCall[];attachments?:Attachment[];toolCallId?:string;createdAt:number;streaming?:boolean;notice?:string;hidden?:boolean;/** Model reasoning trace (display-only, collapsed once the answer streams). */thinking?:string;/** Ms spent reasoning, set when the trace completes. */thinkingElapsedMs?:number;/** Indicates this message is a context compaction digest. */isCompacted?:boolean;compactStats?:{messagesCount:number;tokensSaved:number;pctSaved:number;strategy?:string};/** Checkpoint created during this turn, allowing 1-click rollback of file changes. */checkpointId?:string;checkpointFiles?:string[];checkpointNumber?:number;}
+export interface ChatMessage{id:string;role:Role;name?:string;content:string;toolCalls?:ToolCall[];attachments?:Attachment[];toolCallId?:string;createdAt:number;streaming?:boolean;notice?:string;hidden?:boolean;/** Model reasoning trace (display-only, collapsed once the answer streams). */thinking?:string;/** Ms spent reasoning, set when the trace completes. */thinkingElapsedMs?:number;/** Indicates this message is a context compaction digest. */isCompacted?:boolean;compactStats?:{messagesCount:number;tokensSaved:number;pctSaved:number;strategy?:string};/** Checkpoint created during this turn, allowing 1-click rollback of file changes. */checkpointId?:string;checkpointFiles?:string[];checkpointNumber?:number;}
 export interface Attachment{id:string;kind:"image"|"text";name:string;mime:string;size:number;dataBase64?:string;text?:string;url?:string;isPruned?:boolean;}
 export interface ToolCall{id:string;name:string;args:Record<string,unknown>;status:"proposed"|"running"|"done"|"error"|"denied";result?:string;error?:string;statusDetail?:string;sideEffecting?:boolean;thoughtSignature?:string;risk?:ToolRisk|"critical";}
 export interface ModelCapabilityProfile{reasoning:number;coding:number;toolCalling:number;schemaAdherence:number;contextRetention:number;editFidelity:number;recovery:number;verification:number;speed:number;}
@@ -22,8 +22,8 @@ export interface VerificationPlan{required:VerificationKind[];completed:Verifica
 export interface TaskAnalysis{scope:"single_file"|"multi_file"|"codebase";reasoning:"low"|"medium"|"high";risk:"low"|"medium"|"high"|"destructive";verification:VerificationKind[];ambiguity:"low"|"medium"|"high";estimatedSteps:number;}
 export interface AdaptivePlan{model:string;mode:Mode;contextWindow:number;numCtx:number;temperature:number;topP:number;seed?:number;maxOutputTokens:number;toolProtocol:ToolProtocol;maxTools:number;allowParallelTools:boolean;intelligence:IntelligenceLevel;intelligenceAuto:boolean;rationale:string[];task?:TaskAnalysis;modelCapabilities?:ModelCapabilityProfile;executionPolicy?:ExecutionPolicy;verification?:VerificationPlan;}
 export type ToolProtocol="native"|"photon-block";
-export interface SessionState{id:string;title:string;mode:Mode;model:string;messages:ChatMessage[];createdAt:number;updatedAt:number;usage?:TokenUsage;}
-export interface SessionSummary{id:string;title:string;mode:Mode;model:string;updatedAt:number;messageCount:number;}
+export interface SessionState{id:string;title:string;mode:Mode;model:string;messages:ChatMessage[];createdAt:number;updatedAt:number;usage?:TokenUsage;pinned?:boolean;pinnedAt?:number;}
+export interface SessionSummary{id:string;title:string;mode:Mode;model:string;updatedAt:number;messageCount:number;pinned?:boolean;pinnedAt?:number;searchText?:string;}
 export interface TokenUsage{used:number;window:number;breakdown:{label:string;tokens:number}[];}
 export type ComplexityLevel="simple"|"moderate"|"complex";
 export interface ComplexitySignals{filesReferenced:number;estimatedSteps:number;keywords:string[];promptTokens:number;scope?:TaskAnalysis["scope"];reasoning?:TaskAnalysis["reasoning"];risk?:TaskAnalysis["risk"];verification?:VerificationKind[];ambiguity?:TaskAnalysis["ambiguity"];}
@@ -200,32 +200,48 @@ export interface RecommendationSet {
   calibrationScale?: number;
 }
 
+/** Known cloud provider ID prefixes so unpopulated ModelInfo objects still classify accurately. */
+const KNOWN_CLOUD_PREFIXES = new Set([
+  "anthropic",
+  "claude",
+  "openai",
+  "gemini",
+  "groq",
+  "nvidia",
+  "mistral",
+  "together",
+  "deepseek",
+  "openrouter",
+  "opencode",
+  "blackbox",
+  "fireworks",
+  "xai",
+  "cerebras",
+  "perplexity",
+  "cohere",
+  "siliconflow",
+  "deepinfra",
+  "huggingface",
+  "moonshot",
+  "kimi",
+  "sambanova",
+  "nebius",
+  "novita",
+  "hyperbolic",
+  "baseten",
+  "lambda",
+  "azure",
+]);
+
 /** Determine whether a model is locally hosted (Ollama / llama.cpp) vs cloud. */
 export function isLocalModel(m: { name?: string; provider?: string } | null | undefined): boolean {
   if (!m) return true;
   if (m.provider) {
-    return m.provider === "ollama" || m.provider === "llamacpp";
+    return m.provider === "ollama" || m.provider === "llamacpp" || m.provider === "lmstudio";
   }
   if (m.name && m.name.includes(":")) {
     const prefix = m.name.split(":")[0].toLowerCase();
-    if (
-      prefix === "anthropic" ||
-      prefix === "claude" ||
-      prefix === "openai" ||
-      prefix === "gemini" ||
-      prefix === "groq" ||
-      prefix === "nvidia" ||
-      prefix === "mistral" ||
-      prefix === "together" ||
-      prefix === "deepseek" ||
-      prefix === "openrouter" ||
-      prefix === "opencode" ||
-      prefix === "blackbox" ||
-      prefix === "fireworks" ||
-      prefix === "xai" ||
-      prefix === "cerebras" ||
-      prefix.startsWith("custom")
-    ) {
+    if (KNOWN_CLOUD_PREFIXES.has(prefix) || prefix.startsWith("custom")) {
       return false;
     }
   }

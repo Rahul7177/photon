@@ -9,6 +9,7 @@ import {
   compactMidTurnLLMHistory,
   isToolResultMessage,
   isUsableProviderSummary,
+  resolveSummarizationTimeoutMs,
 } from "../../src/core/agent/compactor";
 import { runCloudTurn } from "../../src/core/agent/cloudEngine";
 import { runUnifiedTurn } from "../../src/core/agent/unifiedEngine";
@@ -1076,6 +1077,68 @@ describe("Context Compaction Engine (P1 Item 4)", () => {
       assert.equal(attempt, 2);
       assert.ok(session.messages.some((m) => m.isCompacted), "Session should hold compacted digest after overflow recovery");
       assert.ok(finalOut.includes("Overview complete after overflow recovery."));
+    });
+
+    it("scales summarization timeouts for local runtimes and caches failing sibling models per provider", async () => {
+      assert.equal(resolveSummarizationTimeoutMs("ollama"), 120_000);
+      assert.equal(resolveSummarizationTimeoutMs("llamacpp"), 120_000);
+      assert.equal(resolveSummarizationTimeoutMs("openai"), 45_000);
+      assert.equal(resolveSummarizationTimeoutMs("ollama", 15_000), 15_000);
+
+      const requestedModels: string[] = [];
+      const cachedFallbackProvider: LLMProvider = {
+        id: "openai",
+        label: "OpenAI Proxy",
+        enabled: true,
+        isConfigured: () => true,
+        ping: async () => true,
+        listModels: async () => [],
+        async *chatStream(req: LLMChatRequest): AsyncGenerator<LLMChatChunk> {
+          requestedModels.push(req.model);
+          if (req.model.includes("4o-mini")) {
+            throw new Error("404 model_not_found");
+          }
+          yield {
+            done: true,
+            message: {
+              role: "assistant",
+              content: "### Summary\n- Compacted cleanly using configured active model.",
+            },
+          };
+        },
+      };
+
+      const msgs: ChatMessage[] = [
+        makeUserMsg("u1", "Build auth module"),
+        makeAssistantMsg("a1", "Step 1 complete"),
+        makeUserMsg("u2", "Add JWT verifier"),
+        makeAssistantMsg("a2", "Added JWT verifier"),
+        makeUserMsg("u3", "Latest turn"),
+        makeAssistantMsg("a3", "Final reply"),
+      ];
+
+      await compactSessionMessages({
+        messages: msgs,
+        contextWindow: 128_000,
+        model: "openai:gpt-4.1",
+        provider: cachedFallbackProvider,
+        force: true,
+        keepRecentUserTurns: 1,
+      });
+      await compactSessionMessages({
+        messages: msgs,
+        contextWindow: 128_000,
+        model: "openai:gpt-4.1",
+        provider: cachedFallbackProvider,
+        force: true,
+        keepRecentUserTurns: 1,
+      });
+
+      assert.deepEqual(requestedModels, [
+        "openai:gpt-4o-mini",
+        "openai:gpt-4.1",
+        "openai:gpt-4.1",
+      ]);
     });
   });
 });

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ModelInfo } from "../../../shared/types";
 import type { LLMChatChunk, LLMChatRequest, LLMProvider, ProviderModel } from "../types";
-import { fetchWithRetry, streamSse, tryJson } from "../sse";
+import { fetchWithRetry, parseStreamedToolArgs, streamSse, tryJson } from "../sse";
 import { classifyHttpError } from "../errors";
 import { normalizeAnthropicMessages } from "../normalizeMessages";
 
@@ -61,6 +61,12 @@ export class AnthropicProvider implements LLMProvider {
       audio: m.audio,
       video: m.video,
       thinking: m.thinking,
+      thinkingLevels:
+        m.thinkingLevels && m.thinkingLevels.length > 0
+          ? m.thinkingLevels
+          : m.thinking
+            ? ["off", "low", "medium", "high"]
+            : [],
       capabilities: m.capabilities,
       tier: m.tier,
       provider: this.id,
@@ -94,7 +100,7 @@ export class AnthropicProvider implements LLMProvider {
         last_id?: string;
       };
       for (const m of json.data ?? []) {
-        const thinking = /opus|sonnet.*4|3-7-sonnet|thinking/i.test(m.id);
+        const thinking = /opus|sonnet[-_.]?(?:4|3[-_.]7)|haiku[-_.]?4|claude[-_.]4|thinking/i.test(m.id);
         out.push({
           name: `claude:${m.id}`,
           provider: "claude",
@@ -104,7 +110,7 @@ export class AnthropicProvider implements LLMProvider {
           thinking,
           thinkingLevels: thinking ? ["off", "low", "medium", "high"] : [],
           capabilities: thinking ? ["tools", "vision", "thinking"] : ["tools", "vision"],
-          tier: "large",
+          tier: /haiku/i.test(m.id) ? "medium" : "large",
         });
       }
       if (!json.has_more || !json.last_id) break;
@@ -117,15 +123,34 @@ export class AnthropicProvider implements LLMProvider {
     const { system, messages } = normalizeAnthropicMessages(req.messages);
 
     const wireModel = req.model.startsWith("claude:") ? req.model.slice("claude:".length) : req.model;
+    const requestedMaxTokens =
+      req.options?.num_predict && req.options.num_predict > 0
+        ? req.options.num_predict
+        : DEFAULT_MAX_TOKENS;
+    const thinkingLevel = req.options?.thinkingLevel;
+    const thinkingBudget =
+      thinkingLevel === "low"
+        ? 1024
+        : thinkingLevel === "medium"
+          ? 4096
+          : thinkingLevel === "high"
+            ? 8192
+            : thinkingLevel === "xtrahigh"
+              ? 16384
+              : 0;
+
     const body: Record<string, unknown> = {
       model: wireModel,
       max_tokens:
-        req.options?.num_predict && req.options.num_predict > 0
-          ? req.options.num_predict
-          : DEFAULT_MAX_TOKENS,
+        thinkingBudget > 0 ? Math.max(requestedMaxTokens, thinkingBudget + 4096) : requestedMaxTokens,
       messages,
       stream: true,
     };
+    if (thinkingBudget > 0) {
+      body.thinking = { type: "enabled", budget_tokens: thinkingBudget };
+    } else if (thinkingLevel === "off") {
+      body.thinking = { type: "disabled" };
+    }
     if (system) {
       // Ephemeral prompt caching on system block saves up to 90% on input tokens across turns
       body.system = [
@@ -136,8 +161,11 @@ export class AnthropicProvider implements LLMProvider {
         },
       ];
     }
-    if (req.options?.temperature !== undefined) body.temperature = req.options.temperature;
-    if (req.options?.top_p !== undefined) body.top_p = req.options.top_p;
+    // Anthropic rejects temperature/top_p when extended thinking is enabled
+    if (thinkingBudget === 0) {
+      if (req.options?.temperature !== undefined) body.temperature = req.options.temperature;
+      if (req.options?.top_p !== undefined) body.top_p = req.options.top_p;
+    }
     if (req.tools?.length) {
       const mappedTools = (
         req.tools as { function: { name: string; description?: string; parameters?: unknown } }[]
@@ -234,12 +262,10 @@ export class AnthropicProvider implements LLMProvider {
       } else if (json.type === "message_stop") {
         const calls = [...pendingCalls.values()]
           .filter((c) => c.name)
-          .map((c) => {
-            const parsed = tryJson<Record<string, unknown>>(c.json);
-            if (c.json && c.json.trim() && parsed === undefined) return null;
-            return { id: c.id, function: { name: c.name, arguments: parsed ?? {} } };
-          })
-          .filter((c): c is NonNullable<typeof c> => !!c);
+          .map((c) => ({
+            id: c.id,
+            function: { name: c.name, arguments: parseStreamedToolArgs(c.json) },
+          }));
         if (calls.length) {
           yield { message: { role: "assistant", content: "", tool_calls: calls }, done: false };
         }

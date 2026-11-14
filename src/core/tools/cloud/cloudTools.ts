@@ -1,16 +1,15 @@
-import { exec } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import type { Mode, ToolCall } from "../../../shared/types";
 import { locateEdit, listDirTool, readFileTool } from "../builtin/files";
 import { codeOutlineTool, findFilesTool, searchCodeTool } from "../builtin/search";
+import { executeShellCommand, findShellChaining } from "../builtin/terminal";
 import { getDiagnosticsTool } from "../builtin/verify";
 import { todoWriteTool } from "../builtin/plan";
 import { webSearchTool, webFetchTool } from "../builtin/web";
 import { queryProjectContextTool, updateProjectContextTool } from "../builtin/context";
 import { getProjectContextManager } from "../../context/projectContext";
-import { resolveInWorkspace } from "../paths";
+import { resolveInWorkspace, atomicWriteFile } from "../paths";
 import { clamp, fail, ok, outputBudget, type Tool } from "../types";
 import { analyzeCommandSecurity } from "../security";
 
@@ -78,7 +77,6 @@ const WEB_SEARCH_STATE = new WeakMap<AbortSignal, WebSearchState>();
 const MAX_WEB_SEARCH_CALLS = 3;
 
 const COMMAND_TIMEOUT_MS = 180_000;
-const COMMAND_MAX_BUFFER = 1024 * 1024;
 
 export const cloudReadFile: Tool = {
   spec: {
@@ -109,6 +107,7 @@ export const cloudWriteFile: Tool = {
     tags: ["fs", "write"],
   },
   async execute(args, ctx) {
+    if (!ctx.workspaceRoot) return fail("No workspace folder is open.");
     const rel = args.path as string;
     const content = (args.content as string) ?? "";
     const r = resolveInWorkspace(ctx.workspaceRoot, rel);
@@ -117,8 +116,7 @@ export const cloudWriteFile: Tool = {
     if (!approved) return fail("User declined the write.");
     try {
       await ctx.checkpointTracker?.recordBeforeChange(rel);
-      await fs.mkdir(path.dirname(r.abs), { recursive: true });
-      await fs.writeFile(r.abs, content, "utf8");
+      await atomicWriteFile(ctx.workspaceRoot, rel, content);
       const lines = content.split("\n").length;
       void getProjectContextManager(ctx.workspaceRoot)?.recordFileEdit(rel, `Wrote file (${lines} lines)`);
       return ok(`Wrote ${rel} (${lines} lines).`);
@@ -143,6 +141,7 @@ export const cloudReplaceInFile: Tool = {
     tags: ["fs", "write"],
   },
   async execute(args, ctx) {
+    if (!ctx.workspaceRoot) return fail("No workspace folder is open.");
     const rel = args.path as string;
     const find = args.find as string;
     const replace = (args.replace as string) ?? "";
@@ -150,8 +149,13 @@ export const cloudReplaceInFile: Tool = {
     if ("error" in r) return fail(r.error);
     if (!find?.trim()) return fail('"find" must not be empty.');
     let original: string;
+    let hasBom = false;
     try {
       original = await fs.readFile(r.abs, "utf8");
+      if (original.startsWith("\uFEFF")) {
+        hasBom = true;
+        original = original.slice(1);
+      }
     } catch (e) {
       return fail(`Could not read "${rel}": ${(e as Error).message}`);
     }
@@ -161,7 +165,8 @@ export const cloudReplaceInFile: Tool = {
     if (!approved) return fail("User declined the edit.");
     try {
       await ctx.checkpointTracker?.recordBeforeChange(rel);
-      await fs.writeFile(r.abs, result.text, "utf8");
+      const toWrite = hasBom ? "\uFEFF" + result.text : result.text;
+      await atomicWriteFile(ctx.workspaceRoot, rel, toWrite);
       const startLine = original.slice(0, result.firstIndex).split("\n").length;
       void getProjectContextManager(ctx.workspaceRoot)?.recordFileEdit(
         rel,
@@ -180,6 +185,7 @@ export const cloudExecuteCommand: Tool = {
     summary: "Run a shell command in the workspace root and return its output.",
     params: [
       { name: "command", type: "string", required: true, description: "The shell command to run." },
+      { name: "cwd", type: "string", required: false, description: "Working directory relative to workspace root." },
       { name: "timeout_ms", type: "number", required: false, description: "Optional timeout in ms (default 180000, max 600000)." },
     ],
     sideEffecting: true,
@@ -190,64 +196,47 @@ export const cloudExecuteCommand: Tool = {
   async execute(args, ctx) {
     const command = (args.command as string)?.trim();
     if (!command) return fail("Provide a command.");
-    if (findShellChaining(command)) {
+    const chained = findShellChaining(command);
+    if (chained) {
       return fail(
-        `Run one command at a time — chaining is not allowed. Split into separate calls. Got: "${command.slice(0, 120)}"`
+        `Run one command at a time — chaining/substitution with "${chained}" is not allowed. Split into separate calls. Got: "${command.slice(0, 120)}"`
       );
     }
     if (!ctx.workspaceRoot) return fail("No workspace folder is open.");
+    const cwdRel = (args.cwd as string)?.trim();
+    let cwd = ctx.workspaceRoot;
+    if (cwdRel) {
+      const r = resolveInWorkspace(ctx.workspaceRoot, cwdRel);
+      if ("error" in r) return fail(r.error);
+      cwd = r.abs;
+    }
     const requested = Number(args.timeout_ms);
     const timeoutMs =
       Number.isFinite(requested) && requested > 0
         ? Math.min(Math.floor(requested), 600_000)
         : COMMAND_TIMEOUT_MS;
     const secAnalysis = analyzeCommandSecurity(command);
-    const toolCall = mkCall("execute_command", args, ctx.pendingCallId);
-    if (secAnalysis.isDangerous) {
-      toolCall.risk = "critical";
-      toolCall.statusDetail = `High-risk action: ${secAnalysis.reason}`;
-    }
+    const toolCall = mkCall("execute_command", { ...args, command, cwd }, ctx.pendingCallId);
+    toolCall.risk = secAnalysis.isDangerous ? "critical" : "execute";
+    toolCall.statusDetail = secAnalysis.isDangerous
+      ? `High-risk action: ${secAnalysis.reason}`
+      : `Terminal execution in: ${cwd}`;
     const approved = await ctx.requestApproval(toolCall);
     if (ctx.signal.aborted) return fail("Command cancelled.");
-    if (!approved) return fail(secAnalysis.isDangerous ? `User declined high-risk action: ${secAnalysis.reason}` : "User declined to run the command.");
-    ctx.log(`$ ${command}`);
-    return new Promise((resolve) => {
-      if (ctx.signal.aborted) return resolve(fail("Command cancelled."));
-      let settled = false;
-      const finish = (res: ReturnType<typeof ok>) => {
-        if (settled) return;
-        settled = true;
-        resolve(res);
-      };
-      let child: ReturnType<typeof exec> | undefined;
-      const onAbort = () => {
-        if (child) {
-          try { child.stdout?.destroy(); child.stderr?.destroy(); child.stdin?.destroy(); } catch { /* ignore */ }
-          try { child.kill(); } catch { /* ignore */ }
-          if (process.platform === "win32" && child.pid) {
-            try { exec(`taskkill /pid ${child.pid} /T /F`, { windowsHide: true }); } catch { /* ignore */ }
-          }
-        }
-        finish(fail("Command cancelled."));
-      };
-      child = exec(
-        command,
-        { cwd: ctx.workspaceRoot, timeout: timeoutMs, maxBuffer: COMMAND_MAX_BUFFER, windowsHide: true },
-        (error, stdout, stderr) => {
-          ctx.signal.removeEventListener("abort", onAbort);
-          if (settled || ctx.signal.aborted) return finish(fail("Command cancelled."));
-          const out = [stdout, stderr].filter(Boolean).join("\n").trim();
-          const code = error ? ((error as unknown as { code?: number }).code ?? 1) : 0;
-          const header = `Exit code ${code}.`;
-          const outputText = `${header}\n${clamp(out || error?.message || "(no output)", outputBudget(ctx))}`;
-          if (code !== 0) {
-            // Return full stdout and stderr so the cloud model knows exactly why the command or test failed
-            return finish(fail(outputText));
-          }
-          finish(ok(outputText));
-        }
+    if (!approved) {
+      return fail(
+        secAnalysis.isDangerous
+          ? `User declined high-risk action: ${secAnalysis.reason}`
+          : "User declined to run the command."
       );
-      ctx.signal.addEventListener("abort", onAbort, { once: true });
+    }
+    ctx.log(`$ ${command}`);
+    return executeShellCommand({
+      command,
+      cwd,
+      timeoutMs,
+      signal: ctx.signal,
+      maxOutputChars: outputBudget(ctx),
     });
   },
 };
@@ -484,37 +473,4 @@ function isFreshOrExactQuery(query: string): boolean {
 
 function mkCall(name: string, args: Record<string, unknown>, existingId?: string): ToolCall {
   return { id: existingId ?? randomUUID(), name, args, status: "proposed", sideEffecting: true };
-}
-
-/** Detect shell chaining/substitution outside quotes (mirrors builtin terminal guard). */
-function findShellChaining(cmd: string): string | null {
-  let sq = false,
-    dq = false,
-    esc = false;
-  for (let i = 0; i < cmd.length; i++) {
-    const c = cmd[i];
-    if (esc) {
-      esc = false;
-      continue;
-    }
-    if (c === "\\") {
-      esc = true;
-      continue;
-    }
-    if (c === "'" && !dq) {
-      sq = !sq;
-      continue;
-    }
-    if (c === '"' && !sq) {
-      dq = !dq;
-      continue;
-    }
-    if (sq || dq) continue;
-    const two = cmd.slice(i, i + 2);
-    if (two === "&&" || two === "||") return two;
-    if (c === ";" || c === "|" || c === "&" || c === "`" || c === ">" || c === "<") return c;
-    if (two === "$(") return "$(";
-    if (c === "\n" || c === "\r") return "\\n";
-  }
-  return null;
 }

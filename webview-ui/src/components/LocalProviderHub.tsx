@@ -20,19 +20,33 @@ export function LocalProviderHub({
   collapsible?: boolean;
 }) {
   const [showLogs, setShowLogs] = useState(false);
+  const [selectedRuntime, setSelectedRuntime] = useState<"ollama" | "llamacpp">("ollama");
 
-  const ollama = state.localRuntimes.find((r) => r.id === "ollama");
-  const lifecycle = state.providerLifecycle["ollama"];
+  const llamacppInfo = state.localRuntimes.find((r) => r.id === "llamacpp");
+  const hasLlamaCpp = Boolean(llamacppInfo && llamacppInfo.state !== "not_installed");
+  const activeId: "ollama" | "llamacpp" =
+    hasLlamaCpp && selectedRuntime === "llamacpp" ? "llamacpp" : "ollama";
+  const runtimeInfo = state.localRuntimes.find((r) => r.id === activeId);
+  const lifecycle = state.providerLifecycle[activeId];
+  const runtimeLabel = activeId === "llamacpp" ? "llama.cpp" : "Ollama";
+  const runtimePort = runtimeInfo?.port ?? (activeId === "llamacpp" ? 8080 : 11434);
+  const runtimeBaseUrl =
+    runtimeInfo?.baseUrl ??
+    (activeId === "llamacpp" ? "http://127.0.0.1:8080" : state.config.ollamaBaseUrl);
+
   const isStarting = lifecycle?.phase === "starting";
   const isStopping = lifecycle?.phase === "stopping";
-  const isRunning = state.ollamaReachable || ollama?.state === "running";
-  const isConflict = ollama?.state === "port_conflict";
-  const isNotInstalled = ollama?.state === "not_installed";
+  const isRunning =
+    activeId === "ollama"
+      ? state.ollamaReachable || runtimeInfo?.state === "running"
+      : runtimeInfo?.state === "running";
+  const isConflict = runtimeInfo?.state === "port_conflict";
+  const isNotInstalled = runtimeInfo?.state === "not_installed";
   const hasError = !isRunning && lifecycle?.phase === "error";
   const isStopped =
-    !isRunning && (ollama?.state === "installed_stopped" || (!isNotInstalled && !isConflict));
+    !isRunning && (runtimeInfo?.state === "installed_stopped" || (!isNotInstalled && !isConflict));
 
-  const loadedModel = state.ollamaRuntime?.[0];
+  const loadedModel = activeId === "ollama" ? state.ollamaRuntime?.[0] : undefined;
   const formatGb = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 
   return (
@@ -44,7 +58,29 @@ export function LocalProviderHub({
           </span>
           <div className="hub-titles">
             <div className="hub-main-title">
-              <span>Ollama</span>
+              <span>{runtimeLabel}</span>
+              {hasLlamaCpp && (
+                <div className="hub-runtime-tabs" role="tablist" aria-label="Local runtimes">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={activeId === "ollama"}
+                    className={`btn btn-xs ${activeId === "ollama" ? "primary" : "ghost"}`}
+                    onClick={() => setSelectedRuntime("ollama")}
+                  >
+                    Ollama
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={activeId === "llamacpp"}
+                    className={`btn btn-xs ${activeId === "llamacpp" ? "primary" : "ghost"}`}
+                    onClick={() => setSelectedRuntime("llamacpp")}
+                  >
+                    llama.cpp
+                  </button>
+                </div>
+              )}
               <span
                 className={`hub-badge ${
                   isRunning ? "ok" : isStarting ? "warn" : isConflict || hasError ? "error" : "faint"
@@ -53,7 +89,7 @@ export function LocalProviderHub({
                 {isRunning ? (
                   <>
                     <span className="dot-pulse green" />
-                    <span>Running {ollama?.version ? `v${ollama.version}` : ""}</span>
+                    <span>Running {runtimeInfo?.version ? `v${runtimeInfo.version}` : ""}</span>
                   </>
                 ) : isStarting ? (
                   <>
@@ -86,9 +122,9 @@ export function LocalProviderHub({
               {isRunning
                 ? loadedModel
                   ? `${loadedModel.name} (${formatGb(loadedModel.vramBytes || loadedModel.sizeBytes)})`
-                  : state.config.ollamaBaseUrl
+                  : runtimeBaseUrl
                 : isConflict
-                  ? "Port 11434 is in use"
+                  ? `Port ${runtimePort} is in use`
                   : isStarting
                     ? "Starting background service…"
                     : hasError
@@ -105,8 +141,8 @@ export function LocalProviderHub({
             <button
               type="button"
               className="btn primary btn-sm"
-              onClick={() => actions.startProvider("ollama")}
-              title="Start Ollama service"
+              onClick={() => actions.startProvider(activeId)}
+              title={`Start ${runtimeLabel} service`}
             >
               <BoltIcon />
               <span>Start</span>
@@ -117,22 +153,22 @@ export function LocalProviderHub({
             <button
               type="button"
               className="btn danger btn-sm"
-              onClick={() => actions.restartProvider("ollama")}
-              title="Free port 11434 and start Ollama"
+              onClick={() => actions.restartProvider(activeId)}
+              title={`Free port ${runtimePort} and start ${runtimeLabel}`}
             >
               <RefreshIcon />
               <span>Free Port</span>
             </button>
           )}
 
-          {isNotInstalled && ollama?.installOptions && ollama.installOptions.length > 0 && (
+          {isNotInstalled && runtimeInfo?.installOptions && runtimeInfo.installOptions.length > 0 && (
             <div className="hub-install-btns">
-              {ollama.installOptions.slice(0, 2).map((opt, i) => (
+              {runtimeInfo.installOptions.slice(0, 2).map((opt, i) => (
                 <button
                   key={opt.label}
                   type="button"
                   className={`btn btn-sm ${i === 0 ? "primary" : "ghost"}`}
-                  onClick={() => actions.installProvider("ollama", i)}
+                  onClick={() => actions.installProvider(activeId, i)}
                   title={opt.value}
                 >
                   <span>{opt.label}</span>
@@ -156,8 +192,8 @@ export function LocalProviderHub({
             <button
               type="button"
               className="btn danger btn-sm"
-              onClick={() => actions.stopProvider("ollama")}
-              title="Stop Ollama"
+              onClick={() => actions.stopProvider(activeId)}
+              title={`Stop ${runtimeLabel}`}
             >
               <StopSquareIcon />
               <span>Stop</span>

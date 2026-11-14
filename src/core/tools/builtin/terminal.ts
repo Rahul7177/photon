@@ -1,9 +1,11 @@
 import { exec, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { ToolCall } from "../../../shared/types";
-import { clampLines, clampToolResult, ok, toolError, type Tool } from "../types";
-import { analyzeCommandSecurity, isUnattendedCommandAllowed } from "../security";
+import { clamp, clampLines, clampToolResult, ok, toolError, type Tool, type ToolResult } from "../types";
+import { analyzeCommandSecurity, findShellChaining } from "../security";
 import { resolveInWorkspace } from "../paths";
+
+export { findShellChaining };
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_TIMEOUT_MS = 300_000;
@@ -103,16 +105,17 @@ export const runCommandTool: Tool = {
         : DEFAULT_TIMEOUT_MS;
 
     const secAnalysis = analyzeCommandSecurity(command);
-    const isUnattended = isUnattendedCommandAllowed(command);
 
-    // Present exact command and working directory to the user in approval request
+    // Present exact command and working directory to the user in approval request.
+    // Dangerous/destructive commands remain "critical" (never auto-approved);
+    // standard non-dangerous commands use "execute" (prompt when autoApprove=false, allowed when global autoApprove=true).
     const toolCall: ToolCall = {
       id: ctx.pendingCallId ?? randomUUID(),
       name: "run_command",
       args: { command, cwd },
       status: "proposed",
       sideEffecting: true,
-      risk: secAnalysis.isDangerous ? "critical" : isUnattended ? "execute" : "critical",
+      risk: secAnalysis.isDangerous ? "critical" : "execute",
       statusDetail: secAnalysis.isDangerous
         ? `High-risk action: ${secAnalysis.reason}`
         : `Terminal execution in: ${cwd}`,
@@ -131,112 +134,106 @@ export const runCommandTool: Tool = {
 
     ctx.log(`$ ${command}`);
 
-    return new Promise((resolve) => {
-      if (ctx.signal.aborted) return resolve(toolError("execution_error", "Command cancelled."));
-
-      let settled = false;
-      let child: ReturnType<typeof exec> | undefined;
-
-      const finish = (res: ReturnType<typeof ok>) => {
-        if (settled) return;
-        settled = true;
-        ctx.signal.removeEventListener("abort", onAbort);
-        resolve(res);
-      };
-
-      const onAbort = () => {
-        if (child) {
-          killProcessTree(child);
-        }
-        finish(toolError("execution_error", "Command cancelled."));
-      };
-
-      ctx.signal.addEventListener("abort", onAbort, { once: true });
-
-      child = exec(
-        command,
-        { cwd, timeout: timeoutMs, maxBuffer: MAX_BUFFER, windowsHide: true },
-        (error, stdout, stderr) => {
-          if (settled || ctx.signal.aborted) {
-            return finish(toolError("execution_error", "Command cancelled."));
-          }
-
-          if (error && (error as { killed?: boolean }).killed) {
-            return finish(
-              toolError(
-                "timeout",
-                `Command timed out after ${Math.round(timeoutMs / 1000)}s.\n${clampToolResult(stdout || stderr || "")}`,
-                { retryable: true, recovery: { action: "retry" } }
-              )
-            );
-          }
-
-          const code = error ? ((error as unknown as { code?: number }).code ?? 1) : 0;
-          const header = `Exit code ${code}.`;
-
-          // Clearly label stdout and stderr streams
-          let outputText = "";
-          const trimmedStdout = (stdout || "").trim();
-          const trimmedStderr = (stderr || "").trim();
-
-          if (trimmedStdout && trimmedStderr) {
-            outputText = `${header}\n[stdout]\n${clampLines(trimmedStdout, 60)}\n\n[stderr]\n${clampLines(trimmedStderr, 30)}`;
-          } else if (trimmedStderr) {
-            outputText = `${header}\n[stderr]\n${clampLines(trimmedStderr, 80)}`;
-          } else if (trimmedStdout) {
-            outputText = `${header}\n${clampLines(trimmedStdout, 80)}`;
-          } else {
-            outputText = `${header}\n${error?.message || "(no output)"}`;
-          }
-
-          outputText = clampToolResult(outputText);
-
-          if (code !== 0) {
-            return finish(
-              toolError("execution_error", outputText, {
-                retryable: true,
-                recovery: {
-                  action: "repair",
-                  hints: ["Inspect the output/stderr above, fix errors, and re-run"],
-                },
-              })
-            );
-          }
-
-          finish(ok(outputText, { metadata: { evidence: [`command exited 0: ${command}`] } }));
-        }
-      );
+    return executeShellCommand({
+      command,
+      cwd,
+      timeoutMs,
+      signal: ctx.signal,
     });
   },
 };
 
+export interface ShellExecOptions {
+  command: string;
+  cwd: string;
+  timeoutMs: number;
+  signal: AbortSignal;
+  maxOutputChars?: number;
+}
+
 /**
- * Detect shell chaining, substitution, redirection, or PowerShell-specific syntax
- * outside single and double quotes. Returns offending token or null.
+ * Shared hardened single-command executor used by both local (`run_command`)
+ * and cloud (`execute_command`) terminal tools.
  */
-export function findShellChaining(cmd: string): string | null {
-  let sq = false, dq = false, esc = false;
+export function executeShellCommand(opts: ShellExecOptions): Promise<ToolResult> {
+  const { command, cwd, timeoutMs, signal, maxOutputChars } = opts;
 
-  for (let i = 0; i < cmd.length; i++) {
-    const c = cmd[i];
-    if (esc) { esc = false; continue; }
-    if (c === "\\") { esc = true; continue; }
-    if (c === "'" && !dq) { sq = !sq; continue; }
-    if (c === '"' && !sq) { dq = !dq; continue; }
-    if (sq || dq) continue;
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve(toolError("execution_error", "Command cancelled."));
 
-    const two = cmd.slice(i, i + 2);
-    // Chaining operators
-    if (two === "&&" || two === "||" || two === "|&") return two;
-    // Redirection and pipeline
-    if (two === ">>" || two === "2>" || two === "<(" || two === ">(") return two;
-    if (c === ";" || c === "|" || c === "&" || c === "`" || c === ">" || c === "<") return c;
+    let settled = false;
+    let child: ChildProcess | undefined;
 
-    // Subexpression / command substitution
-    if (two === "$(" || two === "@(") return two;
-    // Newline splitting
-    if (c === "\n" || c === "\r") return "\\n";
-  }
+    const finish = (res: ToolResult) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve(res);
+    };
 
-  return null;
+    const onAbort = () => {
+      if (child) {
+        killProcessTree(child);
+      }
+      finish(toolError("execution_error", "Command cancelled."));
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+
+    child = exec(
+      command,
+      { cwd, timeout: timeoutMs, maxBuffer: MAX_BUFFER, windowsHide: true },
+      (error, stdout, stderr) => {
+        if (settled || signal.aborted) {
+          return finish(toolError("execution_error", "Command cancelled."));
+        }
+
+        if (error && (error as { killed?: boolean }).killed) {
+          if (child) killProcessTree(child);
+          const partial = [stdout, stderr].filter(Boolean).join("\n").trim();
+          const clampedPartial = maxOutputChars ? clamp(partial, maxOutputChars) : clampToolResult(partial);
+          return finish(
+            toolError(
+              "timeout",
+              `Command timed out after ${Math.round(timeoutMs / 1000)}s.\n${clampedPartial}`,
+              { retryable: true, recovery: { action: "retry" } }
+            )
+          );
+        }
+
+        const code = error ? ((error as unknown as { code?: number }).code ?? 1) : 0;
+        const header = `Exit code ${code}.`;
+
+        let outputText = "";
+        const trimmedStdout = (stdout || "").trim();
+        const trimmedStderr = (stderr || "").trim();
+
+        if (trimmedStdout && trimmedStderr) {
+          outputText = `${header}\n[stdout]\n${clampLines(trimmedStdout, 60)}\n\n[stderr]\n${clampLines(trimmedStderr, 30)}`;
+        } else if (trimmedStderr) {
+          outputText = `${header}\n[stderr]\n${clampLines(trimmedStderr, 80)}`;
+        } else if (trimmedStdout) {
+          outputText = `${header}\n${clampLines(trimmedStdout, 80)}`;
+        } else {
+          outputText = `${header}\n${error?.message || "(no output)"}`;
+        }
+
+        outputText = maxOutputChars ? clamp(outputText, maxOutputChars) : clampToolResult(outputText);
+
+        if (code !== 0) {
+          return finish(
+            toolError("execution_error", outputText, {
+              retryable: true,
+              recovery: {
+                action: "repair",
+                hints: ["Inspect the output/stderr above, fix errors, and re-run"],
+              },
+            })
+          );
+        }
+
+        finish(ok(outputText, { metadata: { evidence: [`command exited 0: ${command}`] } }));
+      }
+    );
+  });
 }

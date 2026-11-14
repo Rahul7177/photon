@@ -7,6 +7,7 @@ import {
 } from "../../../src/shared/types";
 import type { AppState, Actions } from "../state/store";
 import { ProviderLogo } from "./ProviderLogos";
+import { CUSTOM_ENDPOINT_PRESETS, looksLikeLocalUrl } from "./CloudProviders";
 import { PullProgressBar } from "./PullProgressBar";
 import {
   PhotonLogoIcon,
@@ -45,7 +46,10 @@ export function OnboardingModal({
   const [showCatalogWhenInstalled, setShowCatalogWhenInstalled] = useState(false);
 
   // Cloud setup state
-  const providers = state.config.providers ?? [];
+  const allProviders = state.config.providers ?? [];
+  const providers = allProviders.filter(
+    (p) => !p.isLocal && p.id !== "ollama" && p.id !== "llamacpp"
+  );
   const [selectedProviderId, setSelectedProviderId] = useState<string>(
     () => providers.find((p) => p.configured)?.id ?? providers[0]?.id ?? "gemini"
   );
@@ -54,6 +58,8 @@ export function OnboardingModal({
   const [customLabel, setCustomLabel] = useState("");
   const [customUrl, setCustomUrl] = useState("");
   const [customKey, setCustomKey] = useState("");
+  const [customRequireKey, setCustomRequireKey] = useState(true);
+  const [pendingCustomLabel, setPendingCustomLabel] = useState<string | null>(null);
   const [cloudSearch, setCloudSearch] = useState("");
   const [autoPinging, setAutoPinging] = useState(false);
   const autoPingCancelRef = useRef(false);
@@ -69,6 +75,20 @@ export function OnboardingModal({
       autoPingCancelRef.current = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!pendingCustomLabel) return;
+    const match = providers.find(
+      (p) => p.label.toLowerCase() === pendingCustomLabel.toLowerCase()
+    );
+    if (match) {
+      setSelectedProviderId(match.id);
+      setPendingCustomLabel(null);
+      if (match.configured && !state.providerModels[match.id]?.length) {
+        actions.fetchProviderModels(match.id);
+      }
+    }
+  }, [pendingCustomLabel, providers, actions, state.providerModels]);
 
   const triggerLocalScan = () => {
     setIsScanning(true);
@@ -200,15 +220,20 @@ export function OnboardingModal({
   };
 
   const handleAddCustomProvider = () => {
-    if (!customLabel.trim() || !customUrl.trim()) return;
+    const cleanLabel = customLabel.trim();
+    const cleanUrl = customUrl.trim();
+    if (!cleanLabel || !/^https?:\/\/[^/\s]+/i.test(cleanUrl)) return;
+    setPendingCustomLabel(cleanLabel);
     actions.addCustomProvider(
-      customLabel.trim(),
-      customUrl.trim(),
-      customKey.trim() || undefined
+      cleanLabel,
+      cleanUrl,
+      customKey.trim() || undefined,
+      customRequireKey
     );
     setCustomLabel("");
     setCustomUrl("");
     setCustomKey("");
+    setCustomRequireKey(true);
     setIsCustomMode(false);
   };
 
@@ -763,9 +788,9 @@ export function OnboardingModal({
                           }
                         }}
                       >
-                        <ProviderLogo providerId={p.id} label={p.label} size={18} />
+                        <ProviderLogo providerId={p.id} label={p.label} baseUrl={p.baseUrl} size={18} />
                         <span className="onboarding-provider-chip-name">{p.label}</span>
-                        {p.configured && <span className="onboarding-provider-dot" title="API Key Configured" />}
+                        {p.configured && <span className="onboarding-provider-dot" title="Configured & Ready" />}
                       </button>
                     );
                   })}
@@ -784,13 +809,35 @@ export function OnboardingModal({
               {isCustomMode ? (
                 <div className="onboarding-section">
                   <div className="onboarding-section-title">
-                    2. Connect Custom OpenAI-Compatible Endpoint
+                    2. Connect Custom / Preset OpenAI-Compatible Endpoint
+                  </div>
+                  <div className="preset-chip-row" style={{ marginBottom: 8 }}>
+                    {CUSTOM_ENDPOINT_PRESETS.slice(0, 10).map((preset) => (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        className={`preset-chip ${customLabel === preset.label ? "active" : ""}`}
+                        onClick={() => {
+                          setCustomLabel(preset.label);
+                          setCustomUrl(preset.baseUrl);
+                          setCustomRequireKey(preset.requireApiKey !== false);
+                        }}
+                      >
+                        <ProviderLogo
+                          providerId={preset.id}
+                          label={preset.label}
+                          baseUrl={preset.baseUrl}
+                          size={14}
+                        />
+                        <span>{preset.label}</span>
+                      </button>
+                    ))}
                   </div>
                   <div className="onboarding-custom-form">
                     <input
                       className="settings-input"
                       type="text"
-                      placeholder="Provider Name (e.g. Together, Groq, vLLM)"
+                      placeholder="Provider Name (e.g. Groq, DeepSeek, LM Studio)"
                       value={customLabel}
                       onChange={(e) => setCustomLabel(e.target.value)}
                     />
@@ -799,19 +846,37 @@ export function OnboardingModal({
                       type="text"
                       placeholder="Base URL (e.g. https://api.groq.com/openai/v1)"
                       value={customUrl}
-                      onChange={(e) => setCustomUrl(e.target.value)}
+                      onChange={(e) => {
+                        const next = e.target.value;
+                        setCustomUrl(next);
+                        if (looksLikeLocalUrl(next)) {
+                          setCustomRequireKey(false);
+                        }
+                      }}
                     />
+                    <label className="custom-endpoint-checkbox">
+                      <input
+                        type="checkbox"
+                        checked={customRequireKey}
+                        onChange={(e) => setCustomRequireKey(e.target.checked)}
+                      />
+                      <span>Requires API key</span>
+                    </label>
                     <input
                       className="settings-input"
                       type="password"
-                      placeholder="API Key (optional for local servers)"
+                      placeholder={
+                        customRequireKey
+                          ? "API Key (required by this endpoint)"
+                          : "API Key (optional for local servers)"
+                      }
                       value={customKey}
                       onChange={(e) => setCustomKey(e.target.value)}
                     />
                     <button
                       type="button"
                       className="btn btn-sm primary"
-                      disabled={!customLabel.trim() || !customUrl.trim()}
+                      disabled={!customLabel.trim() || !/^https?:\/\/[^/\s]+/i.test(customUrl.trim())}
                       onClick={handleAddCustomProvider}
                     >
                       Connect &amp; Fetch Models
@@ -827,21 +892,24 @@ export function OnboardingModal({
                           <ProviderLogo
                             providerId={activeProvider.id}
                             label={activeProvider.label}
+                            baseUrl={activeProvider.baseUrl}
                             size={20}
                           />
                           <div>
                             <div className="onboarding-section-title">
-                              2. {activeProvider.label} API Key
+                              2. {activeProvider.label} {activeProvider.requireApiKey === false ? "Connection" : "API Key"}
                             </div>
                             <div className="onboarding-section-hint">
-                              {activeProvider.configured
+                              {activeProvider.requireApiKey === false
+                                ? "Local / unauthenticated endpoint — API key is optional."
+                                : activeProvider.configured
                                 ? "API key is saved in VS Code SecretStorage. Enter a new key to replace it or fetch models below."
                                 : "Stored encrypted in VS Code SecretStorage."}
                             </div>
                           </div>
                         </div>
 
-                        {activeProvider.configured && (
+                        {(activeProvider.configured || activeProvider.requireApiKey === false) && (
                           <button
                             type="button"
                             className="btn btn-sm"
@@ -1016,7 +1084,7 @@ export function OnboardingModal({
                         </>
                       ) : (
                         <div className="onboarding-empty-models">
-                          {activeProvider.configured
+                          {activeProvider.configured || activeProvider.requireApiKey === false
                             ? "Click Fetch Models above to load models for this provider."
                             : `Enter your ${activeProvider.label} API key above to fetch and ping available models.`}
                         </div>

@@ -11,20 +11,23 @@ interface Persisted {
   embeddingModel?: string;
   fileMtimes?: Record<string, number>;
   fileSizes?: Record<string, number>;
+  fileHashes?: Record<string, string>;
   chunks: IndexedChunk[];
 }
 
 /**
  * A tiny, dependency-free vector store. Vectors are stored unit-normalized so a
- * similarity query is a dot product; retrieval is a linear scan, which is more
- * than fast enough at workspace scale (a few thousand chunks) and needs no
- * native module or server process — critical for offline, low-end machines.
+ * similarity query is a dot product; also maintains a lightweight inverted
+ * lexical index so hybrid retrieval blends dense semantics with exact symbol
+ * and path matching cleanly at workspace scale.
  */
 export class VectorStore {
   private byPath = new Map<string, IndexedChunk[]>();
   private fileMtimes = new Map<string, number>();
   private fileSizes = new Map<string, number>();
+  private fileHashes = new Map<string, string>();
   private flat: IndexedChunk[] = [];
+  private inverted = new Map<string, number[]>();
   private dirty = true;
   private dim = 0;
   private embeddingModel?: string;
@@ -85,6 +88,14 @@ export class VectorStore {
     return new Map(this.fileSizes);
   }
 
+  setFileHash(path: string, hash: string): void {
+    this.fileHashes.set(normalizePathKey(path), hash);
+  }
+
+  getFileHash(path: string): string | undefined {
+    return this.fileHashes.get(normalizePathKey(path));
+  }
+
   getFilePaths(): string[] {
     return Array.from(this.byPath.keys());
   }
@@ -93,6 +104,7 @@ export class VectorStore {
     const norm = normalizePathKey(path);
     this.fileMtimes.delete(norm);
     this.fileSizes.delete(norm);
+    this.fileHashes.delete(norm);
     if (this.byPath.delete(norm)) this.dirty = true;
   }
 
@@ -104,7 +116,9 @@ export class VectorStore {
     this.byPath.clear();
     this.fileMtimes.clear();
     this.fileSizes.clear();
+    this.fileHashes.clear();
     this.flat = [];
+    this.inverted.clear();
     this.dirty = true;
     // Dimension is deliberately preserved across clear so vector size contract remains valid
   }
@@ -115,21 +129,35 @@ export class VectorStore {
     return { files: this.byPath.size, chunks };
   }
 
-  /** Top-k most similar chunks — chunked scoring with yield to avoid main-thread jank at 8k chunks (audit). */
-  query(vector: number[], k: number): RetrievedChunk[] {
+  /**
+   * Top-k most similar chunks. When `queryText` is omitted, uses pure dense
+   * cosine similarity (`dot`). When `queryText` is provided, blends dense
+   * vector similarity with inverted-index lexical + path/identifier matching.
+   */
+  query(vector: number[], k: number, queryText?: string): RetrievedChunk[] {
     this.rebuild();
-    if (this.flat.length === 0 || vector.length === 0) return [];
+    if (this.flat.length === 0 || vector.length === 0 || k <= 0) return [];
     const q = normalize(vector);
-    const scored: RetrievedChunk[] = [];
+    const terms = queryText ? tokenizeIndexTerms(queryText) : [];
+    const lexicalScores = terms.length > 0 ? this.scoreLexicalCandidates(terms, queryText!) : undefined;
+
+    const hasLexicalHits = Boolean(lexicalScores && lexicalScores.size > 0);
+    const scored: RetrievedChunk[] = new Array(this.flat.length);
     for (let i = 0; i < this.flat.length; i++) {
       const c = this.flat[i];
-      scored.push({
+      const vecScore = dot(c.vector, q);
+      let finalScore = vecScore;
+      if (hasLexicalHits) {
+        const lex = lexicalScores!.get(i) ?? 0;
+        finalScore = Math.min(1, Math.max(0, vecScore) * 0.72 + lex * 0.28);
+      }
+      scored[i] = {
         path: c.path,
         startLine: c.startLine,
         endLine: c.endLine,
         text: c.text,
-        score: dot(c.vector, q),
-      });
+        score: finalScore,
+      };
     }
     scored.sort((a, b) => b.score - a.score);
     return scored.slice(0, k);
@@ -145,12 +173,17 @@ export class VectorStore {
     for (const [p, s] of this.fileSizes.entries()) {
       sizesObj[p] = s;
     }
+    const hashesObj: Record<string, string> = {};
+    for (const [p, h] of this.fileHashes.entries()) {
+      hashesObj[p] = h;
+    }
     return {
       version: 2,
       dim: this.dim,
       embeddingModel: this.embeddingModel,
       fileMtimes: mtimesObj,
       fileSizes: sizesObj,
+      fileHashes: hashesObj,
       chunks: this.flat,
     };
   }
@@ -233,6 +266,14 @@ export class VectorStore {
       }
     }
 
+    if (p.fileHashes && typeof p.fileHashes === "object") {
+      for (const [k, v] of Object.entries(p.fileHashes)) {
+        if (typeof v === "string" && v.length > 0) {
+          store.fileHashes.set(normalizePathKey(k), v);
+        }
+      }
+    }
+
     store.dirty = true;
     return store;
   }
@@ -240,8 +281,65 @@ export class VectorStore {
   private rebuild(): void {
     if (!this.dirty) return;
     this.flat = [];
-    for (const list of this.byPath.values()) this.flat.push(...list);
+    this.inverted.clear();
+    for (const list of this.byPath.values()) {
+      for (const chunk of list) {
+        const idx = this.flat.length;
+        this.flat.push(chunk);
+        const terms = tokenizeIndexTerms(`${chunk.path} ${chunk.text}`);
+        for (const term of terms) {
+          let posting = this.inverted.get(term);
+          if (!posting) {
+            posting = [];
+            this.inverted.set(term, posting);
+          }
+          posting.push(idx);
+        }
+      }
+    }
     this.dirty = false;
+  }
+
+  /** Score candidate chunk indices using IDF-weighted inverted-index lookup + exact symbol/path boosts. */
+  private scoreLexicalCandidates(terms: string[], rawQuery: string): Map<number, number> {
+    const scores = new Map<number, number>();
+    const totalDocs = Math.max(1, this.flat.length);
+    let maxTheoretical = 0;
+
+    for (const term of terms) {
+      const posting = this.inverted.get(term);
+      if (!posting || posting.length === 0) continue;
+      // Suppress overly common tokens that appear in > 60% of chunks
+      if (posting.length > totalDocs * 0.6 && totalDocs > 20) continue;
+      const idf = Math.log(1 + totalDocs / (1 + posting.length));
+      maxTheoretical += idf;
+      for (const idx of posting) {
+        scores.set(idx, (scores.get(idx) ?? 0) + idf);
+      }
+    }
+
+    if (scores.size === 0 || maxTheoretical <= 0) return scores;
+
+    // Normalize into [0, 1] and apply exact phrase / path match boost
+    const exactPhrases = rawQuery
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length >= 4);
+
+    for (const [idx, rawScore] of scores.entries()) {
+      const c = this.flat[idx];
+      let norm = Math.min(1, rawScore / maxTheoretical);
+      const pathLower = c.path.toLowerCase();
+      for (const phrase of exactPhrases) {
+        if (pathLower.includes(phrase)) {
+          norm = Math.min(1, norm + 0.18);
+        } else if (c.text.toLowerCase().includes(phrase)) {
+          norm = Math.min(1, norm + 0.1);
+        }
+      }
+      scores.set(idx, norm);
+    }
+    return scores;
   }
 
   /**
@@ -267,9 +365,41 @@ export class VectorStore {
       this.byPath.delete(path);
       this.fileMtimes.delete(path);
       this.fileSizes.delete(path);
+      this.fileHashes.delete(path);
     }
     this.dirty = true;
   }
+}
+
+const INDEX_STOP_WORDS = new Set([
+  "the", "and", "for", "with", "this", "that", "from", "into", "return", "const", "let", "var",
+  "function", "import", "export", "async", "await", "true", "false", "null", "undefined", "void",
+]);
+
+/** Tokenize paths and code into unique lowercase identifier subterms for fast lexical matching. */
+export function tokenizeIndexTerms(text: string): string[] {
+  const out = new Set<string>();
+  const raw = text.slice(0, 8000).split(/[^a-zA-Z0-9_]+/);
+  for (const part of raw) {
+    if (part.length < 2) continue;
+    const lower = part.toLowerCase();
+    if (!INDEX_STOP_WORDS.has(lower)) {
+      out.add(lower);
+    }
+    // Split camelCase / PascalCase / snake_case subwords
+    const split = part
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .replace(/_+/g, " ")
+      .toLowerCase()
+      .split(/\s+/);
+    for (const sub of split) {
+      if (sub.length >= 2 && !INDEX_STOP_WORDS.has(sub)) {
+        out.add(sub);
+      }
+    }
+    if (out.size >= 160) break;
+  }
+  return Array.from(out);
 }
 
 export function normalizePathKey(p: string): string {

@@ -265,7 +265,12 @@ export class OllamaClient {
    * Uses /api/embed (batched). Bounded by a total timeout — embedding is a quick,
    * non-streaming call.
    */
-  async embed(model: string, input: string | string[], timeoutMs = 60_000): Promise<number[][]> {
+  async embed(
+    model: string,
+    input: string | string[],
+    timeoutMs = 60_000,
+    signal?: AbortSignal
+  ): Promise<number[][]> {
     const res = await this.fetch(
       "/api/embed",
       {
@@ -282,7 +287,8 @@ export class OllamaClient {
           ...(this.opts.keepAlive ? { keep_alive: normalizeKeepAlive(this.opts.keepAlive) } : {}),
         }),
       },
-      timeoutMs
+      timeoutMs,
+      signal
     );
     if (!res.ok) {
       const detail = (await res.text().catch(() => "")).slice(0, 500);
@@ -519,19 +525,27 @@ export class OllamaClient {
     return "loaded";
   }
 
-  /** Total-timeout fetch for the small, quick JSON endpoints. */
+  /** Total-timeout fetch for the small, quick JSON endpoints, supporting external AbortSignal. */
   private async fetch(
     path: string,
     init: RequestInit,
-    timeoutMs: number
+    timeoutMs: number,
+    externalSignal?: AbortSignal
   ): Promise<Response> {
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const signal = externalSignal
+      ? AbortSignal.any([timeoutSignal, externalSignal])
+      : timeoutSignal;
     try {
       return await fetch(`${this.baseUrl}${path}`, {
         ...init,
-        signal: AbortSignal.timeout(timeoutMs),
+        signal,
         headers: { "Content-Type": "application/json", ...(init.headers ?? {}) },
       });
     } catch (err) {
+      if (externalSignal?.aborted) {
+        throw new OllamaError("Ollama request aborted.", err);
+      }
       if (err instanceof Error && err.name === "TimeoutError") {
         throw new OllamaError(`Ollama request timed out after ${timeoutMs}ms`, err);
       }

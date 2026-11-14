@@ -10,6 +10,7 @@ import {
   analyzeCommandSecurity,
   isUnattendedCommandAllowed,
 } from "../../src/core/tools/security";
+import { cloudExecuteCommand } from "../../src/core/tools/cloud/cloudTools";
 import type { ToolContext } from "../../src/core/tools/types";
 
 describe("Phase 2.5: Terminal Execution & Shell Security", () => {
@@ -39,6 +40,13 @@ describe("Phase 2.5: Terminal Execution & Shell Security", () => {
       assert.strictEqual(findShellChaining("git commit -m 'feat: add user || fix bug'"), null);
       assert.strictEqual(findShellChaining('echo "redirect > output"'), null);
       assert.strictEqual(findShellChaining('echo "semicolon; here"'), null);
+      assert.strictEqual(findShellChaining('echo "escaped \\" && still quoted"'), null);
+    });
+
+    it("rejects Windows backslash-before-operator chaining bypasses outside quotes", () => {
+      assert.strictEqual(findShellChaining("dir C:\\&whoami"), "&");
+      assert.strictEqual(findShellChaining("dir C:\\&&whoami"), "&&");
+      assert.strictEqual(findShellChaining("echo foo\\;whoami"), ";");
     });
   });
 
@@ -81,6 +89,11 @@ describe("Phase 2.5: Terminal Execution & Shell Security", () => {
       assert.strictEqual(isUnattendedCommandAllowed("rm -rf node_modules"), false);
       assert.strictEqual(isUnattendedCommandAllowed("npm install malicious-pkg"), false);
       assert.strictEqual(isUnattendedCommandAllowed("git reset --hard"), false);
+      assert.strictEqual(isUnattendedCommandAllowed("git status && whoami"), false);
+      assert.strictEqual(
+        analyzeCommandSecurity("Remove-Item -Path C:\\temp -Recurse -Force").isDangerous,
+        true
+      );
     });
   });
 
@@ -156,6 +169,47 @@ describe("Phase 2.5: Terminal Execution & Shell Security", () => {
       const res = await execPromise;
       assert.strictEqual(res.ok, false);
       assert.ok(res.output.includes("Command cancelled"));
+    });
+
+    it("cloudExecuteCommand blocks shell chaining and reports timeouts cleanly", async () => {
+      const chained = await cloudExecuteCommand.execute(
+        { command: "node -v && node -e \"process.exit(0)\"" },
+        mockCtx
+      );
+      assert.strictEqual(chained.ok, false);
+      assert.ok(chained.output.includes("chaining"));
+
+      const sleepCmd =
+        process.platform === "win32" ? 'node -e "setTimeout(()=>{}, 5000)"' : "sleep 5";
+      const timedOut = await cloudExecuteCommand.execute(
+        { command: sleepCmd, timeout_ms: 80 },
+        mockCtx
+      );
+      assert.strictEqual(timedOut.ok, false);
+      assert.ok(/timed out/i.test(timedOut.output), `Expected timeout message, got: ${timedOut.output}`);
+    });
+
+    it("assigns execute risk to safe non-allowlisted commands and critical risk to dangerous commands", async () => {
+      const seenRisks: Array<{ cmd: string; risk?: string }> = [];
+      const inspectCtx: ToolContext = {
+        ...mockCtx,
+        requestApproval: async (call) => {
+          seenRisks.push({ cmd: String(call.args.command), risk: call.risk });
+          return false;
+        },
+      };
+
+      await runCommandTool.execute({ command: "pytest -q" }, inspectCtx);
+      await runCommandTool.execute({ command: "rm -rf ./dist" }, inspectCtx);
+      await cloudExecuteCommand.execute({ command: "pytest -q" }, inspectCtx);
+      await cloudExecuteCommand.execute({ command: "rm -rf ./dist" }, inspectCtx);
+
+      assert.deepStrictEqual(seenRisks, [
+        { cmd: "pytest -q", risk: "execute" },
+        { cmd: "rm -rf ./dist", risk: "critical" },
+        { cmd: "pytest -q", risk: "execute" },
+        { cmd: "rm -rf ./dist", risk: "critical" },
+      ]);
     });
   });
 });

@@ -23,7 +23,7 @@ import type { LLMProvider } from "../llm/types";
 import type { TodoItem } from "../tools/types";
 
 export interface UnifiedEngineDeps { provider:LLMProvider;tools:import("../tools/types").Tool[];workspaceName?:string;workspaceMap?:()=>Promise<string|undefined>;retrieveContext?:(query:string,signal:AbortSignal)=>Promise<string|undefined>;buildToolContext:(signal:AbortSignal)=>import("../tools/types").ToolContext;reserveOutputTokens?:number; }
-export interface UnifiedEmitter { onAssistantStart(id:string):void;onDelta(id:string,delta:string):void;onThinkingDelta?(id:string,delta:string):void;onThinkingEnd?(id:string,elapsedMs:number):void;onContent(id:string,content:string):void;onAssistantCancel(id:string):void;onPhase(phase:"thinking"|"working",detail?:string):void;onToolCall(id:string,call:ToolCall):void;onToolUpdate(id:string,call:ToolCall):void;onUsage(usage:import("../../shared/types").TokenUsage):void;onGenerationStats(stats:import("../../shared/types").GenerationStats|null):void;onDone(id:string,notice?:string):void;onError(message:string):void; }
+export interface UnifiedEmitter { onAssistantStart(id:string):void;onDelta(id:string,delta:string):void;onThinkingDelta?(id:string,delta:string):void;onThinkingEnd?(id:string,elapsedMs:number):void;onContent(id:string,content:string):void;onAssistantCancel(id:string):void;onPhase(phase:"thinking"|"working",detail?:string):void;onToolCall(id:string,call:ToolCall):void;onToolUpdate(id:string,call:ToolCall):void;onQueuedTools?(calls:ToolCall[]):void;onUsage(usage:import("../../shared/types").TokenUsage):void;onGenerationStats(stats:import("../../shared/types").GenerationStats|null):void;onDone(id:string,notice?:string):void;onError(message:string):void; }
 const MAX_OUTPUT_CHARS = 200_000;
 const MAX_TOOL_OUTPUT_CHARS = 100_000;
 const MAX_WORKSPACE_MAP_CHARS = 10_000;
@@ -114,8 +114,14 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
     return;
   }
 
-  if(plan.mode!=="chat"&&(deps.workspaceMap||deps.retrieveContext)){
-    emitter.onPhase("thinking","Retrieving project context");
+  const isCasualGreeting = /^(?:hi|hello|hey|yo|sup|thanks|thank you|thx|ok|okay|good (?:morning|afternoon|evening)|bye)[!.\s?]*$/i.test(
+    lastUserText.trim()
+  );
+  const shouldRetrieveRag =
+    !!deps.retrieveContext && (plan.mode !== "chat" || (!freshInfo && !isCasualGreeting));
+
+  if ((plan.mode !== "chat" && deps.workspaceMap) || shouldRetrieveRag) {
+    emitter.onPhase("thinking", "Retrieving project context");
   }
 
   let workspaceMap: string | undefined;
@@ -129,7 +135,7 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
   }
 
   let retrieved: string | undefined;
-  if (plan.mode !== "chat" && deps.retrieveContext) {
+  if (shouldRetrieveRag && deps.retrieveContext) {
     const rawCtx = await fetchWithTimeout(() => deps.retrieveContext!(lastUserText, signal), RETRIEVAL_TIMEOUT_MS, signal);
     if (rawCtx) {
       retrieved = rawCtx.length > MAX_RETRIEVED_CONTEXT_CHARS
@@ -276,6 +282,7 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
     // querying the model again.
     if(pendingCalls.length){
       const queuedRaw=pendingCalls.shift()!;
+      emitter.onQueuedTools?.([...pendingCalls]);
       const qId=currentAssistantId;
 
       // Chat mode can't run workspace tools — a queued extra the model
@@ -340,8 +347,11 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
 
       // Normalize: the queued copy must start clean in its own bubble.
       const queued:ToolCall={...queuedRaw,status:"proposed",statusDetail:undefined} as ToolCall;
+      const isQueuedVerify =
+        queued.name === "get_diagnostics" ||
+        ((queued.name === "run_command" || queued.name === "execute_command") && mutationEpoch > 0);
       startAssistant(qId);
-      emitter.onPhase("working",queued.name);
+      emitter.onPhase("working", isQueuedVerify ? `Verifying changes (${queued.name})` : queued.name);
       emitter.onToolCall(qId,queued);
       emitter.onToolUpdate(qId,{...queued,status:"running",statusDetail:undefined});
       currentRunningTool = queued;
@@ -813,6 +823,7 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
         if (plan.mode === "chat" && !modeToolNames.has(c.name)) continue;
         pendingCalls.push({ ...c, status: c.status, statusDetail: undefined } as ToolCall);
       }
+      emitter.onQueuedTools?.([...pendingCalls]);
     }
 
     if (wave.length > 1) {
@@ -1100,6 +1111,7 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
     commitTurnHandoff("step_limit");
   }
   } finally {
+    emitter.onQueuedTools?.([]);
     pipeline.unlockTurn();
   }
 }
@@ -1142,8 +1154,15 @@ function resolveCalls(raw:string,native:{id?:string;name:string;args:Record<stri
   if(plan.toolProtocol==="native"&&native.length){
     const calls:ToolCall[]=native.map(c=>{
       const name=canonicalToolName(c.name,specs)??c.name;
+      const sideEffecting=specs.find(s=>s.name===name)?.sideEffecting;
+      if (c.args.__malformedToolArgs) {
+        const parseErr = typeof c.args.__parseError === "string"
+          ? `${c.args.__parseError} Re-emit "${name}" with valid JSON object arguments.`
+          : `Malformed JSON arguments for tool "${name}". Re-emit the tool call with valid JSON object arguments.`;
+        return{id:c.id??randomUUID(),name,args:{},status:"error" as ToolCall["status"],error:parseErr,sideEffecting,thoughtSignature:c.thoughtSignature};
+      }
       const v=validateAgainstSpec(name,c.args,specs);
-      return{id:c.id??randomUUID(),name,args:v.args,status:(v.errors.length?"error":"proposed") as ToolCall["status"],error:v.errors.join(" "),sideEffecting:specs.find(s=>s.name===name)?.sideEffecting,thoughtSignature:c.thoughtSignature};
+      return{id:c.id??randomUUID(),name,args:v.args,status:(v.errors.length?"error":"proposed") as ToolCall["status"],error:v.errors.join(" "),sideEffecting,thoughtSignature:c.thoughtSignature};
     });
     return{calls,cleanedText:stripToolMarkup(raw)};
   }

@@ -52,6 +52,18 @@ export class ModelConfigStore {
     return merged;
   }
 
+  /** Effective map across all stored user overrides and file-level overrides (without mutating globalState). */
+  allEffective(fileConfigs?: Record<string, PerModelConfig>): Record<string, PerModelConfig> {
+    const stored = this.all();
+    if (!fileConfigs || Object.keys(fileConfigs).length === 0) return stored;
+    const out: Record<string, PerModelConfig> = { ...stored };
+    for (const model of Object.keys(fileConfigs)) {
+      const merged = this.effective(model, fileConfigs);
+      if (merged) out[model] = merged;
+    }
+    return out;
+  }
+
   async remove(model: string): Promise<void> {
     const all = this.all();
     delete all[model];
@@ -69,7 +81,8 @@ export class ModelConfigStore {
     const ctk = lc?.ctk;
     const ctv = lc?.ctv;
     const port = (() => { try { return new URL(baseUrl).port || "8080"; } catch { return "8080"; } })();
-    const modelFile = modelName.replace(/^llamacpp:/, "") || "<model.gguf>";
+    const rawModelFile = modelName.replace(/^llamacpp:/, "") || "<model.gguf>";
+    const modelFile = /\s/.test(rawModelFile) ? `"${rawModelFile}"` : rawModelFile;
     const parts = ["llama-server", "-m", modelFile];
     if (ctx && ctx > 0) parts.push("-c", String(ctx));
     if (ngl !== undefined) parts.push("-ngl", String(ngl));

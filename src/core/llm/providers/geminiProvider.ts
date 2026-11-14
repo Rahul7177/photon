@@ -50,39 +50,53 @@ export class GeminiProvider implements LLMProvider {
       audio: m.audio,
       video: m.video,
       thinking: m.thinking,
-      thinkingLevels: m.thinkingLevels,
+      thinkingLevels:
+        m.thinkingLevels && m.thinkingLevels.length > 0
+          ? m.thinkingLevels
+          : m.thinking
+            ? geminiThinkingLevels(m.name)
+            : [],
       capabilities: m.capabilities,
       tier: m.tier,
       provider: this.id,
     }));
   }
   async fetchLiveModels(): Promise<ModelInfo[]> {
-    const res = await fetchWithRetry(`${GEMINI_BASE}/models`, { headers: geminiHeaders(this.apiKey) }, { retries: 1, timeoutMs: 12000 });
-    if (!res.ok) {
-      const detail = await res.text().catch(() => "");
-      throw classifyHttpError(this.label, res.status, detail, res.headers, [this.apiKey]);
-    }
-    const json = (await res.json()) as {
-      models?: { name: string; displayName?: string; supportedGenerationMethods?: string[]; inputTokenLimit?: number; outputTokenLimit?: number }[];
-    };
     const out: ModelInfo[] = [];
-    for (const m of json.models ?? []) {
-      if (!m.supportedGenerationMethods?.includes("generateContent")) continue;
-      const rawId = m.name.replace(/^models\//, "");
-      const caps = geminiCaps(rawId);
-      out.push({
-        name: `gemini:${rawId}`,
-        provider: "gemini",
-        contextLength: m.inputTokenLimit,
-        toolTrained: true,
-        vision: caps.includes("vision"),
-        audio: caps.includes("audio"),
-        video: caps.includes("video"),
-        thinking: caps.includes("thinking"),
-        thinkingLevels: caps.includes("thinking") ? geminiThinkingLevels(rawId) : [],
-        capabilities: caps,
-        tier: "large",
-      });
+    let pageToken: string | undefined;
+    for (let page = 0; page < 5; page++) {
+      const url = new URL(`${GEMINI_BASE}/models`);
+      url.searchParams.set("pageSize", "100");
+      if (pageToken) url.searchParams.set("pageToken", pageToken);
+      const res = await fetchWithRetry(url.toString(), { headers: geminiHeaders(this.apiKey) }, { retries: 1, timeoutMs: 12000 });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => "");
+        throw classifyHttpError(this.label, res.status, detail, res.headers, [this.apiKey]);
+      }
+      const json = (await res.json()) as {
+        models?: { name: string; displayName?: string; supportedGenerationMethods?: string[]; inputTokenLimit?: number; outputTokenLimit?: number }[];
+        nextPageToken?: string;
+      };
+      for (const m of json.models ?? []) {
+        if (!m.supportedGenerationMethods?.includes("generateContent")) continue;
+        const rawId = m.name.replace(/^models\//, "");
+        const caps = geminiCaps(rawId);
+        out.push({
+          name: `gemini:${rawId}`,
+          provider: "gemini",
+          contextLength: m.inputTokenLimit,
+          toolTrained: true,
+          vision: caps.includes("vision"),
+          audio: caps.includes("audio"),
+          video: caps.includes("video"),
+          thinking: caps.includes("thinking"),
+          thinkingLevels: caps.includes("thinking") ? geminiThinkingLevels(rawId) : [],
+          capabilities: caps,
+          tier: /flash-lite|nano/i.test(rawId) ? "small" : /flash/i.test(rawId) ? "medium" : "large",
+        });
+      }
+      if (!json.nextPageToken) break;
+      pageToken = json.nextPageToken;
     }
     return out;
   }
@@ -113,6 +127,7 @@ export class GeminiProvider implements LLMProvider {
     let cachedTokens = 0;
     for await (const payload of streamSse(res.body, signal, 90_000)) {
       const json = tryJson<{
+        error?: { code?: number; message?: string };
         promptFeedback?: { blockReason?: string };
         usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; cachedContentTokenCount?: number };
         candidates?: {
@@ -128,6 +143,9 @@ export class GeminiProvider implements LLMProvider {
         }[];
       }>(payload);
       if (!json) continue;
+      if (json.error) {
+        throw classifyHttpError(this.label, json.error.code ?? 400, json.error.message ?? JSON.stringify(json.error), undefined, [this.apiKey]);
+      }
       if (json.promptFeedback?.blockReason) {
         throw classifyHttpError(this.label, 400, `Gemini blocked the request: ${json.promptFeedback.blockReason}`, undefined, [this.apiKey]);
       }

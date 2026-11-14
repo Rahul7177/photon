@@ -3,6 +3,7 @@ import { describe, it, beforeEach } from "node:test";
 import {
   SessionStore,
   SESSION_STORE_SCHEMA_VERSION,
+  MAX_PINNED_SESSIONS,
   capForStorage,
   redactSecrets,
   sanitizeArgs,
@@ -292,6 +293,158 @@ describe("SessionStore & SessionCoordinator Robustness Suite", () => {
       assert.ok(oldAtt?.text?.includes("pruned from storage"));
 
       assert.strictEqual(newAtt?.dataBase64, "base64_data_2", "Newest image retained within limit");
+    });
+
+    it("preserves agent/plan modes, thinking traces, denied tool statuses, and usage across save & reload", async () => {
+      const agentSession: SessionState = {
+        id: "sess-agent-mode",
+        title: "Agent Bugfix",
+        mode: "agent",
+        model: "anthropic:claude-sonnet-4",
+        createdAt: 1000,
+        updatedAt: 2000,
+        usage: { used: 1200, window: 200000, breakdown: [{ label: "History", tokens: 1200 }] },
+        messages: [
+          { id: "u1", role: "user", content: "Fix auth", createdAt: 1001 },
+          {
+            id: "a1",
+            role: "assistant",
+            content: "Done.",
+            thinking: "Checked auth.ts carefully.",
+            thinkingElapsedMs: 420,
+            createdAt: 1002,
+            toolCalls: [
+              { id: "c1", name: "run_command", args: { command: "rm -rf /tmp/x" }, status: "denied" },
+            ],
+          },
+          { id: "h1", role: "user", content: "Hidden follow-up", hidden: true, createdAt: 1003 },
+        ],
+      };
+      await store.upsert(agentSession);
+
+      const legacyCode = validateAndSanitizeRestoredSession({
+        id: "legacy-code",
+        mode: "code",
+        model: "llama3",
+        messages: [],
+      });
+      assert.strictEqual(legacyCode?.mode, "agent");
+
+      const loaded = store.get("sess-agent-mode");
+      assert.strictEqual(loaded?.mode, "agent");
+      assert.strictEqual(loaded?.usage?.used, 1200);
+      assert.strictEqual(loaded?.messages[1].thinking, "Checked auth.ts carefully.");
+      assert.strictEqual(loaded?.messages[1].thinkingElapsedMs, 420);
+      assert.strictEqual(loaded?.messages[1].toolCalls?.[0].status, "denied");
+      assert.strictEqual(loaded?.messages[2].hidden, true);
+    });
+
+    it("enforces max 3 pinned sessions, renames sessions cleanly, and protects pinned chats from eviction", async () => {
+      for (let i = 1; i <= 5; i++) {
+        await store.upsert({
+          id: `s-${i}`,
+          title: `Chat ${i}`,
+          mode: i % 2 === 0 ? "plan" : "agent",
+          model: "qwen2.5-coder:7b",
+          createdAt: 1000 + i,
+          updatedAt: 1000 + i,
+          messages: [{ id: `m-${i}`, role: "user", content: `Prompt ${i}`, createdAt: 1000 + i }],
+        });
+      }
+
+      assert.strictEqual((await store.togglePin("s-1")).ok, true);
+      assert.strictEqual((await store.togglePin("s-2")).ok, true);
+      assert.strictEqual((await store.togglePin("s-3")).ok, true);
+      const fourth = await store.togglePin("s-4");
+      assert.strictEqual(fourth.ok, false);
+      assert.ok(fourth.error?.includes(String(MAX_PINNED_SESSIONS)));
+
+      assert.strictEqual(await store.rename("s-1", "   Pinned Auth Refactor   "), true);
+      assert.strictEqual(store.get("s-1")?.title, "Pinned Auth Refactor");
+      assert.strictEqual(await store.rename("s-1", "   "), false);
+
+      // Fill past 40 unpinned sessions to verify pinned chats are never evicted by newer unpinned chats
+      for (let i = 6; i <= 50; i++) {
+        await store.upsert({
+          id: `s-${i}`,
+          title: `New Chat ${i}`,
+          mode: "chat",
+          model: "qwen2.5-coder:7b",
+          createdAt: 2000 + i,
+          updatedAt: 2000 + i,
+          messages: [{ id: `m-${i}`, role: "user", content: `Hi ${i}`, createdAt: 2000 + i }],
+        });
+      }
+
+      const all = store.loadAll();
+      assert.strictEqual(all.length, 40);
+      assert.ok(all.some((s) => s.id === "s-1" && s.pinned), "Pinned s-1 must survive MAX_SESSIONS eviction");
+      assert.ok(all.some((s) => s.id === "s-2" && s.pinned), "Pinned s-2 must survive MAX_SESSIONS eviction");
+      assert.ok(all.some((s) => s.id === "s-3" && s.pinned), "Pinned s-3 must survive MAX_SESSIONS eviction");
+      assert.strictEqual(all[0].pinned, true, "Pinned sessions sort first");
+
+      const summaries = store.summaries();
+      const s1Summary = summaries.find((s) => s.id === "s-1");
+      assert.ok(s1Summary?.searchText?.includes("Prompt 1"));
+    });
+
+    it("preserves thoughtSignature and tool name on restore while capping and redacting attachments", async () => {
+      const longSecretText = "Secret sk-1234567890abcdef1234567890 " + "x".repeat(6000);
+      const hugeBase64 = "A".repeat(400_000);
+      await store.upsert({
+        id: "gemini-sig",
+        title: "Gemini Restore",
+        mode: "agent",
+        model: "gemini:gemini-2.5-pro",
+        createdAt: 1000,
+        updatedAt: 2000,
+        messages: [
+          {
+            id: "u1",
+            role: "user",
+            content: "Check attachment",
+            createdAt: 1001,
+            attachments: [
+              { id: "a1", kind: "text", name: "notes.txt", mime: "text/plain", size: 6100, text: longSecretText },
+              { id: "a2", kind: "image", name: "huge.png", mime: "image/png", size: 400000, dataBase64: hugeBase64 },
+            ],
+          },
+          {
+            id: "a1",
+            role: "assistant",
+            content: "",
+            createdAt: 1002,
+            toolCalls: [
+              {
+                id: "call_1",
+                name: "read_file",
+                args: { path: "README.md" },
+                status: "done",
+                thoughtSignature: "sig_abc123",
+              },
+            ],
+          },
+          {
+            id: "t1",
+            role: "tool",
+            name: "read_file",
+            toolCallId: "call_1",
+            content: "ok",
+            createdAt: 1003,
+          },
+        ],
+      });
+
+      const restored = store.get("gemini-sig");
+      assert.ok(restored);
+      assert.strictEqual(restored!.messages[1].toolCalls?.[0].thoughtSignature, "sig_abc123");
+      assert.strictEqual(restored!.messages[2].name, "read_file");
+
+      const attText = restored!.messages[0].attachments?.[0].text ?? "";
+      assert.ok(!attText.includes("sk-1234567890"), "Secrets in attachment text must be redacted");
+      assert.ok(attText.length < 4200, "Attachment text must be bounded in storage");
+      assert.strictEqual(restored!.messages[0].attachments?.[1].dataBase64, undefined);
+      assert.strictEqual(restored!.messages[0].attachments?.[1].isPruned, true);
     });
   });
 });

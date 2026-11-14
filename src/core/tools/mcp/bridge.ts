@@ -316,7 +316,7 @@ export function inferRisk(mcp: McpTool): ToolRisk {
   return "workspace_write";
 }
 
-function makeBridgedTool(
+export function makeBridgedTool(
   serverId: string,
   client: IMcpClient,
   mcp: McpTool,
@@ -368,6 +368,8 @@ function makeBridgedTool(
           args,
           status: "proposed",
           sideEffecting: true,
+          risk,
+          statusDetail: effect,
         });
 
         if (!approved) {

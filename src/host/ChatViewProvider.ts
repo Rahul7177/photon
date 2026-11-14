@@ -51,6 +51,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.messageSub?.dispose();
     this.messageSub = undefined;
     this.view = undefined;
+    this.controller.dispose();
   }
 
   post(msg: ViewMessage): void {
@@ -70,9 +71,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const csp = [
       `default-src 'none'`,
       `img-src ${webview.cspSource} https: data:`,
-      `style-src ${webview.cspSource} 'unsafe-inline' https://fonts.googleapis.com`,
-      `font-src ${webview.cspSource} https://fonts.gstatic.com`,
-      `connect-src ${webview.cspSource} https://fonts.googleapis.com https://fonts.gstatic.com`,
+      `style-src ${webview.cspSource} 'unsafe-inline'`,
+      `font-src ${webview.cspSource}`,
+      `connect-src ${webview.cspSource}`,
       `script-src 'nonce-${nonce}'`,
     ].join("; ");
 
@@ -83,9 +84,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   <meta http-equiv="Content-Security-Policy" content="${csp}" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="stylesheet" href="${styleUri}" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Manrope:wght@600;700;800&family=Sora:wght@600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <title>Photon</title>
 </head>
 <body>

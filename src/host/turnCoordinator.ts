@@ -12,7 +12,11 @@ export interface TurnCoordinatorDeps {
 export class TurnCoordinator {
   private turnAbort?: AbortController;
   private turnRunning = false;
-  private promptQueue: Array<{ text: string; attachments?: Attachment[] }> = [];
+  private promptQueue: Array<{
+    text: string;
+    attachments?: Attachment[];
+    runPrompt: (text: string, attachments?: Attachment[]) => Promise<void>;
+  }> = [];
   private drainingQueue = false;
 
   constructor(private readonly deps: TurnCoordinatorDeps) {}
@@ -39,8 +43,12 @@ export class TurnCoordinator {
     if (this.turnAbort && !this.turnAbort.signal.aborted) {
       this.turnAbort.abort();
     }
-    this.turnAbort = undefined;
-    this.turnRunning = false;
+    // Keep turnRunning under enqueueOrRun's try/finally ownership so a new turn
+    // submitted while the aborted turn is still unwinding gets queued sequentially
+    // instead of running concurrently and corrupting state/checkpoints.
+    if (!this.turnRunning) {
+      this.turnAbort = undefined;
+    }
   }
 
   clearQueue(): void {
@@ -56,7 +64,7 @@ export class TurnCoordinator {
     runPrompt: (text: string, attachments?: Attachment[]) => Promise<void>
   ): Promise<void> {
     if (this.isTurnActive()) {
-      this.promptQueue.push(prompt);
+      this.promptQueue.push({ ...prompt, runPrompt });
       this.deps.post({
         type: "status",
         payload: {
@@ -79,7 +87,7 @@ export class TurnCoordinator {
             const next = this.promptQueue.shift()!;
             this.turnRunning = true;
             try {
-              await runPrompt(next.text, next.attachments);
+              await next.runPrompt(next.text, next.attachments);
             } catch (err) {
               this.deps.output.appendLine(`[queue] Prompt failed: ${(err as Error).message}`);
             } finally {

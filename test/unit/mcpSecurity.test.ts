@@ -161,6 +161,16 @@ describe("MCP Security, Trust Boundaries & Tool Permissions", () => {
           return err.message.includes("169.254.169.254") || err.message.includes("DNS rebinding");
         }
       );
+
+      // web_fetch public HTTPS helper blocks DNS rebinding targets (169.254.169.254 / 127.0.0.1)
+      const { fetchPublicHttps } = await import("../../src/core/tools/builtin/web");
+      await assert.rejects(
+        () =>
+          fetchPublicHttps("https://rebind.example.com/latest/meta-data", {}, 3, async () => [
+            { address: "169.254.169.254", family: 4 },
+          ]),
+        /DNS rebinding protection|prohibited|non-public/i
+      );
     });
 
     it("parseSse handles comments, multi-line data, CRLF, and multiple events cleanly", async () => {
@@ -736,6 +746,45 @@ describe("MCP Security, Trust Boundaries & Tool Permissions", () => {
       service.resolveApproval("call_destructive", false);
       const approvedDestructive = await promiseDestructive;
       assert.strictEqual(approvedDestructive, false);
+
+      // 4. Bridged MCP destructive tool must forward risk so ApprovalService blocks autoApprove
+      const { makeBridgedTool } = await import("../../src/core/tools/mcp/bridge");
+      const registry = new ToolRegistry();
+      const mcpMgr = new McpManager(registry, () => {});
+      const mockClient: IMcpClient = {
+        connect: async () => {},
+        listTools: async () => [],
+        callTool: async () => "deleted",
+        close: async () => {},
+      };
+      const bridged = makeBridgedTool(
+        "db",
+        mockClient,
+        { name: "delete_records", description: "Delete records permanently", inputSchema: { type: "object", properties: {} } },
+        mcpMgr
+      );
+      let bridgedRisk: string | undefined;
+      const mcpPromise = bridged.execute({}, {
+        workspaceRoot: process.cwd(),
+        signal: new AbortController().signal,
+        log: () => {},
+        webSearchProvider: "duckduckgo",
+        findFiles: async () => [],
+        capability: "high",
+        getDiagnostics: async () => [],
+        todos: [],
+        requestApproval: (call) => {
+          bridgedRisk = call.risk;
+          return service.requestApproval(call, () => {});
+        },
+      });
+      await new Promise((r) => setImmediate(r));
+      const pendingId = [...(service as any).pendingApprovals.keys()][0];
+      assert.ok(pendingId, "Destructive MCP tool must prompt even when autoApprove=true");
+      assert.strictEqual(bridgedRisk, "destructive");
+      service.resolveApproval(pendingId, false);
+      const finalMcpRes = await mcpPromise;
+      assert.strictEqual(finalMcpRes.ok, false);
     });
   });
 });

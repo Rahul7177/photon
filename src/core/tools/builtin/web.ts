@@ -1,3 +1,6 @@
+import { fetch as undiciFetch } from "undici";
+import { createPinnedDispatcher } from "../mcp/mcpClient";
+import { validateRemoteEndpoint, type DnsLookupFn } from "../mcp/dnsValidator";
 import { clampToolResult, toolError, ok, type Tool } from "../types";
 
 export const webSearchTool: Tool = {
@@ -100,24 +103,40 @@ export const webFetchTool: Tool = {
   },
 };
 
-/** Fetch with manual redirect handling so each hop is re-checked against the SSRF guard. */
-async function fetchPublicHttps(url: string, init: RequestInit, maxRedirects = 3): Promise<Response> {
-  let current = url;
-  for (let i = 0; i <= maxRedirects; i++) {
-    if (!isPublicUrl(current)) throw new Error("Blocked redirect to non-public address.");
-    const res = await fetch(current, { ...init, redirect: "manual" });
-    if (res.status >= 300 && res.status < 400) {
-      const loc = res.headers.get("location");
-      if (!loc) throw new Error(`Request redirected (${res.status}) with no location.`);
-      const next = new URL(loc, current).toString();
-      if (!/^https:\/\//i.test(next)) throw new Error("Blocked redirect: HTTPS only.");
-      await res.body?.cancel().catch(() => {});
-      current = next;
-      continue;
+/** Fetch with DNS-pinned SSRF guard and manual redirect handling across every hop. */
+export async function fetchPublicHttps(
+  url: string,
+  init: RequestInit,
+  maxRedirects = 3,
+  customLookup?: DnsLookupFn
+): Promise<Response> {
+  const dispatcher = createPinnedDispatcher(false, customLookup);
+  try {
+    let current = url;
+    for (let i = 0; i <= maxRedirects; i++) {
+      if (!isPublicUrl(current)) throw new Error("Blocked redirect to non-public address.");
+      const endpoint = await validateRemoteEndpoint(current, false, customLookup);
+      if (!endpoint.ok) throw new Error(endpoint.reason || "Blocked redirect to non-public address.");
+      const res = (await undiciFetch(current, {
+        ...(init as any),
+        redirect: "manual",
+        dispatcher,
+      })) as unknown as Response;
+      if (res.status >= 300 && res.status < 400) {
+        const loc = res.headers.get("location");
+        if (!loc) throw new Error(`Request redirected (${res.status}) with no location.`);
+        const next = new URL(loc, current).toString();
+        if (!/^https:\/\//i.test(next)) throw new Error("Blocked redirect: HTTPS only.");
+        await res.body?.cancel().catch(() => {});
+        current = next;
+        continue;
+      }
+      return res;
     }
-    return res;
+    throw new Error("Too many redirects.");
+  } finally {
+    await dispatcher.close().catch(() => {});
   }
-  throw new Error("Too many redirects.");
 }
 
 function extractWeatherLocation(query:string):string|undefined{

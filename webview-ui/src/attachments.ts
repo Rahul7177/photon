@@ -16,9 +16,11 @@ export async function readFileToAttachment(file: File): Promise<AttachmentResult
   const isText = file.type.startsWith("text/") || TEXT_EXT.test(file.name) || file.type === "application/json";
 
   if (isImage) {
+    if (file.size === 0) return { error: `${file.name || "Image"} is empty (0 bytes).` };
     if (file.size > MAX_IMAGE_BYTES) return { error: `${file.name} is too large (max 6 MB).` };
     const dataUrl = await readAs(file, "dataURL");
     const base64 = dataUrl.split(",")[1] ?? "";
+    if (!base64) return { error: `${file.name || "Image"} could not be read.` };
     return {
       attachment: {
         id: crypto.randomUUID(),
@@ -59,6 +61,9 @@ export async function readClipboardBlobToAttachment(blob: Blob, fileName?: strin
   const isImage = IMAGE_TYPES.includes(mime);
   if (!isImage) {
     return { error: `Clipboard content (${mime}) is not a supported image type.` };
+  }
+  if (blob.size === 0) {
+    return { error: "Clipboard image is empty (0 bytes)." };
   }
   if (blob.size > MAX_IMAGE_BYTES) return { error: `Clipboard image is too large (max 6 MB, got ${(blob.size / 1024 / 1024).toFixed(1)} MB).` };
 

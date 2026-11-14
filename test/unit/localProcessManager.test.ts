@@ -7,6 +7,7 @@ import {
   buildLlamaCppArgs,
   explainLaunchFailure,
   installOptions,
+  splitCliArgs,
   type ProcessManagerDeps,
 } from "../../src/host/localProcessManager";
 import type { DetectorDeps } from "../../src/core/adaptive/runtimeDetector";
@@ -126,6 +127,32 @@ describe("launch plan construction", () => {
     assert.equal(a[1], "C:\\My Models\\a.gguf");
     assert.ok(a.includes("all") && a.includes("--mlock") && a.includes("--no-mmap"));
     assert.deepEqual(a.slice(a.indexOf("-fa"), a.indexOf("-fa") + 2), ["-fa", "on"]);
+  });
+
+  it("splitCliArgs preserves quoted arguments with spaces", () => {
+    assert.deepEqual(
+      splitCliArgs(`--lora "C:\\My Models\\adapter file.bin" --alias 'test model' --mlock`),
+      ["--lora", "C:\\My Models\\adapter file.bin", "--alias", "test model", "--mlock"]
+    );
+    const a = buildLlamaCppArgs({
+      modelPath: "C:\\a.gguf",
+      extraArgs: `--lora "C:\\My Models\\adapter file.bin"`,
+    });
+    assert.deepEqual(a.slice(-2), ["--lora", "C:\\My Models\\adapter file.bin"]);
+  });
+
+  it("Windows Ollama keeps Desktop app fallback alongside custom CLI binary", () => {
+    const prev = process.env.LOCALAPPDATA;
+    process.env.LOCALAPPDATA = "C:\\Users\\Test\\AppData\\Local";
+    try {
+      const plans = buildLaunchPlans("ollama", "win32", "C:\\Tools\\ollama.exe");
+      assert.equal(plans[0].command, "C:\\Tools\\ollama.exe");
+      assert.ok(plans.some((p) => p.command === "C:\\Tools\\ollama app.exe"));
+      assert.ok(plans.some((p) => p.command === "C:\\Users\\Test\\AppData\\Local\\Programs\\Ollama\\ollama app.exe"));
+    } finally {
+      if (prev === undefined) delete process.env.LOCALAPPDATA;
+      else process.env.LOCALAPPDATA = prev;
+    }
   });
 
   it("llama.cpp requires a model path", () => {

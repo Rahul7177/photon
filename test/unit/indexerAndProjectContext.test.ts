@@ -3,8 +3,9 @@ import { describe, it, beforeEach } from "node:test";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as fs from "node:fs/promises";
-import { chunkText } from "../../src/core/index/chunker";
-import { shouldIndexFile } from "../../src/core/index/indexer";
+import { chunkText, formatChunkForEmbedding } from "../../src/core/index/chunker";
+import { shouldIndexFile, WorkspaceIndex, mergeOverlappingChunks } from "../../src/core/index/indexer";
+import { VectorStore } from "../../src/core/index/vectorStore";
 import {
   ProjectContextManager,
   getProjectContextManager,
@@ -242,6 +243,109 @@ describe("Phase 5.3: Indexer, Chunker & Project Context Invariants", () => {
 
       assert.equal(mgrA.getSummary().notes[0].content, "Repo A note");
       assert.equal(mgrB.getSummary().notes[0].content, "Repo B note");
+    });
+
+    it("snaps chunks cleanly to code declaration boundaries and preserves file header in formatChunkForEmbedding", () => {
+      const lines = Array.from({ length: 70 }, (_, idx) => {
+        if (idx === 51) return "export async function handleCriticalAuthFlow(token: string) {";
+        if (idx === 55) return "}";
+        return `const filler${idx} = ${idx};`;
+      });
+      const chunks = chunkText("src/auth/flow.ts", lines.join("\n"));
+      assert.ok(chunks.length >= 2);
+      assert.equal(chunks[1].startLine, 52);
+      const formatted = formatChunkForEmbedding(chunks[1]);
+      assert.ok(formatted.startsWith("// File: src/auth/flow.ts (L52-"));
+      assert.ok(chunks[1].text.startsWith("export async function handleCriticalAuthFlow"));
+    });
+
+    it("batches multi-file embeddings, caches repeated queries, and merges overlapping hits cleanly", async () => {
+      const embedCalls: string[][] = [];
+      const embed = async (texts: string[]) => {
+        embedCalls.push(texts);
+        return texts.map((t) => (t.includes("refreshAuthSession") ? [1, 0, 0] : [0.2, 0.9, 0]));
+      };
+
+      const store = new VectorStore();
+      const idx = new WorkspaceIndex(store, embed);
+
+      await idx.indexFilesBatch([
+        { path: "src/a.ts", mtime: 100, content: "export function refreshAuthSession() { return true; }" },
+        { path: "src/b.ts", mtime: 100, content: "export function unrelatedHelper() { return 42; }" },
+      ]);
+
+      // Both files fit into a single shared embed call
+      assert.equal(embedCalls.length, 1);
+      assert.equal(embedCalls[0].length, 2);
+
+      // First retrieve invokes embed once; second identical retrieve uses queryCache (0 new calls)
+      const r1 = await idx.retrieve("refreshAuthSession", 3);
+      const r2 = await idx.retrieve("refreshAuthSession", 3);
+      assert.equal(embedCalls.length, 2);
+      assert.equal(r1[0].path, "src/a.ts");
+      assert.equal(r2[0].path, "src/a.ts");
+
+      // Verify overlap stitching + 2-region per-file cap
+      const merged = mergeOverlappingChunks(
+        [
+          { path: "src/x.ts", startLine: 1, endLine: 4, text: "L1\nL2\nL3\nL4", score: 0.9 },
+          { path: "src/x.ts", startLine: 3, endLine: 6, text: "L3\nL4\nL5\nL6", score: 0.85 },
+          { path: "src/x.ts", startLine: 30, endLine: 33, text: "L30\nL31", score: 0.7 },
+          { path: "src/x.ts", startLine: 60, endLine: 63, text: "L60\nL61", score: 0.6 },
+        ],
+        2
+      );
+      assert.equal(merged.length, 2);
+      assert.equal(merged[0].startLine, 1);
+      assert.equal(merged[0].endLine, 6);
+      assert.equal(merged[0].text, "L1\nL2\nL3\nL4\nL5\nL6");
+    });
+
+    it("rejects ignored paths in indexSingleFile and ignores braces inside strings/comments when finding symbol endLine", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "photon-ctx-hardening-"));
+      try {
+        await fs.mkdir(path.join(tmpDir, "dist"), { recursive: true });
+        await fs.mkdir(path.join(tmpDir, "src"), { recursive: true });
+        await fs.writeFile(path.join(tmpDir, "dist", "bundle.js"), "export function bundled() {}", "utf8");
+        await fs.writeFile(
+          path.join(tmpDir, "src", "parser.ts"),
+          [
+            "export function parseTemplate() {",
+            '  const fakeClose = "} } }";',
+            "  // }",
+            "  /* multi\n   } comment */",
+            "  return 123;",
+            "}",
+            "",
+            "export function afterParser() { return true; }",
+          ].join("\n"),
+          "utf8"
+        );
+
+        const mgr = new ProjectContextManager(tmpDir, path.join(tmpDir, ".photon", "context.json"));
+        await mgr.ensureInitialized();
+
+        const rejected = await mgr.indexSingleFile("dist/bundle.js");
+        assert.equal(rejected, undefined);
+
+        const valid = await mgr.indexSingleFile("src/parser.ts");
+        assert.ok(valid);
+        const fn = valid.symbols.find((s) => s.name === "parseTemplate");
+        assert.ok(fn);
+        assert.equal(fn.line, 1);
+        assert.equal(fn.endLine, 7);
+
+        // Concurrent saveToDisk calls must serialize atomically and leave zero .tmp files
+        await Promise.all([mgr.saveToDisk(), mgr.saveToDisk(), mgr.saveToDisk()]);
+        const photonFiles = await fs.readdir(path.join(tmpDir, ".photon"));
+        assert.equal(
+          photonFiles.some((f) => f.endsWith(".tmp")),
+          false,
+          `Unexpected leftover .tmp files: ${photonFiles.join(", ")}`
+        );
+      } finally {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      }
     });
   });
 });

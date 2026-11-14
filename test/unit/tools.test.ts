@@ -737,5 +737,27 @@ describe("Built-in Workspace Tools", () => {
       assert.equal(res.ok, true);
       assert.ok(res.output.includes("calculate") || res.output.includes("Engine"));
     });
+
+    it("editFileTool append=true records checkpoint before change and preserves BOM", async () => {
+      const targetRel = "append_checkpoint.txt";
+      await fs.writeFile(path.join(tmpDir, targetRel), "\uFEFFheader\n", "utf8");
+      const recorded: string[] = [];
+      const cpCtx: ToolContext = {
+        ...ctx,
+        checkpointTracker: {
+          recordBeforeChange: async (rel) => {
+            recorded.push(rel);
+          },
+        } as any,
+      };
+      const res = await editFileTool.execute(
+        { path: targetRel, append: true, new_str: "appended-line" },
+        cpCtx
+      );
+      assert.equal(res.ok, true);
+      assert.deepEqual(recorded, [targetRel]);
+      const disk = await fs.readFile(path.join(tmpDir, targetRel), "utf8");
+      assert.equal(disk, "\uFEFFheader\nappended-line");
+    });
   });
 });

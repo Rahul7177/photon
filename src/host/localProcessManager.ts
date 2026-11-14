@@ -49,6 +49,48 @@ export interface LaunchPlan {
 // Pure command construction (2.1 / 2.2)
 // ---------------------------------------------------------------------------
 
+/** Split a CLI argument string while preserving single- or double-quoted tokens. */
+export function splitCliArgs(raw: string): string[] {
+  const out: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let tokenStarted = false;
+
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (quote) {
+      if (ch === "\\" && i + 1 < raw.length && raw[i + 1] === quote) {
+        current += quote;
+        i++;
+      } else if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      tokenStarted = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (tokenStarted || current.length > 0) {
+        out.push(current);
+        current = "";
+        tokenStarted = false;
+      }
+      continue;
+    }
+    current += ch;
+    tokenStarted = true;
+  }
+  if (tokenStarted || current.length > 0) {
+    out.push(current);
+  }
+  return out;
+}
+
 export function buildLlamaCppArgs(o: LlamaCppLaunchOptions): string[] {
   const args = ["-m", o.modelPath, "--host", "127.0.0.1", "--port", String(o.port ?? 8080)];
   if (o.ctx && o.ctx > 0) args.push("-c", String(o.ctx));
@@ -57,7 +99,7 @@ export function buildLlamaCppArgs(o: LlamaCppLaunchOptions): string[] {
   if (o.fa !== undefined) args.push("-fa", o.fa ? "on" : "off");
   if (o.ctk) args.push("-ctk", o.ctk);
   if (o.ctv) args.push("-ctv", o.ctv);
-  if (o.extraArgs) args.push(...o.extraArgs.split(/\s+/).filter(Boolean));
+  if (o.extraArgs) args.push(...splitCliArgs(o.extraArgs));
   return args;
 }
 
@@ -113,9 +155,13 @@ export function buildLaunchPlans(
 
     // Also look for ollama app.exe (the native Windows desktop app)
     const candidates = [
-      bin ? bin.replace(/ollama\.exe$/i, "ollama app.exe") : "",
-      process.env.LOCALAPPDATA ? `${process.env.LOCALAPPDATA}\\Programs\\Ollama\\ollama app.exe` : "",
-    ].filter(Boolean);
+      ...new Set(
+        [
+          bin ? bin.replace(/ollama\.exe$/i, "ollama app.exe") : "",
+          process.env.LOCALAPPDATA ? `${process.env.LOCALAPPDATA}\\Programs\\Ollama\\ollama app.exe` : "",
+        ].filter(Boolean)
+      ),
+    ];
     for (const appPath of candidates) {
       plans.push({
         kind: "spawn",
@@ -124,7 +170,6 @@ export function buildLaunchPlans(
         env,
         description: "ollama app.exe",
       });
-      break;
     }
     return plans;
   }

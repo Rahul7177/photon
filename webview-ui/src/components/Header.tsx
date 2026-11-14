@@ -110,6 +110,7 @@ export function Header({
             title="Session history"
             aria-label="Session history"
             aria-expanded={historyOpen}
+            onMouseDown={(e) => e.stopPropagation()}
             onClick={() => setHistoryOpen((o) => !o)}
           >
             <ClockIcon />

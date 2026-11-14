@@ -32,8 +32,17 @@ export function Approval({
 
   const isDestructive =
     (call as any).risk === "destructive" ||
+    (call.risk === "critical" && /high-risk/i.test(call.statusDetail || "")) ||
     /delete|remove|rmdir|unlink|drop|purge|reset/i.test(toolName) ||
     Boolean(command && /\b(rm\s+-[rf]|git\s+reset\s+--hard|drop\s+database|del\s+\/[fq]|format)\b/i.test(command));
+
+  const isShellCommandTool = toolName === "run_command" || toolName === "execute_command";
+  const disableAlwaysAllow = isDestructive || isShellCommandTool;
+  const alwaysAllowTitle = isDestructive
+    ? "Always allow is disabled for destructive actions to protect your workspace"
+    : isShellCommandTool
+      ? "Always allow is disabled for arbitrary shell commands to protect your workspace"
+      : `Always allow ${toolName} for this session`;
 
   let permissionDescription = "Execute tool operation";
   if (isFileWrite) permissionDescription = "Write / create file on disk in your workspace";
@@ -152,9 +161,9 @@ export function Approval({
         <button
           type="button"
           className="btn approval-btn-always"
-          aria-label={isDestructive ? "Always allow is disabled for destructive commands" : "Always allow tools in this session"}
-          disabled={isDestructive}
-          title={isDestructive ? "Always allow is disabled for destructive actions to protect your workspace" : "Always allow this tool for this session"}
+          aria-label={disableAlwaysAllow ? alwaysAllowTitle : `Always allow ${toolName} in this session`}
+          disabled={disableAlwaysAllow}
+          title={alwaysAllowTitle}
           onClick={() => decide(true, true)}
         >
           Always allow in session

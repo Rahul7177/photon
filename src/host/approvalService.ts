@@ -95,16 +95,10 @@ export class ApprovalService {
       this.approvedCallIds.add(callId);
     }
     if (remember && approved) {
-      // General shell execution ('run_command') cannot receive blanket session approval
-      // because arbitrary dangerous commands could be executed under the same tool name.
-      if (toolName && toolName !== "run_command") {
+      // General shell execution ('run_command' / 'execute_command') cannot receive
+      // session-wide approval because arbitrary commands share the same tool name.
+      if (toolName && toolName !== "run_command" && toolName !== "execute_command") {
         this.sessionApprovedToolNames.add(toolName);
-      }
-      if (!this.sessionAutoApprove) {
-        this.sessionAutoApprove = true;
-        if (!this.userConfiguredAutoApprove) {
-          autoApproveChanged = true;
-        }
       }
     }
     resolve(approved);

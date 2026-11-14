@@ -290,6 +290,16 @@
               "keyInBody": {
                 "type": "boolean",
                 "description": "Send the API key in the request body instead of an Authorization header."
+              },
+              "enabled": {
+                "type": "boolean",
+                "default": true,
+                "description": "Whether this custom provider is enabled."
+              },
+              "requireApiKey": {
+                "type": "boolean",
+                "default": true,
+                "description": "Whether an API key is required for this endpoint (set false for local LM Studio / vLLM servers)."
               }
             }
           }

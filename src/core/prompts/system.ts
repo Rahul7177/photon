@@ -54,7 +54,7 @@ export function buildSystemPrompt(input:SystemPromptInput):string{
     const capped=capLines(workspaceMap,MAP_LINES[level]);const t=estimateTokens(`Project files (partial):\n${capped}`);
     if(used+t<=budgetTokens){extras.push(`Project files (partial):\n${capped}`);used+=t;}
   }
-  if(retrievedContext&&mode!=="chat"){
+  if(retrievedContext){
     const trimmed=fitBlock(retrievedContext,budgetTokens-used-8);if(trimmed)extras.push("Relevant code from the workspace (retrieved for this request; read files to confirm before editing):\n"+trimmed);
   }
   return[...core,...extras].join("\n\n");

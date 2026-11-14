@@ -3,7 +3,16 @@ import { describe, it } from "node:test";
 import { initial, reducer } from "../../webview-ui/src/state/store";
 import { PROTOCOL_VERSION } from "../../src/shared/protocol";
 import { sanitizeErrorMessage, getErrorSuggestion } from "../../webview-ui/src/components/ErrorBanner";
-import type { ChatMessage, ToolCall } from "../../src/shared/types";
+import {
+  extractTerminalTasks,
+  getVisibleTerminalBannerTasks,
+} from "../../webview-ui/src/components/TerminalTaskBanner";
+import {
+  compactModelLabel,
+  filterAndGroupSessions,
+} from "../../webview-ui/src/components/SessionHistory";
+import { buildPerModelConfigEntries } from "../../webview-ui/src/components/ModelConfigs";
+import type { ChatMessage, SessionSummary, ToolCall } from "../../src/shared/types";
 
 describe("Phase 8: Webview State, Protocol, Usability & Accessibility", () => {
   describe("8.1 Protocol Integrity, Validation & Stale Event Protection", () => {
@@ -135,6 +144,156 @@ Authorization: Bearer mySecretBearerToken12345
         payload: { messageId: "m1", call: { id: "call-1", name: "edit_file", status: "done" } },
       });
       assert.equal(state.pendingApproval, null);
+    });
+  });
+
+  describe("8.4 Terminal Task Banner & Queue State", () => {
+    it("tracks queuedTools and toolStartTimes in reducer and clears them on idle", () => {
+      const queuedRun: ToolCall = {
+        id: "q-1",
+        name: "run_command",
+        args: { command: "npm run build" },
+        status: "proposed",
+      };
+      let state = reducer(initial, { type: "status", payload: { kind: "running" } });
+      state = reducer(state, { type: "queuedTools", payload: [queuedRun] });
+      assert.equal(state.queuedTools.length, 1);
+      assert.equal(state.queuedTools[0].id, "q-1");
+
+      state = reducer(state, {
+        type: "toolUpdate",
+        payload: {
+          messageId: "m-run",
+          call: { id: "q-1", name: "run_command", args: { command: "npm run build" }, status: "running" },
+        },
+      });
+      assert.equal(state.queuedTools.length, 0);
+      assert.ok(typeof state.toolStartTimes["q-1"] === "number");
+
+      state = reducer(state, { type: "status", payload: { kind: "idle" } });
+      assert.deepEqual(state.queuedTools, []);
+      assert.deepEqual(state.toolStartTimes, {});
+    });
+
+    it("extracts running and queued terminal/verification tasks without duplicating docked approvals", () => {
+      let state = reducer(initial, { type: "status", payload: { kind: "running" } });
+      const activeMsg: ChatMessage = {
+        id: "turn-1",
+        role: "assistant",
+        content: "",
+        streaming: true,
+        createdAt: Date.now(),
+        toolCalls: [
+          {
+            id: "t-done",
+            name: "execute_command",
+            args: { command: "npm run lint" },
+            status: "done",
+            result: "ok",
+          },
+          {
+            id: "t-run",
+            name: "run_command",
+            args: { command: "node build.js", cwd: "/repo" },
+            status: "running",
+          },
+          {
+            id: "t-wait",
+            name: "run_command",
+            args: { command: "rm -rf dist" },
+            status: "pending",
+          },
+        ],
+      };
+      state = reducer(state, { type: "messageAppended", payload: activeMsg });
+      state = reducer(state, {
+        type: "toolApprovalRequest",
+        payload: { messageId: "turn-1", call: activeMsg.toolCalls![2] },
+      });
+      state = reducer(state, {
+        type: "queuedTools",
+        payload: [
+          { id: "t-next", name: "get_diagnostics", args: { path: "src/app.ts" }, status: "proposed" },
+        ],
+      });
+
+      const all = extractTerminalTasks(state);
+      assert.equal(all.length, 4);
+      const visible = getVisibleTerminalBannerTasks(state);
+      assert.deepEqual(
+        visible.map((t) => [t.id, t.phase, t.kind]),
+        [
+          ["t-run", "running", "terminal"],
+          ["t-next", "queued", "verify"],
+        ]
+      );
+
+      // Returns empty once the agent turn becomes idle
+      const idleState = reducer(state, { type: "status", payload: { kind: "idle" } });
+      assert.deepEqual(getVisibleTerminalBannerTasks(idleState), []);
+    });
+  });
+
+  describe("8.5 Session History Filtering & Per-Model Config Entries", () => {
+    it("partitions pinned vs recent sessions and filters by search query or mode", () => {
+      const list: SessionSummary[] = [
+        {
+          id: "1",
+          title: "Fix login bug",
+          mode: "agent",
+          model: "anthropic:claude-sonnet-4",
+          updatedAt: 100,
+          messageCount: 4,
+          pinned: true,
+          pinnedAt: 500,
+          searchText: "Updated oauth middleware and JWT refresh logic",
+        },
+        { id: "2", title: "Architecture plan", mode: "plan", model: "qwen2.5-coder:7b", updatedAt: 300, messageCount: 2 },
+        { id: "3", title: "Hello", mode: "chat", model: "openai:gpt-4o", updatedAt: 200, messageCount: 6, pinned: true, pinnedAt: 600, searchText: "Explain postgres vacuum analyze" },
+      ];
+
+      const all = filterAndGroupSessions(list, "", "all");
+      assert.equal(all.pinnedCount, 2);
+      assert.deepEqual(all.pinned.map((s) => s.id), ["3", "1"]);
+      assert.deepEqual(all.recent.map((s) => s.id), ["2"]);
+
+      const byModel = filterAndGroupSessions(list, "sonnet", "all");
+      assert.deepEqual(byModel.pinned.map((s) => s.id), ["1"]);
+      assert.equal(byModel.recent.length, 0);
+
+      const byMultiTokenBody = filterAndGroupSessions(list, "postgres vacuum", "all");
+      assert.deepEqual(byMultiTokenBody.pinned.map((s) => s.id), ["3"]);
+      assert.equal(byMultiTokenBody.recent.length, 0);
+
+      const byCrossField = filterAndGroupSessions(list, "sonnet jwt", "all");
+      assert.deepEqual(byCrossField.pinned.map((s) => s.id), ["1"]);
+
+      const pinnedOnly = filterAndGroupSessions(list, "", "pinned");
+      assert.equal(pinnedOnly.pinned.length, 2);
+      assert.equal(pinnedOnly.recent.length, 0);
+
+      assert.equal(compactModelLabel("anthropic:claude-sonnet-4"), "claude-sonnet-4");
+    });
+
+    it("lists both local and cloud models plus orphan project config keys in ModelConfigs", () => {
+      const entries = buildPerModelConfigEntries(
+        [
+          { name: "anthropic:claude-sonnet-4", provider: "anthropic", contextLength: 200_000 },
+          { name: "qwen2.5-coder:7b", provider: "ollama", contextLength: 32_768 },
+        ],
+        {
+          "llamacpp:custom.gguf": { numCtx: 16384, sampling: { temp: 0.2 } },
+          "anthropic:claude-sonnet-4": { sampling: { temp: 0.1 } },
+        },
+        "anthropic:claude-sonnet-4",
+        ["anthropic:claude-sonnet-4"]
+      );
+
+      assert.equal(entries.length, 3);
+      assert.equal(entries[0].name, "anthropic:claude-sonnet-4");
+      assert.equal(entries[0].isSelected, true);
+      assert.equal(entries[0].fromProjectFile, true);
+      assert.ok(entries.some((e) => e.name === "llamacpp:custom.gguf" && e.isLlama));
     });
   });
 });

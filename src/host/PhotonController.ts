@@ -1,3 +1,4 @@
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -20,12 +21,13 @@ import {
   type ModelCapability,
   type ModelInfo,
   type OllamaRuntimeModel,
+  type PerModelConfig,
   type SessionState,
   type ThinkingLevel,
   type ThinkingSetting,
   type ToolCall,
 } from "../shared/types";
-import type { HostMessage, PhotonConfig, ToolSummary, ViewMessage } from "../shared/protocol";
+import type { HostMessage, PhotonConfig, ProjectConfigStatus, ToolSummary, ViewMessage } from "../shared/protocol";
 import { OllamaClient } from "../core/ollama/client";
 import { profileMachine, sampleHardwareMetrics } from "../core/adaptive/machineProfiler";
 import { CloudUsageTracker } from "../core/telemetry/cloudUsage";
@@ -54,7 +56,7 @@ import { BenchStore } from "./benchStore";
 import { ProjectStore, computeMcpConfigFingerprint, type McpTrustScope } from "./projectStore";
 import { IndexService } from "./indexService";
 import { ModelConfigStore } from "./modelConfigStore";
-import { getProjectContextManager, ProjectContextManager } from "../core/context/projectContext";
+import { getProjectContextManager, isTrackableProjectPath, ProjectContextManager } from "../core/context/projectContext";
 import { LocalProcessManager, installOptions, type StartableId } from "./localProcessManager";
 import {
   evaluateBackgroundBenchGuard,
@@ -63,11 +65,13 @@ import {
 } from "../core/adaptive/modelAdvisor";
 import { scanDiskOllamaModels } from "../core/adaptive/runtimeDetector";
 import { ModelInstaller } from "../core/ollama/modelInstaller";
-import { loadProjectConfig, type ProjectConfig } from "./projectConfig";
 import {
-  ProviderCatalogService,
-  deriveCustomProviderId,
-} from "./providerCatalogService";
+  DEFAULT_PROJECT_CONFIG_TEMPLATE,
+  loadProjectConfig,
+  summarizeProjectConfig,
+  type ProjectConfig,
+} from "./projectConfig";
+import { ProviderCatalogService } from "./providerCatalogService";
 import { ApprovalService, parseMcpConfigJson } from "./approvalService";
 import {
   MAX_SESSION_MESSAGES,
@@ -111,6 +115,7 @@ export class PhotonController {
   private lastDecision: AutoDecision | null = null;
   /** Checked-in project defaults from `.photon/config.*` (M5), if any. */
   private projectConfig: ProjectConfig | null = null;
+  private projectConfigStatus: ProjectConfigStatus = { loaded: false, fields: [], modelConfigKeys: [] };
   private mode: Mode = "chat";
   /** Which engine stack is active: local (Ollama + adaptive) or cloud
    *  (direct provider APIs, native tool calling, no adaptive limits). */
@@ -187,6 +192,8 @@ export class PhotonController {
   private samplingHardware = false;
   /** Tracks session and cumulative cloud token usage and cost. */
   private cloudUsageTracker: CloudUsageTracker;
+  /** Ensures deterministic teardown runs at most once. */
+  private disposed = false;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -198,9 +205,8 @@ export class PhotonController {
     this.client = new OllamaClient({
       baseUrl: cfg.get<string>("ollama.baseUrl", "http://localhost:11434"),
       timeoutMs: cfg.get<number>("ollama.requestTimeoutMs", 180000),
-      // Keep models resident between turns — Ollama's 5-minute default unloads
-      // them, so infrequent chats and bench runs paid a full cold load each time.
-      keepAlive: "30m",
+      connectTimeoutMs: cfg.get<number>("ollama.connectTimeoutMs", 300000),
+      keepAlive: cfg.get<string>("ollama.keepAlive", "-1"),
     });
     this.ollamaProvider = new OllamaProvider(this.client);
     // The engine keeps ONE ProviderManager instance; providers are swapped in
@@ -236,6 +242,8 @@ export class PhotonController {
       },
       getLlamaCppBaseUrl: () =>
         vscode.workspace.getConfiguration("photon").get<string>("llamacpp.baseUrl", "http://localhost:8080"),
+      getLlamaCppRequestTimeoutMs: () =>
+        vscode.workspace.getConfiguration("photon").get<number>("llamacpp.requestTimeoutMs", 300000),
       getCustomProviders: () =>
         vscode.workspace.getConfiguration("photon").get<OpenAICompatConfig[]>("providers.custom", []),
       setCustomProviders: async (providers) => {
@@ -333,6 +341,7 @@ export class PhotonController {
         );
         const onFileChange = (uri: vscode.Uri) => {
           const rel = vscode.workspace.asRelativePath(uri, false);
+          if (!isTrackableProjectPath(rel)) return;
           void this.ctxMgr?.indexSingleFile(rel);
         };
         ctxWatcher.onDidCreate(onFileChange);
@@ -352,15 +361,7 @@ export class PhotonController {
     // Deterministic teardown on extension deactivate — abort work, close every
     // MCP connection, dispose the index watcher. Prevents process/connection leaks.
     this.context.subscriptions.push({
-      dispose: () => {
-        this.turnCoord.abortTurn();
-        this.benchBatchAbort?.abort();
-        this.benchAbort?.abort();
-        this.index.dispose();
-        this.installer.cancel();
-        this.localProcs.dispose();
-        void this.mcp.dispose();
-      },
+      dispose: () => this.dispose(),
     });
 
     // Keep in sync if the user edits settings.json directly instead of using
@@ -395,12 +396,14 @@ export class PhotonController {
     );
   }
 
-  /** Re-read the Ollama URL/timeout from settings into the client. */
+  /** Re-read Ollama connection, timeout, and keepAlive settings into the client. */
   private syncClientConfig(): void {
     const cfg = vscode.workspace.getConfiguration("photon");
     this.client.update({
       baseUrl: cfg.get<string>("ollama.baseUrl", "http://localhost:11434"),
       timeoutMs: cfg.get<number>("ollama.requestTimeoutMs", 180000),
+      connectTimeoutMs: cfg.get<number>("ollama.connectTimeoutMs", 300000),
+      keepAlive: cfg.get<string>("ollama.keepAlive", "-1"),
     });
   }
 
@@ -447,6 +450,19 @@ export class PhotonController {
     }
   }
 
+  /** Idempotent resource teardown for extension deactivation or view disposal. */
+  public dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.turnCoord.abortTurn();
+    this.benchBatchAbort?.abort();
+    this.benchAbort?.abort();
+    this.index.dispose();
+    this.installer.cancel();
+    this.localProcs.dispose();
+    void this.mcp.dispose();
+  }
+
   /* --------------------------------- init --------------------------------- */
 
   async initialize(): Promise<void> {
@@ -462,10 +478,9 @@ export class PhotonController {
 
   /** One-time heavy setup: machine profile, connect, MCP, index. */
   private async initializeOnce(): Promise<void> {
-    // Always start with a fresh session in chat mode — never carry over old
-    // messages, mode, or decisions from a previous session. The user can switch
-    // to history or change modes via the UI.
-    this.mode = "chat";
+    // Always start with a fresh session respecting photon.defaultMode — never carry
+    // over old messages or decisions from a previous session.
+    this.mode = vscode.workspace.getConfiguration("photon").get<Mode>("defaultMode", "chat");
     this.lastDecision = null;
     this.session = this.freshSession();
     // Load checked-in project defaults (M5) before deriving effective settings.
@@ -521,6 +536,8 @@ export class PhotonController {
       this.safePost({ type: "error", payload: { message: result.error } });
     }
     this.projectConfig = result.config;
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    this.projectConfigStatus = summarizeProjectConfig(result, root);
     // Security boundary: Repository configuration (.photon/config) MUST NOT silently
     // disable user approval protections. Auto-approval is strictly a user-level setting.
     if (this.projectConfig?.autoApprove) {
@@ -529,21 +546,24 @@ export class PhotonController {
       );
     }
 
-    // Phase 1.4: Sync file-based per-model configs → ModelConfigStore (file wins).
-    // The file is the source of truth for team-shared overrides; the extension's
-    // globalState is the fallback for user-only overrides not in the file.
+    // Keep file-based per-model overrides scoped to this workspace rather than writing
+    // them into globalState (prevents cross-project config leaks while still applying
+    // file-wins precedence dynamically via effectiveModelConfig).
     if (result.modelConfigs && Object.keys(result.modelConfigs).length > 0) {
-      for (const [model, fileCfg] of Object.entries(result.modelConfigs)) {
-        const effective = this.modelConfigs.effective(model, result.modelConfigs);
-        if (effective) {
-          // Write the file-wins merged result to globalState so the rest of the
-          // codebase can read it via modelConfigs.get(model) without knowing
-          // about the file layer.
-          void this.modelConfigs.set(model, effective);
-        }
-      }
-      this.output.appendLine(`[config] Synced ${Object.keys(result.modelConfigs).length} per-model config(s) from project file`);
+      this.output.appendLine(
+        `[config] Loaded ${Object.keys(result.modelConfigs).length} workspace per-model config override(s) from project file`
+      );
     }
+  }
+
+  /** Effective per-model config merging global user overrides + checked-in project file (file wins). */
+  private effectiveModelConfig(model: string): PerModelConfig | undefined {
+    return this.modelConfigs.effective(model, this.projectConfig?.modelConfigs);
+  }
+
+  /** Effective map across all per-model configs for UI & runtime consistency. */
+  private allEffectiveModelConfigs(): Record<string, PerModelConfig> {
+    return this.modelConfigs.allEffective(this.projectConfig?.modelConfigs);
   }
 
   /** Watch the project config file so team edits apply without a reload. */
@@ -556,6 +576,7 @@ export class PhotonController {
     const reload = async () => {
       this.applyProjectConfig();
       await this.configureIndex();
+      this.pushModelConfigs();
       this.recomputePlan();
       this.pushPlan();
       this.pushConfig();
@@ -575,14 +596,17 @@ export class PhotonController {
     return this.projectConfig?.intelligence ?? "auto";
   }
 
-  /** Effective context override: a UI override wins; else the file default. */
+  /** Effective context override: a UI choice (including explicit 0 = Auto) wins; else the file default. */
   private effectiveNumCtx(): number | undefined {
-    return this.userNumCtx ?? this.projectConfig?.numCtx;
+    if (this.userNumCtx !== undefined) {
+      return this.userNumCtx > 0 ? this.userNumCtx : undefined;
+    }
+    return this.projectConfig?.numCtx;
   }
 
   /** Per-model context: per-model config wins over the global override. */
   private effectiveNumCtxFor(model: string): number | undefined {
-    const per = this.modelConfigs.get(model);
+    const per = this.effectiveModelConfig(model);
     const perCtx = per?.numCtx ?? per?.llamacpp?.ctx;
     if (perCtx && perCtx > 0) return perCtx;
     return this.effectiveNumCtx();
@@ -720,11 +744,12 @@ export class PhotonController {
       if (id === "llamacpp") {
         const selected = this.selectedModel ?? "";
         const path = modelPath ?? (selected.startsWith("llamacpp:") ? selected.replace(/^llamacpp:/, "") : "");
-        const lc = this.modelConfigs.effective(selected)?.llamacpp;
+        const effectiveCfg = this.effectiveModelConfig(selected);
+        const lc = effectiveCfg?.llamacpp;
         const cfg = vscode.workspace.getConfiguration("photon");
         let port: number | undefined;
         try { port = Number(new URL(cfg.get<string>("llamacpp.baseUrl", "http://localhost:8080")).port) || undefined; } catch { /* default */ }
-        llamacpp = { modelPath: path, ctx: lc?.ctx ?? this.modelConfigs.effective(selected)?.numCtx, ngl: lc?.ngl, np: lc?.np, fa: lc?.fa, ctk: lc?.ctk, ctv: lc?.ctv, extraArgs: lc?.extraArgs, port };
+        llamacpp = { modelPath: path, ctx: lc?.ctx ?? effectiveCfg?.numCtx, ngl: lc?.ngl, np: lc?.np, fa: lc?.fa, ctk: lc?.ctk, ctv: lc?.ctv, extraArgs: lc?.extraArgs, port };
       }
       const state = await this.localProcs.start(id, { llamacpp });
       if (state.phase === "running") {
@@ -1019,6 +1044,7 @@ export class PhotonController {
         // session (but is not a persisted project pin — that's `pinModel`).
         this.autoSelect = false;
         this.selectedModel = msg.payload.model;
+        this.session.model = msg.payload.model;
         this.recomputePlan();
         this.pushPlan();
         this.pushConfig();
@@ -1048,6 +1074,15 @@ export class PhotonController {
         await this.configureIndex();
         this.pushConfig();
         return;
+      case "setEmbeddingModel": {
+        const nextModel = msg.payload.model.trim() || DEFAULT_EMBEDDING_MODEL;
+        await vscode.workspace
+          .getConfiguration("photon")
+          .update("index.embeddingModel", nextModel, vscode.ConfigurationTarget.Global);
+        await this.configureIndex();
+        this.pushConfig();
+        return;
+      }
       case "reindex":
         await this.index.reindex();
         return;
@@ -1069,7 +1104,7 @@ export class PhotonController {
         }
         return;
       case "setContextWindow":
-        this.userNumCtx = msg.payload.numCtx || undefined;
+        this.userNumCtx = Number.isFinite(msg.payload.numCtx) ? Math.max(0, Math.floor(msg.payload.numCtx)) : 0;
         this.recomputePlan();
         this.pushPlan();
         this.pushConfig();
@@ -1104,13 +1139,7 @@ export class PhotonController {
         this.pushConfig();
         return;
       case "setProviderEnabled":
-        await vscode.workspace
-          .getConfiguration("photon")
-          .update(
-            `providers.${msg.payload.id}.enabled`,
-            msg.payload.enabled,
-            vscode.ConfigurationTarget.Global
-          );
+        await this.providerCatalog.setProviderEnabledState(msg.payload.id, msg.payload.enabled);
         await this.rebuildProviders();
         await this.refresh();
         this.pushConfig();
@@ -1119,25 +1148,14 @@ export class PhotonController {
         if (msg.payload.enabled) await this.pushLiveModels(msg.payload.id);
         return;
       case "setProviderApiKey":
-        if (msg.payload.apiKey) {
-          await this.context.secrets.store(
-            `photon.provider.${msg.payload.id}.apiKey`,
-            msg.payload.apiKey
-          );
-          // Auto-enable provider when an API key is connected
-          await vscode.workspace
-            .getConfiguration("photon")
-            .update(`providers.${msg.payload.id}.enabled`, true, vscode.ConfigurationTarget.Global);
-        } else {
-          await this.context.secrets.delete(`photon.provider.${msg.payload.id}.apiKey`);
-        }
+        await this.providerCatalog.setProviderApiKeyState(msg.payload.id, msg.payload.apiKey);
         await this.rebuildProviders();
         await this.refresh();
         this.pushConfig();
         // A saved key is a new connection: validate it and list the models
         // available to THIS account. Failures (bad key, no access) surface in
         // the provider card via the providerModels error field.
-        if (msg.payload.apiKey) await this.pushLiveModels(msg.payload.id);
+        if (msg.payload.apiKey.trim()) await this.pushLiveModels(msg.payload.id);
         else {
           this.providerCatalog.liveModelCache.delete(msg.payload.id);
           this.safePost({ type: "providerModels", payload: { id: msg.payload.id, models: [] } });
@@ -1198,6 +1216,25 @@ export class PhotonController {
       case "deleteSession":
         await this.deleteSession(msg.payload.id);
         return;
+      case "togglePinSession": {
+        const res = await this.sessionStore.togglePin(msg.payload.id);
+        if (!res.ok && res.error) {
+          void vscode.window.showInformationMessage(`Photon: ${res.error}`);
+        } else if (res.ok && msg.payload.id === this.session.id) {
+          this.session.pinned = res.pinned;
+          this.session.pinnedAt = res.pinned ? Date.now() : undefined;
+        }
+        this.pushSessionList();
+        return;
+      }
+      case "renameSession": {
+        const ok = await this.sessionStore.rename(msg.payload.id, msg.payload.title);
+        if (ok && msg.payload.id === this.session.id) {
+          this.session.title = msg.payload.title.replace(/\s+/g, " ").trim().slice(0, 120);
+        }
+        this.pushSessionList();
+        return;
+      }
       case "detectProviders":
         return this.detectProviders(true);
       case "completeOnboarding":
@@ -1299,19 +1336,8 @@ export class PhotonController {
         return;
       }
       case "addCustomProvider": {
-        const { label, baseUrl, apiKey } = msg.payload;
-        if (!label.trim() || !baseUrl.trim()) return;
-        const cfg = vscode.workspace.getConfiguration("photon");
-        const existing = cfg.get<OpenAICompatConfig[]>("providers.custom", []);
-        const id = deriveCustomProviderId(label, existing.map((c) => c.id));
-        await cfg.update(
-          "providers.custom",
-          [...existing, { id, label: label.trim(), baseUrl: baseUrl.trim(), enabled: true }],
-          vscode.ConfigurationTarget.Global
-        );
-        if (apiKey?.trim()) {
-          await this.context.secrets.store(`photon.provider.${id}.apiKey`, apiKey.trim());
-        }
+        const id = await this.providerCatalog.addCustomProvider(msg.payload);
+        if (!id) return;
         await this.rebuildProviders();
         await this.refresh();
         this.pushConfig();
@@ -1319,22 +1345,22 @@ export class PhotonController {
         await this.pushLiveModels(id);
         return;
       }
+      case "updateCustomProvider": {
+        const updated = await this.providerCatalog.updateCustomProvider(msg.payload);
+        if (!updated) return;
+        await this.rebuildProviders();
+        await this.refresh();
+        this.pushConfig();
+        await this.pushLiveModels(msg.payload.id);
+        return;
+      }
       case "removeCustomProvider": {
         const id = msg.payload.id;
-        const cfg = vscode.workspace.getConfiguration("photon");
-        const existing = cfg.get<OpenAICompatConfig[]>("providers.custom", []);
-        if (!existing.some((c) => c.id === id)) return;
-        await cfg.update(
-          "providers.custom",
-          existing.filter((c) => c.id !== id),
-          vscode.ConfigurationTarget.Global
-        );
-        await this.context.secrets.delete(`photon.provider.${id}.apiKey`);
-        // Also drop any models the user had added under this provider.
-        await this.providerCatalog.setAddedModels(
-          this.providerCatalog.addedModels().filter((m) => m.provider !== id)
-        );
-        this.providerCatalog.liveModelCache.delete(id);
+        const removed = await this.providerCatalog.removeCustomProvider(id);
+        if (!removed) return;
+        if (this.selectedModel.startsWith(`${id}:`)) {
+          this.selectedModel = "";
+        }
         await this.rebuildProviders();
         await this.refresh();
         this.pushConfig();
@@ -1342,6 +1368,12 @@ export class PhotonController {
       }
       case "openDiagnostics":
         return this.runDiagnostics();
+      case "openProjectConfig":
+        await this.openOrCreateProjectConfig(false);
+        return;
+      case "createProjectConfig":
+        await this.openOrCreateProjectConfig(true);
+        return;
       case "setPerModelConfig": {
         const { model, config } = msg.payload;
         if (!model) return;
@@ -1571,15 +1603,19 @@ export class PhotonController {
     }
     // Reflect the chosen model in the UI (auto-selection may differ from the picker).
     if (this.autoSelect && decision.chosenModel) this.selectedModel = decision.chosenModel;
+    this.session.model = plan.model;
+    this.applyPerModelSampling(plan);
     this.plan = plan;
-    // Cloud mode: swap the adaptive plan for the permissive cloud plan (but keep per-model ctx if set).
+    // Cloud mode: swap the adaptive plan for the permissive cloud plan (but keep per-model ctx/sampling if set).
     if (this.interfaceMode === "cloud") {
       const targetModelName = plan.model;
       const m = this.models.find((x) => x.name === targetModelName) ?? this.modelsForUi()[0];
       if (m) {
         const cPlan = this.cloudPlan(m, this.mode, text);
-        const pCtx = this.modelConfigs.get(m.name)?.numCtx ?? this.modelConfigs.get(m.name)?.llamacpp?.ctx;
+        const eff = this.effectiveModelConfig(m.name);
+        const pCtx = eff?.numCtx ?? eff?.llamacpp?.ctx;
         if (pCtx && pCtx > 0) { cPlan.numCtx = pCtx; cPlan.contextWindow = pCtx; }
+        this.applyPerModelSampling(cPlan);
         plan = cPlan;
         this.plan = cPlan;
       }
@@ -1665,12 +1701,17 @@ export class PhotonController {
       // before any content arrived would linger forever.
       let touched = finalizeTurnMessages(session);
       if (this.ctxMgr) {
-        const lastUserMsg = [...session.messages]
+        const turnStartIdx = session.messages.lastIndexOf(userMsg);
+        const turnMessages =
+          turnStartIdx >= 0 ? session.messages.slice(turnStartIdx) : session.messages;
+        const lastUserMsg = [...turnMessages]
           .reverse()
           .find((m) => m.role === "user" && !m.hidden && !m.content.trimStart().startsWith("<tool_result"));
-        const lastAsstMsg = [...session.messages].reverse().find((m) => m.role === "assistant" && m.content.trim());
+        const lastAsstMsg = [...turnMessages]
+          .reverse()
+          .find((m) => m.role === "assistant" && m.content.trim());
         const toolsUsed: { name: string; args: Record<string, unknown>; ok: boolean }[] = [];
-        for (const m of session.messages) {
+        for (const m of turnMessages) {
           if (m.role === "assistant" && m.toolCalls) {
             for (const tc of m.toolCalls) {
               toolsUsed.push({
@@ -1720,7 +1761,7 @@ export class PhotonController {
   private getActiveContextLimit(modelName?: string): number {
     const mName = modelName || this.plan?.model || this.selectedModel;
     if (mName) {
-      const cfg = this.modelConfigs.get(mName);
+      const cfg = this.effectiveModelConfig(mName);
       const cfgCtx = cfg?.numCtx ?? cfg?.llamacpp?.ctx;
       if (cfgCtx && cfgCtx > 0) return cfgCtx;
     }
@@ -1926,6 +1967,10 @@ export class PhotonController {
         if (!isLive()) return;
         this.safePost({ type: "toolUpdate", payload: { messageId: id, call } });
       },
+      onQueuedTools: (calls) => {
+        if (!isLive()) return;
+        this.safePost({ type: "queuedTools", payload: calls });
+      },
       onUsage: (usage) => {
         if (!isLive()) return;
         this.safePost({ type: "tokenUsage", payload: usage });
@@ -2047,16 +2092,41 @@ export class PhotonController {
       activeModel: plan.model,
       maxTokens: 2000,
     });
+    let retrievedContext: string | undefined;
+    if (toolPolicy === "all") {
+      const ragCtrl = new AbortController();
+      const onParentAbort = () => ragCtrl.abort();
+      signal.addEventListener("abort", onParentAbort, { once: true });
+      const timer = setTimeout(() => ragCtrl.abort(), 2500);
+      try {
+        retrievedContext = await this.index.retrieveContext(String(lastUser), ragCtrl.signal);
+      } catch {
+        retrievedContext = undefined;
+      } finally {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onParentAbort);
+      }
+    }
     const system = buildCloudSystemPrompt({
       mode: plan.mode,
       workspaceName: vscode.workspace.workspaceFolders?.[0]?.name,
       workspaceMap,
       toolPolicy,
       projectContextDigest,
+      retrievedContext,
     });
     const MODE_CAPS: Record<Mode, number> = { chat: 100, plan: 150, agent: 200 };
     const prevPolicy = getCloudToolPolicy();
     setCloudToolPolicy(toolPolicy);
+    const effCfg = this.effectiveModelConfig(plan.model);
+    const sp = effCfg?.sampling;
+    const cloudOptions = sp && (sp.temp !== undefined || sp.topP !== undefined || sp.seed !== undefined)
+      ? {
+          ...(sp.temp !== undefined ? { temperature: Math.max(0, Math.min(2, sp.temp)) } : {}),
+          ...(sp.topP !== undefined && sp.topP > 0 && sp.topP <= 1 ? { top_p: sp.topP } : {}),
+          ...(sp.seed !== undefined && sp.seed >= 0 ? { seed: Math.floor(sp.seed) } : {}),
+        }
+      : undefined;
     try {
       await runCloudTurn({
         provider: this.providers,
@@ -2064,7 +2134,7 @@ export class PhotonController {
         system,
         history: cloudHistoryFromSession(session.messages),
         tools: cloudTools(plan.mode, mcpTools),
-        contextWindow: model.contextLength ?? 128_000,
+        contextWindow: this.getActiveContextLimit(plan.model),
         ctx: {
           ...this.buildToolContext(signal, { sessionId: session.id, messageId: lastUserMsg?.id || "" }, plan.executionPolicy),
           mode: plan.mode,
@@ -2073,6 +2143,7 @@ export class PhotonController {
         signal,
         mode: plan.mode,
         maxSteps: plan.executionPolicy?.stepBudget ?? (MODE_CAPS[plan.mode] ?? 200),
+        ...(cloudOptions && Object.keys(cloudOptions).length > 0 ? { options: cloudOptions } : {}),
         onStepUsage: (usage) => {
           this.cloudUsageTracker.recordStep(usage);
           void this.context.globalState.update(
@@ -2121,14 +2192,23 @@ export class PhotonController {
   /** Current editor problems mapped to compact, model-friendly records. */
   private async collectDiagnostics(absPath?: string): Promise<DiagnosticInfo[]> {
     const out: DiagnosticInfo[] = [];
+    const normPath = (p: string) => {
+      const resolved = path.resolve(p);
+      return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+    };
+    const targetNorm = absPath ? normPath(absPath) : undefined;
     try {
       const all = vscode.languages.getDiagnostics();
       for (const [uri, diags] of all) {
         if (uri.scheme !== "file") continue;
-        if (absPath && uri.fsPath !== absPath) continue;
+        if (targetNorm && normPath(uri.fsPath) !== targetNorm) continue;
+        const rel = vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/");
+        if (!targetNorm && /(?:^|\/)(?:node_modules|\.git|dist|out|build)(?:\/|$)/.test(rel)) {
+          continue;
+        }
         for (const d of diags) {
           out.push({
-            file: vscode.workspace.asRelativePath(uri, false),
+            file: rel,
             line: d.range.start.line + 1,
             col: d.range.start.character + 1,
             severity:
@@ -2140,9 +2220,11 @@ export class PhotonController {
             message: d.message.split("\n")[0],
             source: d.source,
           });
-          if (out.length >= 500) return out;
         }
       }
+      const rank = { error: 0, warning: 1, info: 2 } as const;
+      out.sort((a, b) => rank[a.severity] - rank[b.severity]);
+      if (out.length > 500) out.length = 500;
     } catch (e) {
       this.output.appendLine(`[tool] diagnostics failed: ${(e as Error).message}`);
     }
@@ -2185,17 +2267,33 @@ export class PhotonController {
 
   /* -------------------------------- helpers ------------------------------- */
 
+  private applyPerModelSampling(plan: AdaptivePlan): void {
+    const sp = this.effectiveModelConfig(plan.model)?.sampling;
+    if (!sp) return;
+    if (typeof sp.temp === "number" && Number.isFinite(sp.temp)) {
+      plan.temperature = Math.max(0, Math.min(2, sp.temp));
+    }
+    if (typeof sp.topP === "number" && Number.isFinite(sp.topP) && sp.topP > 0 && sp.topP <= 1) {
+      plan.topP = sp.topP;
+    }
+    if (typeof sp.seed === "number" && Number.isFinite(sp.seed) && sp.seed >= 0) {
+      plan.seed = Math.floor(sp.seed);
+    }
+  }
+
   private recomputePlan(): void {
     const model = this.models.find((m) => m.name === this.selectedModel);
     if (!model) {
       this.plan = null;
       return;
     }
+    const perCfg = this.effectiveModelConfig(model.name);
     const perCtx = this.effectiveNumCtxFor(model.name);
     // Cloud mode bypasses the adaptive orchestrator entirely.
     if (this.interfaceMode === "cloud") {
       const p = this.cloudPlan(model, this.mode);
       if (perCtx && perCtx > 0) { p.numCtx = perCtx; p.contextWindow = perCtx; }
+      this.applyPerModelSampling(p);
       this.plan = p;
       return;
     }
@@ -2208,6 +2306,7 @@ export class PhotonController {
       intelligence: this.effectiveIntelligence(),
       reserveOutputTokens: cfg.get<number>("context.reserveOutputTokens", 1024),
       adaptiveEnabled: this.adaptiveEnabled(),
+      sampling: perCfg?.sampling,
     });
   }
 
@@ -2235,7 +2334,34 @@ export class PhotonController {
       providers: this.providerStatuses(),
       interfaceMode: this.interfaceMode,
       thinkingLevel: this.thinkingLevel,
+      projectConfig: this.projectConfigStatus,
+      fileModelConfigKeys: Object.keys(this.projectConfig?.modelConfigs ?? {}),
     };
+  }
+
+  private async openOrCreateProjectConfig(createIfMissing: boolean): Promise<void> {
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!root) {
+      void vscode.window.showInformationMessage("Photon: Open a workspace folder to configure .photon/config.json.");
+      return;
+    }
+    const targetPath =
+      this.projectConfigStatus.path && createIfMissing === false
+        ? this.projectConfigStatus.path
+        : path.join(root, ".photon", "config.json");
+    if (createIfMissing) {
+      await fs.mkdir(path.dirname(targetPath), { recursive: true });
+      try {
+        await fs.access(targetPath);
+      } catch {
+        await fs.writeFile(targetPath, DEFAULT_PROJECT_CONFIG_TEMPLATE + "\n", "utf8");
+      }
+      this.applyProjectConfig();
+      this.pushModelConfigs();
+      this.pushConfig();
+    }
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(targetPath));
+    await vscode.window.showTextDocument(doc, { preview: false });
   }
 
   private pushConfig(): void {
@@ -2325,7 +2451,7 @@ export class PhotonController {
       benchResults: [...this.benchStore.byModel().values()],
       indexStatus: this.index.getStatus(),
       mcpServers: this.mcp.list(),
-      modelConfigs: this.modelConfigs.all(),
+      modelConfigs: this.allEffectiveModelConfigs(),
       projectContext: this.ctxMgr?.getSummary() ?? null,
       hardwareMetrics: this.latestHardwareMetrics,
       ollamaRuntime: this.latestOllamaRuntime,
@@ -2335,7 +2461,7 @@ export class PhotonController {
   }
 
   private pushModelConfigs(): void {
-    this.safePost({ type: "modelConfigs", payload: this.modelConfigs.all() });
+    this.safePost({ type: "modelConfigs", payload: this.allEffectiveModelConfigs() });
   }
 
   private freshSession(): SessionState {
@@ -2399,6 +2525,8 @@ export class PhotonController {
   private loadSession(target: SessionState): void {
     this.session = target;
     this.mode = target.mode;
+    this.lastDecision = null;
+    this.safePost({ type: "decision", payload: null });
     this.cloudUsageTracker.resetSession();
     this.pushCloudUsage();
     if (this.modelsForUi().some((m) => m.name === target.model)) {

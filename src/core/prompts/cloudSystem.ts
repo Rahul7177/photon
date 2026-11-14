@@ -5,6 +5,7 @@ export interface CloudSystemInput {
   workspaceName?: string;
   workspaceMap?: string;
   projectContextDigest?: string;
+  retrievedContext?: string;
   toolPolicy?: "all" | "web" | "none";
 }
 
@@ -82,6 +83,12 @@ export function buildCloudSystemPrompt(input: CloudSystemInput): string {
 
   if (input.projectContextDigest) {
     parts.push(input.projectContextDigest);
+  }
+
+  if (input.retrievedContext) {
+    parts.push(
+      `# Retrieved Code Snippets\nRelevant workspace excerpts (confirm by reading files before editing):\n${input.retrievedContext}`
+    );
   }
 
   if (input.workspaceMap) {

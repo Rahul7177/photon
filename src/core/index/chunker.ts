@@ -11,15 +11,17 @@ const MAX_CHUNK_CHARS = 4000;
 /** Hard cap on chunks per file to prevent memory exhaustion on giant generated files. */
 const MAX_CHUNKS_PER_FILE = 80;
 
+const CODE_BOUNDARY_RE =
+  /^(?:export\s+(?:default\s+)?|pub(?:\([^)]*\))?\s+)?(?:abstract\s+|async\s+)?(?:class|interface|type|enum|function|def|fn|func|struct|impl)\b/;
+
+/** Format a chunk with file path and line range metadata for higher-accuracy embedding vectors. */
+export function formatChunkForEmbedding(chunk: Chunk): string {
+  return `// File: ${chunk.path} (L${chunk.startLine}-${chunk.endLine})\n${chunk.text}`;
+}
+
 /**
  * Split a file's content into overlapping line-window chunks. Deterministic and
  * pure. Returns [] for empty/binary-ish content.
- *
- * Hardened to handle:
- * - Extremely long lines (minified / generated code) by wrapping them safely.
- * - Markdown header boundaries for semantic cohesion.
- * - File header / import context preservation for deeper chunks.
- * - Pathological files capped at MAX_CHUNKS_PER_FILE.
  */
 export function chunkText(path: string, content: string): Chunk[] {
   if (!content || content.includes("\0")) return [];
@@ -45,7 +47,7 @@ export function chunkText(path: string, content: string): Chunk[] {
 
   // Extract concise top-level import/package context (up to 3 non-empty import/package lines)
   const headerImports: string[] = [];
-  const isCode = /\.(ts|tsx|js|jsx|py|go|rs|java|cs|cpp|c|h|rb|php)$/i.test(path);
+  const isCode = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|cs|cpp|c|h|hpp|rb|php|swift|kt|scala)$/i.test(path);
   if (isCode) {
     for (let i = 0; i < Math.min(lines.length, 30); i++) {
       const trimmed = lines[i].trim();
@@ -66,13 +68,27 @@ export function chunkText(path: string, content: string): Chunk[] {
   const step = Math.max(1, CHUNK_LINES - OVERLAP_LINES);
 
   for (let start = 0; start < lines.length && chunks.length < MAX_CHUNKS_PER_FILE; start += step) {
-    // For Markdown, snap start to nearby header (# or ##) if within a 4-line window
+    // Snap start forward slightly (<= 5 lines < OVERLAP_LINES) to Markdown headers or code declarations
     let adjustedStart = start;
-    if (isMarkdown && start > 0) {
-      for (let look = 0; look < 4 && start + look < lines.length; look++) {
-        if (/^#{1,3}\s+\S+/.test(lines[start + look])) {
-          adjustedStart = start + look;
-          break;
+    if (start > 0) {
+      if (isMarkdown) {
+        for (let look = 0; look < 5 && start + look < lines.length; look++) {
+          if (/^#{1,3}\s+\S+/.test(lines[start + look])) {
+            adjustedStart = start + look;
+            break;
+          }
+        }
+      } else if (isCode) {
+        for (let look = 0; look <= 5 && start + look < lines.length; look++) {
+          const trimmed = lines[start + look].trimStart();
+          if (CODE_BOUNDARY_RE.test(trimmed)) {
+            adjustedStart = start + look;
+            break;
+          }
+          if (look > 0 && trimmed === "" && start + look + 1 < lines.length && lines[start + look + 1].trim()) {
+            adjustedStart = start + look + 1;
+            break;
+          }
         }
       }
     }

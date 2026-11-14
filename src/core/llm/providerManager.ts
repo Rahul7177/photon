@@ -1,4 +1,4 @@
-import type { ModelInfo, ThinkingLevel, ThinkingSetting } from "../../shared/types";
+import { isLocalModel, type ModelInfo, type ThinkingLevel, type ThinkingSetting } from "../../shared/types";
 import type { LLMChatChunk, LLMChatRequest, LLMProvider } from "./types";
 
 /**
@@ -52,6 +52,12 @@ export class ProviderManager implements LLMProvider {
     const known = this.providers.find((p) => p.id === prefix);
     if (known) return known;
 
+    // 3. If the model carries a recognized cloud/custom provider prefix that isn't currently registered
+    // (for instance a removed custom provider), never silently route it to local Ollama.
+    if (!isLocalModel({ name: model })) {
+      return undefined;
+    }
+
     // Unknown prefix is an Ollama name:tag (e.g. "gemma4:e4b", "llama3:8b", "my-org/model:latest") —
     // Ollama tags always carry a colon, so this IS the normal local path.
     // Fall back to ollama, never throw here.
@@ -102,6 +108,12 @@ export class ProviderManager implements LLMProvider {
   async *chatStream(req: LLMChatRequest, signal?: AbortSignal): AsyncGenerator<LLMChatChunk> {
     const provider = this.providerFor(req.model);
     if (!provider) throw new Error(`No provider configured for model "${req.model}".`);
+    if (provider.id !== "ollama" && !provider.enabled) {
+      throw new Error(`${provider.label} is currently disabled. Enable it in Settings → Providers.`);
+    }
+    if (!provider.isConfigured()) {
+      throw new Error(`${provider.label} is not configured. Add an API key or endpoint URL in Settings → Providers.`);
+    }
     const effectiveThinking = this.thinkingLevel;
     const stripped: LLMChatRequest = {
       ...req,
