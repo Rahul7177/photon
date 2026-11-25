@@ -37,7 +37,7 @@ export interface BenchResult{model:string;quantization?:string;hardwareClass:str
 export type BenchPhase="idle"|"running"|"done"|"error";
 export type IndexPhase="idle"|"indexing"|"validating"|"ready"|"unavailable"|"error";
 export interface IndexStatus{phase:IndexPhase;filesIndexed:number;chunks:number;pending:number;embeddingModel?:string;message?:string;}
-export type McpTransport="http"|"stdio";export type McpServerStatus="pending"|"approved"|"connected"|"error"|"revoked";export interface McpServerInfo{id:string;transport:McpTransport;target:string;status:McpServerStatus;toolCount:number;message?:string;args?:string[];permissions?:unknown;envKeys?:string[];headerKeys?:string[];fingerprint?:string;}
+export type CustomizationScope="user"|"workspace";export type McpTransport="http"|"stdio";export type McpServerStatus="pending"|"approved"|"connected"|"error"|"revoked";export interface McpServerInfo{id:string;transport:McpTransport;target:string;status:McpServerStatus;toolCount:number;message?:string;args?:string[];permissions?:unknown;envKeys?:string[];headerKeys?:string[];fingerprint?:string;scope?:CustomizationScope;sourcePath?:string;}
 
 export interface OllamaRuntimeModel{name:string;sizeBytes:number;vramBytes:number;gpuPercent:number;contextLength:number;expiresAt?:string;}
 export interface PullProgress{model:string;phase:"pulling"|"done"|"error";status:string;percent?:number;error?:string;
@@ -324,6 +324,51 @@ export function matchInstalledModelName(
   }
 
   return undefined;
+}
+
+export interface SkillInfo {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  content: string;
+  scope: CustomizationScope;
+  filePath: string;
+  relPath: string;
+  enabled: boolean;
+}
+
+export interface InstructionInfo {
+  id: string;
+  slug: string;
+  name: string;
+  description?: string;
+  applyTo?: string;
+  content: string;
+  scope: CustomizationScope;
+  filePath: string;
+  relPath: string;
+  enabled: boolean;
+}
+
+export interface CustomAgentInfo {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  instructions: string;
+  preferredMode?: Mode;
+  scope: CustomizationScope;
+  filePath: string;
+  relPath: string;
+  enabled: boolean;
+}
+
+export interface CustomizationsSnapshot {
+  skills: SkillInfo[];
+  instructions: InstructionInfo[];
+  agents: CustomAgentInfo[];
+  activeAgentId: string | null;
 }
 
 

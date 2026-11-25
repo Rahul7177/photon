@@ -7,6 +7,7 @@ export interface CloudSystemInput {
   projectContextDigest?: string;
   retrievedContext?: string;
   toolPolicy?: "all" | "web" | "none";
+  customizationsPrompt?: string;
 }
 
 /**
@@ -83,6 +84,10 @@ export function buildCloudSystemPrompt(input: CloudSystemInput): string {
 
   if (input.projectContextDigest) {
     parts.push(input.projectContextDigest);
+  }
+
+  if (input.customizationsPrompt) {
+    parts.push(input.customizationsPrompt);
   }
 
   if (input.retrievedContext) {

@@ -563,6 +563,11 @@ describe("Agent Activity Visibility & TurnProcess Summary (Item 13)", () => {
     const errSummary = computeSummary([errCall], 2000, false, true, null, false);
     assert.equal(errSummary.state, "error");
     assert.equal(errSummary.badge, "Failed");
+
+    const doneCall: ToolCall = { ...writeCall, id: "t3", status: "done" };
+    const recoveredSummary = computeSummary([errCall, doneCall], 2500, false, true, null, false);
+    assert.equal(recoveredSummary.state, "partial");
+    assert.equal(recoveredSummary.badge, "Recovered");
   });
 
   it("keeps live thinking indicator active during generation even after partial prose arrives", () => {

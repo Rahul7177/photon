@@ -21,15 +21,17 @@ export const ThinkingBlock = memo(function ThinkingBlock({ thinking, elapsedMs, 
 }) {
   const [open, setOpen] = useState(live);
   const collapsedOnce = useRef(false);
+  const prevLiveRef = useRef(live);
   const bodyRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    // Answer started arriving while we were open: collapse once.
-    if (!live && open && !collapsedOnce.current) {
+    // Answer started arriving while we were open: collapse once on the live->done transition.
+    if (prevLiveRef.current && !live && open && !collapsedOnce.current) {
       collapsedOnce.current = true;
       setOpen(false);
     }
-  }, [live, open ]);
+    prevLiveRef.current = live;
+  }, [live, open]);
 
   useEffect(() => {
     // Follow-scroll the live trace so the newest reasoning stays visible.
@@ -52,7 +54,10 @@ export const ThinkingBlock = memo(function ThinkingBlock({ thinking, elapsedMs, 
       <button
         type="button"
         className="thinking-head"
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => {
+          collapsedOnce.current = true;
+          setOpen((o) => !o);
+        }}
         title={open ? "Collapse reasoning" : "Expand reasoning"}
       >
         {live ? (

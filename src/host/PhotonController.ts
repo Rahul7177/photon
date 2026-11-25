@@ -82,8 +82,14 @@ import {
 } from "./sessionCoordinator";
 import { CheckpointCoordinator } from "./checkpointCoordinator";
 import { McpCoordinator } from "./mcpCoordinator";
+import {
+  CustomizationsStore,
+  buildCustomizationsPromptBlock,
+  resolveCustomSlashCommand,
+} from "./customizationsStore";
 import { ProviderService } from "./providerService";
 import { TurnCoordinator } from "./turnCoordinator";
+import { CUSTOMIZATIONS_ENABLED, EMPTY_CUSTOMIZATIONS_SNAPSHOT } from "../shared/features";
 
 const DEFAULT_EMBEDDING_MODEL = "nomic-embed-text";
 
@@ -136,6 +142,10 @@ export class PhotonController {
   private readonly checkpointCoord: CheckpointCoordinator;
   /** MCP coordinator manages server discovery, trust fingerprints, and lifecycle. */
   private readonly mcpCoord: McpCoordinator;
+  /** Customizations store manages User & Workspace Skills, Instructions, and Custom Agents. */
+  private readonly customizations: CustomizationsStore;
+  /** Explicitly invoked skill IDs for the current prompt turn. */
+  private invokedSkillIdsForTurn: string[] = [];
 
   private get models(): ModelInfo[] {
     return this.providerService.getModels();
@@ -283,6 +293,7 @@ export class PhotonController {
       workspaceMap: () =>
         buildWorkspaceMap(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath),
       retrieveContext: (query, signal) => this.index.retrieveContext(query, signal),
+      getCustomizationsPrompt: () => this.buildActiveCustomizationsPrompt(),
       reserveOutputTokens: cfg.get<number>("context.reserveOutputTokens", 1024),
       toolContext: (signal, turnContext) => this.buildToolContext(signal, turnContext),
     });
@@ -320,6 +331,17 @@ export class PhotonController {
       post: (msg) => this.safePost(msg),
       pushTools: () => this.pushTools(),
       output: this.output,
+    });
+    this.customizations = new CustomizationsStore({
+      getWorkspaceRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+      getDisabledIds: () => this.context.globalState.get<string[]>("photon.disabledCustomizations") ?? [],
+      setDisabledIds: async (ids) => {
+        await this.context.globalState.update("photon.disabledCustomizations", ids);
+      },
+      getActiveAgentId: () => this.context.workspaceState.get<string | null>("photon.activeCustomAgentId") ?? null,
+      setActiveAgentId: async (id) => {
+        await this.context.workspaceState.update("photon.activeCustomAgentId", id);
+      },
     });
 
     // Wire up Project Context Manager: maintains symbol index, smart paths, and cross-model memory
@@ -460,6 +482,7 @@ export class PhotonController {
     this.index.dispose();
     this.installer.cancel();
     this.localProcs.dispose();
+    this.ctxMgr?.dispose();
     void this.mcp.dispose();
   }
 
@@ -585,6 +608,34 @@ export class PhotonController {
     watcher.onDidChange(() => void reload());
     watcher.onDidDelete(() => void reload());
     this.context.subscriptions.push(watcher);
+
+    const customWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(
+        folder,
+        CUSTOMIZATIONS_ENABLED
+          ? "{.photon/**,.github/**,.vscode/mcp.json,AGENTS.md}"
+          : "{.vscode/mcp.json,.photon/mcp.json}"
+      )
+    );
+    const reloadCustom = () => {
+      if (CUSTOMIZATIONS_ENABLED) this.pushCustomizations();
+    };
+    const reloadMcp = () => {
+      void this.setupMcp();
+    };
+    customWatcher.onDidCreate((uri) => {
+      if (uri.fsPath.endsWith("mcp.json")) reloadMcp();
+      else reloadCustom();
+    });
+    customWatcher.onDidChange((uri) => {
+      if (uri.fsPath.endsWith("mcp.json")) reloadMcp();
+      else reloadCustom();
+    });
+    customWatcher.onDidDelete((uri) => {
+      if (uri.fsPath.endsWith("mcp.json")) reloadMcp();
+      else reloadCustom();
+    });
+    this.context.subscriptions.push(customWatcher);
   }
 
   /** Effective intelligence: an explicit user choice wins; else file default; else auto. */
@@ -900,6 +951,39 @@ export class PhotonController {
 
   private async revokeMcpServer(id: string): Promise<void> {
     await this.mcpCoord.revokeMcpServer(id);
+  }
+
+  /* ------------------------------ Customizations ------------------------------ */
+
+  private buildActiveCustomizationsPrompt(): string | undefined {
+    if (!CUSTOMIZATIONS_ENABLED) return undefined;
+    const snap = this.customizations.getSnapshot();
+    return buildCustomizationsPromptBlock(snap, {
+      invokedSkillIds: this.invokedSkillIdsForTurn,
+    });
+  }
+
+  private pushCustomizations(): void {
+    this.safePost({
+      type: "customizations",
+      payload: CUSTOMIZATIONS_ENABLED ? this.customizations.getSnapshot() : EMPTY_CUSTOMIZATIONS_SNAPSHOT,
+    });
+  }
+
+  private async openCustomizationFilePath(filePath: string): Promise<void> {
+    if (!filePath || !filePath.trim()) return;
+    const resolved = path.resolve(filePath);
+    const allowedMcp = this.mcpCoord.getAllowedConfigPaths().some((p) => path.resolve(p) === resolved);
+    if (!allowedMcp && !this.customizations.isAllowedPath(resolved)) {
+      this.output.appendLine(`[customizations] Refused opening path outside customization roots: ${filePath}`);
+      return;
+    }
+    try {
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(resolved));
+      await vscode.window.showTextDocument(doc, { preview: false });
+    } catch (e) {
+      this.output.appendLine(`[customizations] Could not open ${filePath}: ${(e as Error).message}`);
+    }
   }
 
   /* --------------------------- Photon Bench (M7) ------------------------------ */
@@ -1450,6 +1534,113 @@ export class PhotonController {
       case "openFile":
         await this.openWorkspaceFile(msg.payload.path, msg.payload.line);
         return;
+      case "addMcpServer":
+        if (!CUSTOMIZATIONS_ENABLED) return;
+        await this.mcpCoord.addServer(msg.payload);
+        return;
+      case "removeMcpServer":
+        if (!CUSTOMIZATIONS_ENABLED) return;
+        await this.mcpCoord.removeServer(msg.payload.id, msg.payload.scope);
+        return;
+      case "openMcpConfig": {
+        if (!CUSTOMIZATIONS_ENABLED) return;
+        const cfgPath = this.mcpCoord.ensureConfigFile(msg.payload.scope);
+        if (cfgPath) {
+          await this.openCustomizationFilePath(cfgPath);
+        } else {
+          this.safePost({
+            type: "error",
+            payload: { message: "Open a workspace folder first to edit workspace .vscode/mcp.json." },
+          });
+        }
+        return;
+      }
+      case "saveSkill":
+        if (!CUSTOMIZATIONS_ENABLED) return;
+        try {
+          this.customizations.saveSkill(msg.payload);
+          this.pushCustomizations();
+        } catch (e) {
+          this.safePost({ type: "error", payload: { message: (e as Error).message } });
+        }
+        return;
+      case "toggleSkill":
+        if (!CUSTOMIZATIONS_ENABLED) return;
+        this.safePost({
+          type: "customizations",
+          payload: await this.customizations.setEnabled(msg.payload.id, msg.payload.enabled),
+        });
+        return;
+      case "deleteSkill":
+        if (!CUSTOMIZATIONS_ENABLED) return;
+        this.safePost({
+          type: "customizations",
+          payload: await this.customizations.deleteById(msg.payload.id),
+        });
+        return;
+      case "saveInstruction":
+        if (!CUSTOMIZATIONS_ENABLED) return;
+        try {
+          this.customizations.saveInstruction(msg.payload);
+          this.pushCustomizations();
+        } catch (e) {
+          this.safePost({ type: "error", payload: { message: (e as Error).message } });
+        }
+        return;
+      case "toggleInstruction":
+        if (!CUSTOMIZATIONS_ENABLED) return;
+        this.safePost({
+          type: "customizations",
+          payload: await this.customizations.setEnabled(msg.payload.id, msg.payload.enabled),
+        });
+        return;
+      case "deleteInstruction":
+        if (!CUSTOMIZATIONS_ENABLED) return;
+        this.safePost({
+          type: "customizations",
+          payload: await this.customizations.deleteById(msg.payload.id),
+        });
+        return;
+      case "saveCustomAgent":
+        if (!CUSTOMIZATIONS_ENABLED) return;
+        try {
+          this.customizations.saveCustomAgent(msg.payload);
+          this.pushCustomizations();
+        } catch (e) {
+          this.safePost({ type: "error", payload: { message: (e as Error).message } });
+        }
+        return;
+      case "toggleCustomAgent":
+        if (!CUSTOMIZATIONS_ENABLED) return;
+        this.safePost({
+          type: "customizations",
+          payload: await this.customizations.setEnabled(msg.payload.id, msg.payload.enabled),
+        });
+        return;
+      case "deleteCustomAgent":
+        if (!CUSTOMIZATIONS_ENABLED) return;
+        this.safePost({
+          type: "customizations",
+          payload: await this.customizations.deleteById(msg.payload.id),
+        });
+        return;
+      case "setActiveCustomAgent": {
+        if (!CUSTOMIZATIONS_ENABLED) return;
+        const snap = await this.customizations.setActiveAgent(msg.payload.id);
+        this.safePost({ type: "customizations", payload: snap });
+        const agent = msg.payload.id ? snap.agents.find((a) => a.id === msg.payload.id) : undefined;
+        if (agent?.preferredMode && agent.preferredMode !== this.mode) {
+          this.mode = agent.preferredMode;
+          this.session.mode = agent.preferredMode;
+          this.recomputePlan();
+          this.pushPlan();
+        }
+        return;
+      }
+      case "openCustomizationFile":
+        if (!CUSTOMIZATIONS_ENABLED) return;
+        await this.openCustomizationFilePath(msg.payload.filePath);
+        return;
     }
   }
 
@@ -1528,6 +1719,41 @@ export class PhotonController {
       return;
     }
 
+    let effectivePrompt = text;
+    this.invokedSkillIdsForTurn = [];
+    if (CUSTOMIZATIONS_ENABLED) {
+      const customCmd = resolveCustomSlashCommand(trimmed, this.customizations.getSnapshot());
+      if (customCmd.kind === "agent_clear") {
+        const snap = await this.customizations.setActiveAgent(null);
+        this.safePost({ type: "customizations", payload: snap });
+        if (!customCmd.remainingPrompt) {
+          this.safePost({ type: "status", payload: { kind: "idle", detail: "Cleared active custom agent." } });
+          return;
+        }
+        effectivePrompt = customCmd.remainingPrompt;
+      } else if (customCmd.kind === "agent_activate") {
+        const snap = await this.customizations.setActiveAgent(customCmd.agent.id);
+        this.safePost({ type: "customizations", payload: snap });
+        if (customCmd.agent.preferredMode && customCmd.agent.preferredMode !== this.mode) {
+          this.mode = customCmd.agent.preferredMode;
+          this.session.mode = customCmd.agent.preferredMode;
+          this.recomputePlan();
+          this.pushPlan();
+        }
+        if (!customCmd.remainingPrompt) {
+          this.safePost({
+            type: "status",
+            payload: { kind: "idle", detail: `Active agent: ${customCmd.agent.name}` },
+          });
+          return;
+        }
+        effectivePrompt = customCmd.remainingPrompt;
+      } else if (customCmd.kind === "skill_invoke") {
+        this.invokedSkillIdsForTurn = [customCmd.skill.id];
+        effectivePrompt = customCmd.remainingPrompt || `Apply the "${customCmd.skill.name}" skill workflow.`;
+      }
+    }
+
     if (this.modelsForUi().length === 0) {
       this.safePost({
         type: "error",
@@ -1562,7 +1788,7 @@ export class PhotonController {
     const perModelCtx = (m: string) => this.effectiveNumCtxFor(m);
     const prevModel = this.selectedModel || undefined;
     let { decision, plan } = planRequest({
-      prompt: text,
+      prompt: effectivePrompt,
       mode: this.mode,
       attachmentCount: attachments?.length ?? 0,
       models: this.modelsForUi(),
@@ -1577,6 +1803,7 @@ export class PhotonController {
     });
     if (!plan) {
       this.turnPreparing = false;
+      this.invokedSkillIdsForTurn = [];
       this.safePost({
         type: "error",
         payload: { message: "No usable model/plan. Check that Ollama is running and a model is selected." },
@@ -1587,7 +1814,7 @@ export class PhotonController {
     const perCtx = perModelCtx(plan.model);
     if (perCtx && perCtx !== plan.numCtx) {
       const reb = planRequest({
-        prompt: text,
+        prompt: effectivePrompt,
         mode: this.mode,
         attachmentCount: attachments?.length ?? 0,
         models: this.modelsForUi(),
@@ -1611,7 +1838,7 @@ export class PhotonController {
       const targetModelName = plan.model;
       const m = this.models.find((x) => x.name === targetModelName) ?? this.modelsForUi()[0];
       if (m) {
-        const cPlan = this.cloudPlan(m, this.mode, text);
+        const cPlan = this.cloudPlan(m, this.mode, effectivePrompt);
         const eff = this.effectiveModelConfig(m.name);
         const pCtx = eff?.numCtx ?? eff?.llamacpp?.ctx;
         if (pCtx && pCtx > 0) { cPlan.numCtx = pCtx; cPlan.contextWindow = pCtx; }
@@ -1639,7 +1866,7 @@ export class PhotonController {
       {
         id: "pending-context-check",
         role: "user",
-        content: text,
+        content: effectivePrompt,
         attachments: attachments?.length ? attachments : undefined,
         createdAt: Date.now(),
       },
@@ -1665,17 +1892,17 @@ export class PhotonController {
     const userMsg: ChatMessage = {
       id: randomUUID(),
       role: "user",
-      content: text,
+      content: effectivePrompt,
       attachments: attachments?.length ? attachments : undefined,
       createdAt: Date.now(),
     };
     session.messages.push(userMsg);
     this.safePost({ type: "messageAppended", payload: userMsg });
     if (session.messages.length === 1) {
-      session.title = text.slice(0, 40);
+      session.title = effectivePrompt.slice(0, 40);
     }
     await this.persistActiveSession(session);
-    this.checkpointCoord.beginTurn(session.id, userMsg.id, text);
+    this.checkpointCoord.beginTurn(session.id, userMsg.id, effectivePrompt);
     this.providers.setThinkingLevel((this.thinkingLevel ?? "auto") as any);
 
     const signal = this.turnCoord.createTurnSignal();
@@ -1693,6 +1920,7 @@ export class PhotonController {
       this.safePost({ type: "error", payload: { message: (e as Error).message } });
     } finally {
       this.turnPreparing = false;
+      this.invokedSkillIdsForTurn = [];
       this.turnCoord.finishTurn(signal);
       this.safePost({ type: "status", payload: { kind: "idle" } });
       this.safePost({ type: "generationStats", payload: null });
@@ -2114,6 +2342,7 @@ export class PhotonController {
       toolPolicy,
       projectContextDigest,
       retrievedContext,
+      customizationsPrompt: this.buildActiveCustomizationsPrompt(),
     });
     const MODE_CAPS: Record<Mode, number> = { chat: 100, plan: 150, agent: 200 };
     const prevPolicy = getCloudToolPolicy();
@@ -2173,7 +2402,7 @@ export class PhotonController {
       log: (m) => this.output.appendLine(`[tool] ${m}`),
       webSearchProvider: vscode.workspace
         .getConfiguration("photon")
-        .get<"duckduckgo" | "none">("webSearch.provider", "duckduckgo"),
+        .get<"google" | "duckduckgo" | "none">("webSearch.provider", "google"),
       requestApproval: (call) => this.requestApproval(call),
       findFiles: (query, maxResults) => this.findFiles(query, maxResults),
       // Scales every tool's output budget: tiny models get tight clamps that
@@ -2323,7 +2552,7 @@ export class PhotonController {
     return {
       autoApprove: this.approvals.autoApprove,
       adaptiveEnabled: this.adaptiveEnabled(),
-      webSearchProvider: cfg.get<"duckduckgo" | "none">("webSearch.provider", "duckduckgo"),
+      webSearchProvider: cfg.get<"google" | "duckduckgo" | "none">("webSearch.provider", "google"),
       ollamaBaseUrl: this.client.baseUrl,
       llamacppBaseUrl: cfg.get<string>("llamacpp.baseUrl", "http://localhost:8080"),
       numCtxOverride: this.effectiveNumCtx() ?? 0,
@@ -2453,6 +2682,9 @@ export class PhotonController {
       mcpServers: this.mcp.list(),
       modelConfigs: this.allEffectiveModelConfigs(),
       projectContext: this.ctxMgr?.getSummary() ?? null,
+      customizations: CUSTOMIZATIONS_ENABLED
+        ? this.customizations.getSnapshot()
+        : EMPTY_CUSTOMIZATIONS_SNAPSHOT,
       hardwareMetrics: this.latestHardwareMetrics,
       ollamaRuntime: this.latestOllamaRuntime,
       cloudUsage: this.cloudUsageTracker.getSummary(),

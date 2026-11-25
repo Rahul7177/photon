@@ -1,6 +1,17 @@
 import { isLocalModel, type ModelInfo, type ThinkingLevel, type ThinkingSetting } from "../../shared/types";
 import type { LLMChatChunk, LLMChatRequest, LLMProvider } from "./types";
 
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(fallback), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 /**
  * Routes chat requests to the right provider based on a model's provider
  * prefix and injects the user's provider-neutral thinking setting.
@@ -83,12 +94,7 @@ export class ProviderManager implements LLMProvider {
   async ping(): Promise<boolean> {
     // Bound aggregation: one hung provider must not hang the whole check.
     const results = await Promise.all(
-      this.active().map((p) =>
-        Promise.race([
-          p.ping().catch(() => false),
-          new Promise<boolean>((r) => setTimeout(() => r(false), 15000)),
-        ])
-      )
+      this.active().map((p) => withTimeout(p.ping().catch(() => false), 15000, false))
     );
     return results.some(Boolean);
   }
@@ -96,10 +102,7 @@ export class ProviderManager implements LLMProvider {
   async listModels(): Promise<ModelInfo[]> {
     const lists = await Promise.all(
       this.active().map((p) =>
-        Promise.race([
-          p.listModels().catch(() => [] as ModelInfo[]),
-          new Promise<ModelInfo[]>((r) => setTimeout(() => r([]), 20000)),
-        ])
+        withTimeout(p.listModels().catch(() => [] as ModelInfo[]), 20000, [] as ModelInfo[])
       )
     );
     return lists.flat();

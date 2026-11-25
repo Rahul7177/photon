@@ -6,6 +6,8 @@ import type {
   BenchResult,
   ChatMessage,
   CloudUsageSummary,
+  CustomizationsSnapshot,
+  CustomizationScope,
   GenerationStats,
   HardwareMetrics,
   IndexStatus,
@@ -58,6 +60,7 @@ export interface AppState {
   benchRunning: string[];
   indexStatus: IndexStatus;
   mcpServers: McpServerInfo[];
+  customizations: CustomizationsSnapshot;
   providerModels: Record<string, ModelInfo[]>;
   providerModelsFetching: string[];
   providerModelsError: Record<string, string>;
@@ -122,6 +125,7 @@ export const initial: AppState = {
   benchRunning: [],
   indexStatus: initialIndex,
   mcpServers: [],
+  customizations: { skills: [], instructions: [], agents: [], activeAgentId: null },
   providerModels: {},
   providerModelsFetching: [],
   providerModelsError: {},
@@ -146,6 +150,7 @@ export const initial: AppState = {
 type LocalAction =
   | { type: "_clearApproval" }
   | { type: "_clearError" }
+  | { type: "_clearPullProgress" }
   | { type: "_setMode"; mode: Mode }
   | { type: "_setModel"; model: string }
   | { type: "_fetchProviderModels"; id: string }
@@ -160,11 +165,12 @@ export function reducer(state: AppState, msg: Action): AppState {
   switch (msg.type) {
     case "_clearApproval": return { ...state, pendingApproval: null };
     case "_clearError": return { ...state, error: null };
+    case "_clearPullProgress": return { ...state, pullProgress: null };
     case "_setMode": return { ...state, mode: msg.mode };
     case "_setModel": return { ...state, selectedModel: msg.model, config: { ...state.config, autoSelectModel: false } };
     case "_fetchProviderModels": return { ...state, providerModelsFetching: [...state.providerModelsFetching, msg.id], providerModelsError: { ...state.providerModelsError, [msg.id]: "" } };
     case "_testModel": return { ...state, modelTestRunning: [...state.modelTestRunning, modelTestKey(msg.providerId, msg.model.name)] };
-    case "init": return { ...state, ready: true, ollamaReachable: msg.payload.ollamaReachable, models: msg.payload.models, selectedModel: msg.payload.selectedModel, mode: msg.payload.mode, machine: msg.payload.machine, plan: msg.payload.plan, messages: msg.payload.session.messages, sessions: msg.payload.sessions, activeSessionId: msg.payload.session.id, config: msg.payload.config, tools: msg.payload.tools, benchResults: msg.payload.benchResults, indexStatus: msg.payload.indexStatus, mcpServers: msg.payload.mcpServers, modelConfigs: (msg.payload as any).modelConfigs ?? {}, ollamaRuntime: msg.payload.ollamaRuntime ?? [], hardwareMetrics: msg.payload.hardwareMetrics ?? null, cloudUsage: msg.payload.cloudUsage ?? null, projectContext: msg.payload.projectContext ?? state.projectContext, usage: msg.payload.session.usage ?? state.usage, queuedTools: [], toolStartTimes: {}, showOnboarding: Boolean(msg.payload.showOnboarding) };
+    case "init": return { ...state, ready: true, ollamaReachable: msg.payload.ollamaReachable, models: msg.payload.models, selectedModel: msg.payload.selectedModel, mode: msg.payload.mode, machine: msg.payload.machine, plan: msg.payload.plan, messages: msg.payload.session.messages, sessions: msg.payload.sessions, activeSessionId: msg.payload.session.id, config: msg.payload.config, tools: msg.payload.tools, benchResults: msg.payload.benchResults, indexStatus: msg.payload.indexStatus, mcpServers: msg.payload.mcpServers, customizations: msg.payload.customizations ?? state.customizations, modelConfigs: (msg.payload as any).modelConfigs ?? {}, ollamaRuntime: msg.payload.ollamaRuntime ?? [], hardwareMetrics: msg.payload.hardwareMetrics ?? null, cloudUsage: msg.payload.cloudUsage ?? null, projectContext: msg.payload.projectContext ?? state.projectContext, usage: msg.payload.session.usage ?? state.usage, queuedTools: [], toolStartTimes: {}, showOnboarding: Boolean(msg.payload.showOnboarding) };
     case "models": return { ...state, models: msg.payload.models, selectedModel: msg.payload.selected, ollamaReachable: msg.payload.ollamaReachable };
     case "sessionLoaded": {
       const isSameSession = msg.payload.id === state.activeSessionId;
@@ -277,6 +283,7 @@ export function reducer(state: AppState, msg: Action): AppState {
     case "benchStatus": { const running = new Set(state.benchRunning); if (msg.payload.phase === "running") running.add(msg.payload.model); else running.delete(msg.payload.model); return { ...state, benchRunning: [...running] }; }
     case "indexStatus": return { ...state, indexStatus: msg.payload };
     case "mcpServers": return { ...state, mcpServers: msg.payload };
+    case "customizations": return { ...state, customizations: msg.payload };
     case "tools": return { ...state, tools: msg.payload };
     case "providerModels": return { ...state, providerModelsFetching: state.providerModelsFetching.filter((id) => id !== msg.payload.id), providerModels: { ...state.providerModels, [msg.payload.id]: msg.payload.models }, providerModelsError: { ...state.providerModelsError, [msg.payload.id]: msg.payload.error || "" } };
     case "modelTestResult": { const key = modelTestKey(msg.payload.providerId, msg.payload.model.name); return { ...state, modelTestRunning: state.modelTestRunning.filter((k) => k !== key), modelTestResults: { ...state.modelTestResults, [key]: { ok: msg.payload.ok, latencyMs: msg.payload.latencyMs, error: msg.payload.error } } }; }
@@ -449,6 +456,7 @@ export function useAppState() {
     unloadModel: (model?: string) => post({ type: "unloadModel", payload: { model } }),
     pullModel: (model: string) => post({ type: "pullModel", payload: { model } }),
     cancelPull: () => post({ type: "cancelPull" }),
+    clearPullProgress: () => dispatch({ type: "_clearPullProgress" }),
     detectProviders: () => post({ type: "detectProviders" }),
     startProvider: (id: "ollama" | "llamacpp", modelPath?: string) => post({ type: "startProvider", payload: { id, modelPath } }),
     stopProvider: (id: "ollama" | "llamacpp") => post({ type: "stopProvider", payload: { id } }),
@@ -470,6 +478,46 @@ export function useAppState() {
       scope: "persistent" | "session" | "one_time" = "persistent"
     ) => post({ type: "approveMcpServer", payload: { id, expectedFingerprint, scope } }),
     revokeMcpServer: (id: string) => post({ type: "revokeMcpServer", payload: { id } }),
+    addMcpServer: (payload: {
+      scope: CustomizationScope;
+      id: string;
+      transport: "stdio" | "http";
+      command?: string;
+      args?: string[];
+      env?: Record<string, string>;
+      url?: string;
+      headers?: Record<string, string>;
+      allowLocalNetwork?: boolean;
+      connectNow?: boolean;
+    }) => post({ type: "addMcpServer", payload }),
+    removeMcpServer: (id: string, scope?: CustomizationScope) => post({ type: "removeMcpServer", payload: { id, scope } }),
+    openMcpConfig: (scope: CustomizationScope) => post({ type: "openMcpConfig", payload: { scope } }),
+    saveSkill: (payload: { scope: CustomizationScope; slug?: string; name: string; description: string; content: string }) =>
+      post({ type: "saveSkill", payload }),
+    toggleSkill: (id: string, enabled: boolean) => post({ type: "toggleSkill", payload: { id, enabled } }),
+    deleteSkill: (id: string) => post({ type: "deleteSkill", payload: { id } }),
+    saveInstruction: (payload: {
+      scope: CustomizationScope;
+      slug?: string;
+      name: string;
+      applyTo?: string;
+      description?: string;
+      content: string;
+    }) => post({ type: "saveInstruction", payload }),
+    toggleInstruction: (id: string, enabled: boolean) => post({ type: "toggleInstruction", payload: { id, enabled } }),
+    deleteInstruction: (id: string) => post({ type: "deleteInstruction", payload: { id } }),
+    saveCustomAgent: (payload: {
+      scope: CustomizationScope;
+      slug?: string;
+      name: string;
+      description: string;
+      instructions: string;
+      preferredMode?: Mode;
+    }) => post({ type: "saveCustomAgent", payload }),
+    toggleCustomAgent: (id: string, enabled: boolean) => post({ type: "toggleCustomAgent", payload: { id, enabled } }),
+    deleteCustomAgent: (id: string) => post({ type: "deleteCustomAgent", payload: { id } }),
+    setActiveCustomAgent: (id: string | null) => post({ type: "setActiveCustomAgent", payload: { id } }),
+    openCustomizationFile: (filePath: string) => post({ type: "openCustomizationFile", payload: { filePath } }),
     diagnostics: () => post({ type: "openDiagnostics" }),
     openProjectConfig: () => post({ type: "openProjectConfig" }),
     createProjectConfig: () => post({ type: "createProjectConfig" }),
@@ -490,8 +538,12 @@ export function useAppState() {
     removeCustomProvider: (id: string) => post({ type: "removeCustomProvider", payload: { id } }),
     compactContext: (focus?: string) => post({ type: "compactContext", payload: { focus } }),
     rollbackCheckpoint: (checkpointId: string, rewindChat = true) => post({ type: "rollbackCheckpoint", payload: { checkpointId, rewindChat } }),
-    openRevertModal: () => dispatch({ type: "_openRevertModal" }),
+    openRevertModal: () => {
+      dispatch({ type: "_openRevertModal" });
+      post({ type: "getCheckpoints" });
+    },
     closeRevertModal: () => dispatch({ type: "_closeRevertModal" }),
+    setDraftPrompt: (prompt: string) => dispatch({ type: "_setDraftPrompt", prompt }),
     clearDraftPrompt: () => dispatch({ type: "_setDraftPrompt", prompt: null }),
     revertToNumber: (checkpointNumber: number) => post({ type: "revertToNumber", payload: { checkpointNumber } }),
     getCheckpoints: () => post({ type: "getCheckpoints" }),

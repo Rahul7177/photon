@@ -13,6 +13,8 @@ export interface SystemPromptInput {
   lastUserText?:string;
   /** The request needs current external facts: force the web-tool directive. */
   freshInfoRequest?:boolean;
+  /** Active Custom Agent persona, enabled Custom Instructions, and invoked Skills. */
+  customizationsPrompt?:string;
 }
 /**
  * Budget fraction of numCtx reserved for the system prompt + workspace map + RAG.
@@ -43,6 +45,14 @@ export function buildSystemPrompt(input:SystemPromptInput):string{
   if(mode==="agent")core.push(multiFileGuidance(level));
   core.push(formattingRules(level));
   const budgetTokens=Math.max(512,Math.floor(plan.numCtx*BUDGET_FRACTION[level]));let used=estimateTokens(core.join("\n\n"));const extras:string[]=[];
+  if(input.customizationsPrompt){
+    const customBudget=Math.max(160,Math.floor((budgetTokens-used)*0.45));
+    const trimmedCustom=fitBlock(input.customizationsPrompt,customBudget);
+    if(trimmedCustom){
+      extras.push(trimmedCustom);
+      used+=estimateTokens(trimmedCustom);
+    }
+  }
   if(projectContextDigest){
     const trimmedDigest=fitBlock(projectContextDigest,Math.max(220,Math.floor((budgetTokens-used)*0.65)));
     if(trimmedDigest){

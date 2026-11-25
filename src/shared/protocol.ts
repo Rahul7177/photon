@@ -17,6 +17,8 @@ import type {
   BenchResult,
   ChatMessage,
   CloudUsageSummary,
+  CustomizationsSnapshot,
+  CustomizationScope,
   GenerationStats,
   HardwareMetrics,
   IndexStatus,
@@ -99,6 +101,7 @@ export type HostMessage =
   | { type: "checkpointsList"; payload: { checkpoints: CheckpointSummary[] } }
   | { type: "openRevertModal"; payload?: { checkpoints?: CheckpointSummary[] } }
   | { type: "onboardingStatus"; payload: { show: boolean } }
+  | { type: "customizations"; payload: CustomizationsSnapshot }
   | { type: "error"; payload: { message: string } };
 
 export interface CheckpointSummary {
@@ -182,6 +185,7 @@ export interface InitPayload {
   hardwareMetrics?: HardwareMetrics | null;
   cloudUsage?: CloudUsageSummary;
   projectContext?: ProjectContextSummary | null;
+  customizations?: CustomizationsSnapshot;
   showOnboarding?: boolean;
 }
 
@@ -274,4 +278,55 @@ export type ViewMessage =
   | { type: "revertToNumber"; payload: { checkpointNumber: number } }
   | { type: "openFile"; payload: { path: string; line?: number } }
   | { type: "completeOnboarding" }
-  | { type: "openOnboarding" };
+  | { type: "openOnboarding" }
+  | {
+      type: "addMcpServer";
+      payload: {
+        scope: CustomizationScope;
+        id: string;
+        transport: "stdio" | "http";
+        command?: string;
+        args?: string[];
+        env?: Record<string, string>;
+        url?: string;
+        headers?: Record<string, string>;
+        allowLocalNetwork?: boolean;
+        connectNow?: boolean;
+      };
+    }
+  | { type: "removeMcpServer"; payload: { id: string; scope?: CustomizationScope } }
+  | { type: "openMcpConfig"; payload: { scope: CustomizationScope } }
+  | {
+      type: "saveSkill";
+      payload: { scope: CustomizationScope; slug?: string; name: string; description: string; content: string };
+    }
+  | { type: "toggleSkill"; payload: { id: string; enabled: boolean } }
+  | { type: "deleteSkill"; payload: { id: string } }
+  | {
+      type: "saveInstruction";
+      payload: {
+        scope: CustomizationScope;
+        slug?: string;
+        name: string;
+        applyTo?: string;
+        description?: string;
+        content: string;
+      };
+    }
+  | { type: "toggleInstruction"; payload: { id: string; enabled: boolean } }
+  | { type: "deleteInstruction"; payload: { id: string } }
+  | {
+      type: "saveCustomAgent";
+      payload: {
+        scope: CustomizationScope;
+        slug?: string;
+        name: string;
+        description: string;
+        instructions: string;
+        preferredMode?: Mode;
+      };
+    }
+  | { type: "toggleCustomAgent"; payload: { id: string; enabled: boolean } }
+  | { type: "deleteCustomAgent"; payload: { id: string } }
+  | { type: "setActiveCustomAgent"; payload: { id: string | null } }
+  | { type: "openCustomizationFile"; payload: { filePath: string } };

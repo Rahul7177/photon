@@ -12,6 +12,7 @@ import {
   filterAndGroupSessions,
 } from "../../webview-ui/src/components/SessionHistory";
 import { buildPerModelConfigEntries } from "../../webview-ui/src/components/ModelConfigs";
+import { getThemePreference, applyThemePreference, setThemePreference } from "../../webview-ui/src/state/themePref";
 import type { ChatMessage, SessionSummary, ToolCall } from "../../src/shared/types";
 
 describe("Phase 8: Webview State, Protocol, Usability & Accessibility", () => {
@@ -294,6 +295,40 @@ Authorization: Bearer mySecretBearerToken12345
       assert.equal(entries[0].isSelected, true);
       assert.equal(entries[0].fromProjectFile, true);
       assert.ok(entries.some((e) => e.name === "llamacpp:custom.gguf" && e.isLlama));
+    });
+
+    it("defaults theme preference to auto and safely persists/applies theme overrides", () => {
+      assert.equal(getThemePreference(), "auto");
+
+      const dataset: Record<string, string> = {};
+      const storeMap = new Map<string, string>();
+      const prevDoc = (globalThis as any).document;
+      const prevStorage = (globalThis as any).localStorage;
+      try {
+        (globalThis as any).document = { body: { dataset } };
+        (globalThis as any).localStorage = {
+          getItem: (k: string) => storeMap.get(k) ?? null,
+          setItem: (k: string, v: string) => storeMap.set(k, v),
+        };
+
+        setThemePreference("light");
+        assert.equal(getThemePreference(), "light");
+        assert.equal(dataset.theme, "light");
+
+        setThemePreference("dark");
+        assert.equal(getThemePreference(), "dark");
+        assert.equal(dataset.theme, "dark");
+
+        setThemePreference("auto");
+        assert.equal(getThemePreference(), "auto");
+        assert.equal("theme" in dataset, false);
+
+        applyThemePreference("light");
+        assert.equal(dataset.theme, "light");
+      } finally {
+        (globalThis as any).document = prevDoc;
+        (globalThis as any).localStorage = prevStorage;
+      }
     });
   });
 });

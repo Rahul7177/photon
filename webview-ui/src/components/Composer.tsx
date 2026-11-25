@@ -26,8 +26,15 @@ import {
   CloseIcon,
   BoltIcon,
   RewindIcon,
+  BotIcon,
+  SparkleIcon,
+  LinkIcon,
+  RulerIcon,
 } from "./Icons";
 import { ProviderLogo } from "./ProviderLogos";
+import type { CustomizationSection } from "./CustomizationsTab";
+import { filterSlashItems, type SlashItem } from "../slashCommands";
+import { CUSTOMIZATIONS_ENABLED } from "../../../src/shared/features";
 
 const MODES: { id: Mode; label: string; badge: string; hint: string; icon: JSX.Element }[] = [
   {
@@ -60,37 +67,6 @@ const THINKING_OPTIONS: Array<{ value: ThinkingSetting; label: string }> = [
   { value: "medium", label: "Medium" },
   { value: "high", label: "High" },
   { value: "xtrahigh", label: "Extra High" },
-];
-
-const SLASH_COMMANDS: Array<{
-  cmd: string;
-  desc: string;
-  run: (actions: Actions, setText: (t: string) => void) => void;
-}> = [
-  {
-    cmd: "/revert",
-    desc: "Select a checkpoint (#1, #2, …) to restore files and rewind chat",
-    run: (actions, setText) => {
-      actions.openRevertModal();
-      setText("");
-    },
-  },
-  {
-    cmd: "/rewind",
-    desc: "Instantly rollback the most recent file changes and rewind chat",
-    run: (actions, setText) => {
-      actions.send("/rewind");
-      setText("");
-    },
-  },
-  {
-    cmd: "/compact",
-    desc: "Compact conversation history to optimize context window",
-    run: (actions, setText) => {
-      actions.compactContext();
-      setText("");
-    },
-  },
 ];
 
 function benchTps(results: { model: string; tokensPerSec: number }[], model: string): number | undefined {
@@ -436,6 +412,7 @@ export function Composer({
   setAttachError,
   addFiles,
   onOpenHardwareModal,
+  onOpenCustomizations,
   onContextWarn,
 }: {
   state: AppState;
@@ -446,6 +423,7 @@ export function Composer({
   setAttachError: (msg: string | null) => void;
   addFiles: (files: File[]) => Promise<void>;
   onOpenHardwareModal: () => void;
+  onOpenCustomizations?: (section?: CustomizationSection) => void;
   onContextWarn: (check: ContextOverflowCheck) => void;
 }) {
   const [text, setText] = useState("");
@@ -485,11 +463,56 @@ export function Composer({
   }, [state.draftPrompt, actions]);
 
   const filteredSlash = useMemo(() => {
-    const trimmed = text.trim();
-    if (!trimmed.startsWith("/") || slashDismissed) return [];
-    const query = trimmed.toLowerCase();
-    return SLASH_COMMANDS.filter((c) => c.cmd.toLowerCase().startsWith(query) || query === "/");
-  }, [text, slashDismissed]);
+    if (slashDismissed) return [];
+    return filterSlashItems(text, state.customizations);
+  }, [text, slashDismissed, state.customizations]);
+
+  const activeCustomAgent = useMemo(
+    () =>
+      CUSTOMIZATIONS_ENABLED && state.customizations.activeAgentId
+        ? state.customizations.agents.find((a) => a.id === state.customizations.activeAgentId) ?? null
+        : null,
+    [state.customizations.activeAgentId, state.customizations.agents]
+  );
+
+  const runSlashItem = (item: SlashItem) => {
+    if (item.openSection) {
+      if (CUSTOMIZATIONS_ENABLED) onOpenCustomizations?.(item.openSection);
+      setText("");
+      return;
+    }
+    if (item.skillSlug) {
+      if (CUSTOMIZATIONS_ENABLED) {
+        setText(`/${item.skillSlug} `);
+        setSlashDismissed(true);
+      }
+      return;
+    }
+    if (item.clearAgent) {
+      if (CUSTOMIZATIONS_ENABLED) actions.setActiveCustomAgent(null);
+      setText("");
+      return;
+    }
+    if (item.agentId) {
+      if (CUSTOMIZATIONS_ENABLED) actions.setActiveCustomAgent(item.agentId);
+      setText("");
+      return;
+    }
+    if (item.cmd === "/revert") {
+      actions.openRevertModal();
+      setText("");
+      return;
+    }
+    if (item.cmd === "/rewind") {
+      actions.send("/rewind");
+      setText("");
+      return;
+    }
+    if (item.cmd === "/compact") {
+      actions.compactContext();
+      setText("");
+    }
+  };
 
   const showSlashMenu = filteredSlash.length > 0;
 
@@ -512,6 +535,38 @@ export function Composer({
 
   const submit = () => {
     const trimmed = text.trim();
+    if (CUSTOMIZATIONS_ENABLED) {
+      if (trimmed === "/mcp") {
+        onOpenCustomizations?.("mcp");
+        setText("");
+        if (taRef.current) taRef.current.style.height = "auto";
+        return;
+      }
+      if (trimmed === "/skills") {
+        onOpenCustomizations?.("skills");
+        setText("");
+        if (taRef.current) taRef.current.style.height = "auto";
+        return;
+      }
+      if (trimmed === "/instructions") {
+        onOpenCustomizations?.("instructions");
+        setText("");
+        if (taRef.current) taRef.current.style.height = "auto";
+        return;
+      }
+      if (trimmed === "/agents") {
+        onOpenCustomizations?.("agents");
+        setText("");
+        if (taRef.current) taRef.current.style.height = "auto";
+        return;
+      }
+      if (trimmed === "/customizations") {
+        onOpenCustomizations?.("mcp");
+        setText("");
+        if (taRef.current) taRef.current.style.height = "auto";
+        return;
+      }
+    }
     if (trimmed === "/revert") {
       actions.openRevertModal();
       setText("");
@@ -599,7 +654,7 @@ export function Composer({
         e.preventDefault();
         const selected = filteredSlash[slashIndex] || filteredSlash[0];
         if (selected) {
-          selected.run(actions, setText);
+          runSlashItem(selected);
           if (taRef.current) taRef.current.style.height = "auto";
         }
         return;
@@ -816,13 +871,13 @@ export function Composer({
           <div className="slash-menu-list">
             {filteredSlash.map((item, idx) => (
               <button
-                key={item.cmd}
+                key={item.id}
                 type="button"
                 role="option"
                 aria-selected={idx === slashIndex}
                 className={`slash-menu-item${idx === slashIndex ? " active" : ""}`}
                 onClick={() => {
-                  item.run(actions, setText);
+                  runSlashItem(item);
                   if (taRef.current) taRef.current.focus();
                 }}
                 onMouseEnter={() => setSlashIndex(idx)}
@@ -831,11 +886,20 @@ export function Composer({
                   <span className="slash-item-icon" aria-hidden="true">
                     {item.cmd === "/revert" || item.cmd === "/rewind" ? (
                       <RewindIcon size={13} />
+                    ) : item.category === "skill" ? (
+                      <SparkleIcon />
+                    ) : item.category === "agent" || item.openSection === "agents" ? (
+                      <BotIcon />
+                    ) : item.openSection === "mcp" ? (
+                      <LinkIcon />
+                    ) : item.openSection === "instructions" ? (
+                      <RulerIcon />
                     ) : (
                       <BoltIcon />
                     )}
                   </span>
                   <span className="slash-item-cmd">{item.cmd}</span>
+                  {item.badge && <span className="slash-item-badge">{item.badge}</span>}
                 </div>
                 <span className="slash-item-desc">{item.desc}</span>
               </button>
@@ -846,6 +910,28 @@ export function Composer({
 
       {/* Unified Elevated Composer Card */}
       <div className="composer-card">
+        {activeCustomAgent && (
+          <div className="composer-agent-bar">
+            <button
+              type="button"
+              className="composer-agent-chip"
+              onClick={() => onOpenCustomizations?.("agents")}
+              title={`Active custom agent: ${activeCustomAgent.name} (click to manage)`}
+            >
+              <BotIcon />
+              <span>{activeCustomAgent.name}</span>
+            </button>
+            <button
+              type="button"
+              className="composer-agent-clear"
+              onClick={() => actions.setActiveCustomAgent(null)}
+              title="Clear active custom agent (/agent:off)"
+              aria-label="Clear active custom agent"
+            >
+              <CloseIcon />
+            </button>
+          </div>
+        )}
         <div className="composer-input-area">
           <textarea
             ref={taRef}
@@ -862,29 +948,28 @@ export function Composer({
             onKeyDown={onKeyDown}
             onPaste={onPaste}
           />
+          <input
+            ref={fileRef}
+            type="file"
+            multiple
+            hidden
+            accept={supportsVision ? "image/*,text/*,.md,.json,.csv,.log,.py,.ts,.tsx,.js,.jsx" : "text/*,.md,.json,.csv,.log,.py,.ts,.tsx,.js,.jsx"}
+            onChange={(e) => onPickFiles(e.target.files)}
+          />
+          <button
+            type="button"
+            className="attach-btn"
+            title={supportsVision ? "Attach image or code file" : "Attach text or code file"}
+            aria-label={supportsVision ? "Attach image or code file" : "Attach text or code file"}
+            onClick={() => fileRef.current?.click()}
+            disabled={busy || !state.selectedModel}
+          >
+            <PaperclipIcon />
+          </button>
         </div>
 
         <div className="composer-bottom-bar">
           <div className="composer-controls-left">
-            <input
-              ref={fileRef}
-              type="file"
-              multiple
-              hidden
-              accept={supportsVision ? "image/*,text/*,.md,.json,.csv,.log,.py,.ts,.tsx,.js,.jsx" : "text/*,.md,.json,.csv,.log,.py,.ts,.tsx,.js,.jsx"}
-              onChange={(e) => onPickFiles(e.target.files)}
-            />
-            <button
-              type="button"
-              className="attach-btn"
-              title={supportsVision ? "Attach image or code file" : "Attach text or code file"}
-              aria-label={supportsVision ? "Attach image or code file" : "Attach text or code file"}
-              onClick={() => fileRef.current?.click()}
-              disabled={busy || !state.selectedModel}
-            >
-              <PaperclipIcon />
-            </button>
-
             <ModeDropdown mode={state.mode} onChange={(m) => actions.setMode(m)} />
 
             <span className="composer-divider" aria-hidden="true" />

@@ -144,6 +144,9 @@ export function getProjectContextManager(
 }
 
 export function _resetProjectContextManagersForTesting(): void {
+  for (const mgr of managersByRoot.values()) {
+    mgr.dispose();
+  }
   managersByRoot.clear();
 }
 
@@ -154,6 +157,7 @@ export class ProjectContextManager {
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private saveChain: Promise<void> = Promise.resolve();
   private initialized = false;
+  private disposed = false;
   private listeners = new Set<(summary: ProjectContextSummary) => void>();
 
   constructor(private readonly workspaceRoot: string, storageFilePath?: string) {
@@ -183,6 +187,15 @@ export class ProjectContextManager {
 
   setStoragePath(p: string): void {
     this.storageFilePath = p;
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    this.listeners.clear();
   }
 
   onDidUpdate(listener: (summary: ProjectContextSummary) => void): () => void {
@@ -1099,11 +1112,15 @@ export class ProjectContextManager {
   }
 
   private scheduleSave(): void {
-    if (!this.storageFilePath) return;
+    if (this.disposed || !this.storageFilePath) return;
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = setTimeout(() => {
-      void this.saveToDisk();
+      this.saveTimer = null;
+      if (!this.disposed) {
+        void this.saveToDisk();
+      }
     }, 1500);
+    this.saveTimer.unref?.();
   }
 
   async saveToDisk(): Promise<void> {

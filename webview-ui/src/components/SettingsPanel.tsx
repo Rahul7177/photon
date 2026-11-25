@@ -8,6 +8,8 @@ import {
   type ModelCapability,
 } from "../../../src/shared/types";
 import type { AppState, Actions } from "../state/store";
+import { CUSTOMIZATIONS_ENABLED } from "../../../src/shared/features";
+import { getThemePreference, setThemePreference, type ThemePreference } from "../state/themePref";
 import {
   BackIcon,
   BoltIcon,
@@ -28,6 +30,7 @@ import {
   TabModelsIcon,
   TabProvidersIcon,
   TabAdvancedIcon,
+  TabCustomizationsIcon,
   CpuIcon,
   RefreshIcon,
   SparkleIcon,
@@ -46,6 +49,7 @@ import { CapabilityBadges } from "./CapabilityBadges";
 import { ModelConfigs } from "./ModelConfigs";
 import { LocalProviderHub } from "./LocalProviderHub";
 import { PullProgressBar } from "./PullProgressBar";
+import { CustomizationsTab, type CustomizationSection } from "./CustomizationsTab";
 import {
   CONTEXT_PRESETS,
   checkContextWindowOverflow,
@@ -82,28 +86,44 @@ const INTELLIGENCE_OPTIONS: { value: IntelligenceSetting; label: string; hint: s
   { value: "low", label: "Minimal", hint: "Minimal prompt overhead for frontier models." },
 ];
 
-type Tab = "general" | "tools" | "models" | "providers" | "advanced";
+type Tab = "general" | "tools" | "models" | "providers" | "customizations" | "advanced";
 
-const TABS: { id: Tab; label: string; icon: ReactNode }[] = [
+const ALL_TABS: { id: Tab; label: string; icon: ReactNode }[] = [
   { id: "general", label: "General", icon: <TabGeneralIcon /> },
   { id: "models", label: "Models", icon: <TabModelsIcon /> },
   { id: "providers", label: "Providers", icon: <TabProvidersIcon /> },
   { id: "tools", label: "Tools", icon: <TabToolsIcon /> },
+  { id: "customizations", label: "Customizations", icon: <TabCustomizationsIcon /> },
   { id: "advanced", label: "Advanced", icon: <TabAdvancedIcon /> },
 ];
+
+const TABS = CUSTOMIZATIONS_ENABLED ? ALL_TABS : ALL_TABS.filter((t) => t.id !== "customizations");
 
 export function SettingsPanel({
   state,
   actions,
   onClose,
   initialTab = "general",
+  initialCustomizationSection = "mcp",
 }: {
   state: AppState;
   actions: Actions;
   onClose: () => void;
   initialTab?: Tab;
+  initialCustomizationSection?: CustomizationSection;
 }) {
-  const [tab, setTab] = useState<Tab>(initialTab);
+  const safeInitialTab: Tab =
+    !CUSTOMIZATIONS_ENABLED && initialTab === "customizations" ? "general" : initialTab;
+  const [tab, setTab] = useState<Tab>(safeInitialTab);
+  const [customSection, setCustomSection] = useState<CustomizationSection>(initialCustomizationSection);
+
+  useEffect(() => {
+    setTab(safeInitialTab);
+  }, [safeInitialTab]);
+
+  useEffect(() => {
+    setCustomSection(initialCustomizationSection);
+  }, [initialCustomizationSection]);
   const model = state.models.find((m) => m.name === state.selectedModel);
   const [numCtxInput, setNumCtxInput] = useState(
     state.config.numCtxOverride ? String(state.config.numCtxOverride) : ""
@@ -111,6 +131,12 @@ export function SettingsPanel({
   const [ctxWarn, setCtxWarn] = useState<ContextOverflowCheck | null>(null);
   const [customPullName, setCustomPullName] = useState("");
   const [confirmUnload, setConfirmUnload] = useState<string | null>(null);
+  const [themePref, setThemePrefState] = useState<ThemePreference>(() => getThemePreference());
+
+  const selectTheme = (next: ThemePreference) => {
+    setThemePrefState(next);
+    setThemePreference(next);
+  };
 
   useEffect(() => {
     setNumCtxInput(state.config.numCtxOverride ? String(state.config.numCtxOverride) : "");
@@ -184,6 +210,35 @@ export function SettingsPanel({
           {/* ───── General ───── */}
           {tab === "general" && (
             <>
+              <Category title="Appearance" iconNode={<SparkleIcon />}>
+                <div className="intelligence-grid">
+                  {(
+                    [
+                      { value: "auto", label: "Auto (VS Code)", hint: "Matches your VS Code dark or light theme automatically." },
+                      { value: "dark", label: "Soft Dark", hint: "Velvet charcoal backdrop with frosted glass surfaces." },
+                      { value: "light", label: "Soft Light", hint: "Warm stone frosted light palette — easy on the eyes." },
+                    ] as const
+                  ).map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      className={`intelligence-opt ${themePref === opt.value ? "active" : ""}`}
+                      onClick={() => selectTheme(opt.value)}
+                      title={opt.hint}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="settings-hint">
+                  {themePref === "auto"
+                    ? "Matches your VS Code dark or light theme automatically."
+                    : themePref === "light"
+                      ? "Warm stone frosted light palette with softened contrast."
+                      : "Soft charcoal frosted dark theme with gentle contrast."}
+                </div>
+              </Category>
+
               <Category title="Adaptive Scaffolding" iconNode={<BoltIcon />}>
                 <div className="intelligence-grid">
                   {INTELLIGENCE_OPTIONS.map((opt) => (
@@ -964,7 +1019,27 @@ export function SettingsPanel({
               </Category>
 
               <Category title="MCP Servers" iconNode={<LinkIcon />}>
-                {state.mcpServers.length === 0 ? (
+                {CUSTOMIZATIONS_ENABLED ? (
+                  <>
+                    <div className="settings-hint">
+                      {state.mcpServers.length === 0
+                        ? "No MCP servers configured yet."
+                        : `${state.mcpServers.filter((s) => s.status === "connected").length} of ${state.mcpServers.length} MCP server(s) connected.`}
+                    </div>
+                    <div style={{ marginTop: 8 }}>
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        onClick={() => {
+                          setCustomSection("mcp");
+                          setTab("customizations");
+                        }}
+                      >
+                        Manage in Customizations →
+                      </button>
+                    </div>
+                  </>
+                ) : state.mcpServers.length === 0 ? (
                   <div className="settings-hint">
                     Configure MCP servers in <code>.vscode/mcp.json</code>.
                   </div>
@@ -1027,6 +1102,15 @@ export function SettingsPanel({
                 </button>
               </Category>
             </>
+          )}
+
+          {CUSTOMIZATIONS_ENABLED && tab === "customizations" && (
+            <CustomizationsTab
+              state={state}
+              actions={actions}
+              initialSection={customSection}
+              onCloseSettings={onClose}
+            />
           )}
         </div>
       </div>

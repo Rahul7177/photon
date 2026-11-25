@@ -67,10 +67,9 @@ export function PullProgressBar({
             <button
               type="button"
               className="pull-btn-close"
-              onClick={() => {
-                // Post null pullProgress or clear it
-              }}
+              onClick={() => actions.clearPullProgress()}
               title="Dismiss"
+              aria-label="Dismiss pull status"
             >
               <CloseIcon />
             </button>

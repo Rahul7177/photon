@@ -31,6 +31,7 @@ export interface EngineDeps {
   workspaceName: string | undefined;
   workspaceMap: () => Promise<string | undefined>;
   retrieveContext?: (query: string, signal: AbortSignal) => Promise<string | undefined>;
+  getCustomizationsPrompt?: () => string | undefined;
   reserveOutputTokens: number;
 }
 
@@ -76,6 +77,7 @@ export class AgentEngine {
         workspaceName: d.workspaceName,
         workspaceMap: d.workspaceMap,
         retrieveContext: d.retrieveContext,
+        getCustomizationsPrompt: d.getCustomizationsPrompt,
         buildToolContext: (sig) => d.toolContext(sig, turnContext),
         reserveOutputTokens: d.reserveOutputTokens,
       });

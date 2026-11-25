@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type {
+  CustomizationScope,
   JsonSchema,
   McpServerInfo,
   McpServerStatus,
@@ -52,6 +53,8 @@ export interface McpServerConfig {
   cwd?: string;
   allowLocalNetwork?: boolean;
   permissions?: McpServerPermissions;
+  scope?: CustomizationScope;
+  sourcePath?: string;
 }
 
 interface Entry {
@@ -218,6 +221,8 @@ export class McpManager {
       envKeys: e.config.env ? Object.keys(e.config.env).sort() : undefined,
       headerKeys: e.config.headers ? Object.keys(e.config.headers).sort() : undefined,
       fingerprint: e.fingerprint ?? computeMcpConfigFingerprint(e.config),
+      scope: e.config.scope,
+      sourcePath: e.config.sourcePath,
     }));
   }
 

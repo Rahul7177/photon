@@ -26,8 +26,8 @@ export function Approval({
 
   const filePath = (args.path || args.file || args.filepath || args.target_file || args.file_path) as string | undefined;
   const content = (args.content || args.file_text || args.text) as string | undefined;
-  const oldStr = (args.old_str || args.old_string || args.find) as string | undefined;
-  const newStr = (args.new_str || args.new_string || args.replace) as string | undefined;
+  const oldStr = (args.old_str || args.old_string || args.find || args.target) as string | undefined;
+  const newStr = (args.new_str || args.new_string || args.replace || args.replacement) as string | undefined;
   const command = (args.command || args.cmd) as string | undefined;
 
   const isDestructive =
@@ -122,7 +122,13 @@ export function Approval({
         {(() => {
           const skipKeys = new Set<string>();
           if (isFileWrite) { skipKeys.add("path"); skipKeys.add("file"); skipKeys.add("content"); skipKeys.add("file_text"); }
-          if (isFileEdit) { skipKeys.add("path"); skipKeys.add("file"); skipKeys.add("old_str"); skipKeys.add("new_str"); skipKeys.add("find"); skipKeys.add("replace"); }
+          if (isFileEdit) {
+            skipKeys.add("path"); skipKeys.add("file");
+            skipKeys.add("old_str"); skipKeys.add("new_str");
+            skipKeys.add("old_string"); skipKeys.add("new_string");
+            skipKeys.add("find"); skipKeys.add("replace");
+            skipKeys.add("target"); skipKeys.add("replacement");
+          }
           if (isCommand) { skipKeys.add("command"); skipKeys.add("cmd"); }
 
           const remaining = Object.entries(args).filter(([k]) => !skipKeys.has(k));

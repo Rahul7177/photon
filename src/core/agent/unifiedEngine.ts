@@ -22,7 +22,7 @@ import { ToolPipeline } from "../../photon-core/tools/pipeline";
 import type { LLMProvider } from "../llm/types";
 import type { TodoItem } from "../tools/types";
 
-export interface UnifiedEngineDeps { provider:LLMProvider;tools:import("../tools/types").Tool[];workspaceName?:string;workspaceMap?:()=>Promise<string|undefined>;retrieveContext?:(query:string,signal:AbortSignal)=>Promise<string|undefined>;buildToolContext:(signal:AbortSignal)=>import("../tools/types").ToolContext;reserveOutputTokens?:number; }
+export interface UnifiedEngineDeps { provider:LLMProvider;tools:import("../tools/types").Tool[];workspaceName?:string;workspaceMap?:()=>Promise<string|undefined>;retrieveContext?:(query:string,signal:AbortSignal)=>Promise<string|undefined>;getCustomizationsPrompt?:()=>string|undefined;buildToolContext:(signal:AbortSignal)=>import("../tools/types").ToolContext;reserveOutputTokens?:number; }
 export interface UnifiedEmitter { onAssistantStart(id:string):void;onDelta(id:string,delta:string):void;onThinkingDelta?(id:string,delta:string):void;onThinkingEnd?(id:string,elapsedMs:number):void;onContent(id:string,content:string):void;onAssistantCancel(id:string):void;onPhase(phase:"thinking"|"working",detail?:string):void;onToolCall(id:string,call:ToolCall):void;onToolUpdate(id:string,call:ToolCall):void;onQueuedTools?(calls:ToolCall[]):void;onUsage(usage:import("../../shared/types").TokenUsage):void;onGenerationStats(stats:import("../../shared/types").GenerationStats|null):void;onDone(id:string,notice?:string):void;onError(message:string):void; }
 const MAX_OUTPUT_CHARS = 200_000;
 const MAX_TOOL_OUTPUT_CHARS = 100_000;
@@ -234,7 +234,8 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
   // the web tools — anything else is a mode violation, not a retryable error.
   const modeToolNames=new Set(specs.map(s=>s.name));
   const toolInstructions=plan.toolProtocol==="native"?"":renderToolInstructions(specs,plan);
-  const system=buildSystemPrompt({mode:plan.mode,plan,toolInstructions,workspaceName:deps.workspaceName,workspaceMap,retrievedContext:retrieved,projectContextDigest,lastUserText:lastUserText,freshInfoRequest:freshInfo});
+  const customizationsPrompt=deps.getCustomizationsPrompt?.();
+  const system=buildSystemPrompt({mode:plan.mode,plan,toolInstructions,workspaceName:deps.workspaceName,workspaceMap,retrievedContext:retrieved,projectContextDigest,lastUserText:lastUserText,freshInfoRequest:freshInfo,customizationsPrompt});
   const systemMsg:LLMMessage={role:"system",content:system};
   const budgetTokens=Math.max(512, plan.numCtx - 1000); // reserve 1000 for output per §4
   const nativeTools=plan.toolProtocol==="native"&&specs.length?toNativeTools(specs):undefined;

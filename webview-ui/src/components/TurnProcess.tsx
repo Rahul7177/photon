@@ -110,6 +110,10 @@ export const TurnProcess = memo(function TurnProcess({
           <span className="turn-process-icon err" aria-hidden="true">
             <AlertTriangleIcon />
           </span>
+        ) : summary.state === "partial" ? (
+          <span className="turn-process-icon warn" aria-hidden="true">
+            <AlertTriangleIcon />
+          </span>
         ) : summary.state === "cancelled" ? (
           <span className="turn-process-icon cancelled" aria-hidden="true">
             <StopSquareIcon />
@@ -186,9 +190,10 @@ export function computeSummary(
 ): {
   text: string;
   badge: string;
-  state: "running" | "error" | "cancelled" | "done";
+  state: "running" | "error" | "partial" | "cancelled" | "done";
 } {
   const toolCount = toolCalls.length;
+  const doneCount = toolCalls.filter((c) => c.status === "done").length;
   const errorCount = toolCalls.filter((c) => c.status === "error").length;
   const deniedCount = toolCalls.filter((c) => c.status === "denied").length;
   const runningTool = toolCalls.find((c) => c.status === "running");
@@ -196,7 +201,6 @@ export function computeSummary(
 
   if (isStreaming && (runningTool || !hasContent)) {
     if (runningTool) {
-      const doneCount = toolCalls.filter((c) => c.status === "done").length;
       const isVerifying = runningTool.name === "get_diagnostics";
       return {
         text: isVerifying
@@ -236,10 +240,11 @@ export function computeSummary(
   if (toolCount > 0) {
     if (errorCount > 0) {
       const toolStr = `${toolCount} tool${toolCount === 1 ? "" : "s"} (${errorCount} failed)`;
+      const recovered = doneCount > 0;
       return {
         text: timeStr ? `${toolStr} · ${timeStr}` : toolStr,
-        badge: "Failed",
-        state: "error",
+        badge: recovered ? "Recovered" : "Failed",
+        state: recovered ? "partial" : "error",
       };
     }
     const verified = toolCalls.some((c) => c.name === "get_diagnostics" && c.status === "done");

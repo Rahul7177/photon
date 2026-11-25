@@ -7,6 +7,8 @@ import { Composer } from "./components/Composer";
 import { Hero } from "./components/Hero";
 import { LocalProviderHub } from "./components/LocalProviderHub";
 import { SettingsPanel } from "./components/SettingsPanel";
+import type { CustomizationSection } from "./components/CustomizationsTab";
+import { CUSTOMIZATIONS_ENABLED } from "../../src/shared/features";
 import { Approval } from "./components/Approval";
 import { TerminalTaskBanner } from "./components/TerminalTaskBanner";
 import { StatusIndicator } from "./components/StatusIndicator";
@@ -74,9 +76,15 @@ function collectDroppedPaths(dt: DataTransfer): string[] {
 export function App() {
   const { state, dispatch, actions } = useAppState();
   const [showSettings, setShowSettings] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<"general" | "tools" | "models" | "providers" | "advanced">("general");
-  const openSettings = (tab?: "general" | "tools" | "models" | "providers" | "advanced") => {
-    if (tab) setSettingsTab(tab);
+  const [settingsTab, setSettingsTab] = useState<"general" | "tools" | "models" | "providers" | "customizations" | "advanced">("general");
+  const [customSection, setCustomSection] = useState<CustomizationSection>("mcp");
+  const openSettings = (
+    tab?: "general" | "tools" | "models" | "providers" | "customizations" | "advanced",
+    section?: CustomizationSection
+  ) => {
+    const safeTab = !CUSTOMIZATIONS_ENABLED && tab === "customizations" ? "general" : tab;
+    if (safeTab) setSettingsTab(safeTab);
+    if (CUSTOMIZATIONS_ENABLED && section) setCustomSection(section);
     setShowSettings(true);
   };
   const [showContextModal, setShowContextModal] = useState(false);
@@ -182,6 +190,7 @@ export function App() {
           state={state}
           actions={actions}
           initialTab={settingsTab}
+          initialCustomizationSection={customSection}
           onClose={() => setShowSettings(false)}
         />
       ) : (
@@ -220,6 +229,7 @@ export function App() {
             setAttachError={setAttachError}
             addFiles={addFiles}
             onOpenHardwareModal={() => setShowHardwareModal(true)}
+            onOpenCustomizations={CUSTOMIZATIONS_ENABLED ? (section) => openSettings("customizations", section) : undefined}
             onContextWarn={setCtxWarn}
           />
         </>
