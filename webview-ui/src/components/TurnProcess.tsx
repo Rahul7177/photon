@@ -17,12 +17,16 @@ export const TurnProcess = memo(function TurnProcess({
   actions,
   isStreaming,
   hasContent,
+  isCompacting,
+  statusDetail,
 }: {
   messages: ChatMessage[];
   pendingApproval?: ToolCall | null;
   actions?: Actions;
   isStreaming: boolean;
   hasContent: boolean;
+  isCompacting?: boolean;
+  statusDetail?: string | null;
 }) {
   const allToolCalls: ToolCall[] = [];
   const thinkingMessages: ChatMessage[] = [];
@@ -43,8 +47,10 @@ export const TurnProcess = memo(function TurnProcess({
   const hasToolCalls = allToolCalls.length > 0;
   const hasThinking = thinkingMessages.length > 0;
 
+  const activelyCompacting = Boolean(isCompacting || /compact/i.test(statusDetail || ""));
+
   // Nothing to abstract
-  if (!hasToolCalls && !hasThinking) return null;
+  if (!hasToolCalls && !hasThinking && !activelyCompacting) return null;
 
   // Only auto-expand while actively streaming initial thinking/tool steps before text output.
   // Never auto-expand on tool approval — approval belongs solely in the dedicated bottom card.
@@ -63,8 +69,8 @@ export const TurnProcess = memo(function TurnProcess({
     }
   }, [hasContent, isStreaming, open]);
 
-  // If there are NO tool calls and only 1 thinking message, use standard ThinkingBlock
-  if (!hasToolCalls && thinkingMessages.length === 1) {
+  // If there are NO tool calls and only 1 thinking message (and not compacting), use standard ThinkingBlock
+  if (!hasToolCalls && thinkingMessages.length === 1 && !activelyCompacting) {
     const single = thinkingMessages[0];
     const live = isStreaming && !hasContent;
     return (
@@ -81,7 +87,8 @@ export const TurnProcess = memo(function TurnProcess({
     totalThinkingMs,
     isStreaming,
     hasContent,
-    wasCancelled
+    wasCancelled,
+    activelyCompacting
   );
 
   const handleToggle = () => {
@@ -186,7 +193,8 @@ export function computeSummary(
   totalThinkingMs: number,
   isStreaming: boolean,
   hasContent: boolean,
-  wasCancelled: boolean
+  wasCancelled: boolean,
+  isCompacting = false
 ): {
   text: string;
   badge: string;
@@ -198,6 +206,14 @@ export function computeSummary(
   const deniedCount = toolCalls.filter((c) => c.status === "denied").length;
   const runningTool = toolCalls.find((c) => c.status === "running");
   const timeStr = totalThinkingMs > 0 ? `Thought for ${formatElapsed(totalThinkingMs)}` : "";
+
+  if (isStreaming && isCompacting) {
+    return {
+      text: "Compacting context window…",
+      badge: "Compacting",
+      state: "running",
+    };
+  }
 
   if (isStreaming && (runningTool || !hasContent)) {
     if (runningTool) {

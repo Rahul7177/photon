@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   CloudUsageTracker,
+  computeCacheHitRate,
   estimateCloudCost,
   getModelPricing,
 } from "../../src/core/telemetry/cloudUsage";
@@ -142,6 +143,39 @@ describe("Telemetry & Live Hardware Monitoring", () => {
       assert.equal(resetSummary.totalInputTokens, 0);
       assert.equal(resetSummary.totalEstimatedCostUsd, 0);
       assert.equal(resetSummary.byModel.length, 0);
+      assert.equal(resetSummary.sessionCacheHitPct, 0);
+      assert.equal(resetSummary.totalCacheHitPct, 0);
+    });
+
+    it("computes session, total, and per-model cache hit rates accurately", () => {
+      assert.equal(computeCacheHitRate(0, 100), 0);
+      assert.equal(computeCacheHitRate(1000, 750), 75);
+      assert.equal(computeCacheHitRate(1000, 1500), 100);
+
+      const tracker = new CloudUsageTracker();
+      tracker.recordStep({
+        model: "claude-sonnet-4",
+        inputTokens: 2000,
+        outputTokens: 200,
+        cachedTokens: 1500,
+        savedTokens: 1500,
+      });
+      tracker.recordStep({
+        model: "gpt-4o",
+        inputTokens: 1000,
+        outputTokens: 100,
+        cachedTokens: 250,
+        savedTokens: 250,
+      });
+
+      const summary = tracker.getSummary();
+      // 1750 / 3000 = 58.3%
+      assert.equal(summary.sessionCacheHitPct, 58.3);
+      assert.equal(summary.totalCacheHitPct, 58.3);
+      const claude = summary.byModel.find((m) => m.model === "claude-sonnet-4");
+      const gpt = summary.byModel.find((m) => m.model === "gpt-4o");
+      assert.equal(claude?.cacheHitPct, 75);
+      assert.equal(gpt?.cacheHitPct, 25);
     });
   });
 

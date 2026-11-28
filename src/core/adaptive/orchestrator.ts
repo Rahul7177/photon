@@ -1,9 +1,24 @@
-import type { AdaptivePlan, BenchResult, IntelligenceLevel, IntelligenceSetting, MachineProfile, Mode, ModelInfo, ModelTier, TaskAnalysis } from "../../shared/types";
+import type {
+  AdaptivePlan,
+  BenchResult,
+  IntelligenceLevel,
+  IntelligenceSetting,
+  MachineProfile,
+  Mode,
+  ModelCapabilityProfile,
+  ModelInfo,
+  ModelTier,
+  ScaffoldProfile,
+  SessionTaskContext,
+  TaskAnalysis,
+} from "../../shared/types";
 import { analyzeTask, buildExecutionPolicy, buildVerificationPlan, capabilityForModel, isFreshInfoRequest, shouldUseNativeToolProtocol } from "../intelligence/policy";
 import { bytesPerParamForQuant, normalizeQuantization } from "./modelAdvisor";
+import { passportNativeUnreliable, suggestedInitialRung, type PassportEntry } from "./passport";
 
-export interface OrchestratorInput{model:ModelInfo;machine:MachineProfile|null;mode:Mode;prompt?:string;userNumCtx?:number;intelligence:IntelligenceSetting;reserveOutputTokens:number;adaptiveEnabled:boolean;cloudNativeTools?:boolean;task?:TaskAnalysis;bench?:BenchResult;sampling?:{temp?:number;topP?:number;seed?:number};}
-interface LevelProfile{maxTools:number;allowParallelTools:boolean;outputCap:number;chatTemp:number;taskTemp:number;}
+export interface OrchestratorInput{model:ModelInfo;machine:MachineProfile|null;mode:Mode;prompt?:string;userNumCtx?:number;intelligence:IntelligenceSetting;reserveOutputTokens:number;adaptiveEnabled:boolean;cloudNativeTools?:boolean;scaffoldOptimizations?:boolean;/** Capability Passport entry for this model (live reliability learned on-device). */passport?:PassportEntry;/** User froze runtime adaptivity (ignore passport, governor observes only). */freezeAdaptivity?:boolean;task?:TaskAnalysis;sessionTaskContext?:SessionTaskContext;bench?:BenchResult;sampling?:{temp?:number;topP?:number;seed?:number};}
+interface LevelProfile{outputCap:number;chatTemp:number;taskTemp:number;}
+const MAX_PLAN_TOOLS = 40;
 // High non-blocking safety ceilings so complex tasks finish naturally; duplicate-call and runaway guards prevent spin loops.
 const MODE_CAPS:Record<Mode,number>={chat:100,plan:150,agent:200};
 /**
@@ -19,12 +34,121 @@ const MODE_CAPS:Record<Mode,number>={chat:100,plan:150,agent:200};
  *  - `low`: Minimal/Autonomous overhead for large self-sufficient models.
  */
 const LEVELS:Record<IntelligenceLevel,LevelProfile>={
-  low:{maxTools:40,allowParallelTools:false,outputCap:2048,chatTemp:.25,taskTemp:.15},
-  medium:{maxTools:40,allowParallelTools:false,outputCap:3072,chatTemp:.25,taskTemp:.15},
-  high:{maxTools:40,allowParallelTools:false,outputCap:4096,chatTemp:.2,taskTemp:.1},
-  max:{maxTools:40,allowParallelTools:false,outputCap:4096,chatTemp:.15,taskTemp:.1},
+  low:{outputCap:2048,chatTemp:.25,taskTemp:.15},
+  medium:{outputCap:3072,chatTemp:.25,taskTemp:.15},
+  high:{outputCap:4096,chatTemp:.2,taskTemp:.1},
+  max:{outputCap:4096,chatTemp:.15,taskTemp:.1},
+};
+const LEGACY_BUDGET_FRACTION: Record<IntelligenceLevel, number> = { low: 0.2, medium: 0.26, high: 0.34, max: 0.42 };
+const PROMPT_BUDGET_CLAMPS: Record<IntelligenceLevel, { frac: number; minTokens: number; maxTokens: number }> = {
+  low: { frac: 0.2, minTokens: 800, maxTokens: 2800 },
+  medium: { frac: 0.26, minTokens: 1400, maxTokens: 3600 },
+  high: { frac: 0.34, minTokens: 1900, maxTokens: 4600 },
+  max: { frac: 0.42, minTokens: 2400, maxTokens: 5600 },
+};
+const SPLIT_SAMPLING: Record<IntelligenceLevel, { toolTurnTemp: number; answerTurnTemp: number }> = {
+  max: { toolTurnTemp: 0.05, answerTurnTemp: 0.2 },
+  high: { toolTurnTemp: 0.08, answerTurnTemp: 0.2 },
+  medium: { toolTurnTemp: 0.1, answerTurnTemp: 0.25 },
+  low: { toolTurnTemp: 0.12, answerTurnTemp: 0.25 },
+};
+const NUDGE_POLICY_BY_PRESET: Record<IntelligenceLevel, { continue: number; finalAnswer: number; truncation: number }> = {
+  max: { continue: 5, finalAnswer: 2, truncation: 2 },
+  high: { continue: 4, finalAnswer: 2, truncation: 2 },
+  medium: { continue: 3, finalAnswer: 2, truncation: 2 },
+  low: { continue: 2, finalAnswer: 1, truncation: 1 },
 };
 const TIER_RANK:Record<ModelTier,number>={tiny:0,small:1,medium:2,large:3};
+
+/** Derive the multi-dimensional ScaffoldProfile vector from tier, capabilities, task, and preset. */
+export function deriveScaffoldProfile(
+  tier: ModelTier,
+  capabilities: ModelCapabilityProfile,
+  task: TaskAnalysis,
+  mode: Mode,
+  numCtx: number,
+  preset: IntelligenceLevel,
+  options?: { legacyMode?: boolean; modelThinking?: boolean }
+): ScaffoldProfile {
+  const ruleVerbosity: ScaffoldProfile["ruleVerbosity"] =
+    preset === "max" || preset === "high" ? "guided" : preset === "medium" ? "standard" : "terse";
+
+  if (options?.legacyMode) {
+    const legacyTemp = mode === "chat" ? LEVELS[preset].chatTemp : LEVELS[preset].taskTemp;
+    return {
+      preset,
+      ruleVerbosity,
+      toolCards: "full",
+      shortlistSize: MAX_PLAN_TOOLS,
+      examples: "phase",
+      stateCard: "off",
+      hostVerify: "off",
+      hostOrient: false,
+      promptBudget: {
+        frac: LEGACY_BUDGET_FRACTION[preset],
+        minTokens: 512,
+        maxTokens: Math.max(512, numCtx),
+      },
+      sampling: { toolTurnTemp: legacyTemp, answerTurnTemp: legacyTemp },
+      thinking: task.reasoning === "high" ? "high" : task.reasoning === "medium" ? "medium" : "low",
+      nudgePolicy: { continue: 5, finalAnswer: 2, truncation: 2 },
+    };
+  }
+
+  const toolCards: ScaffoldProfile["toolCards"] =
+    tier === "large" && preset === "low" ? "names_only" : "shortlist";
+  const shortlistSize = toolCards === "names_only" ? 0 : mode === "agent" ? 5 : 4;
+  const examples: ScaffoldProfile["examples"] =
+    preset === "low"
+      ? "none"
+      : tier === "tiny" || tier === "small" || capabilities.toolCalling < 0.78
+        ? "phase+failing"
+        : "phase";
+
+  let stateCard: ScaffoldProfile["stateCard"] = "off";
+  if (mode !== "chat" && !(task.readOnly && task.scope === "single_file" && task.estimatedSteps <= 2)) {
+    if (tier === "tiny" && (mode === "agent" || task.scope !== "single_file" || task.estimatedSteps >= 3)) {
+      stateCard = "rich";
+    } else if (tier === "small" && (mode === "agent" || task.scope !== "single_file")) {
+      stateCard = "compact";
+    } else if (tier === "medium" && mode === "agent" && (task.scope !== "single_file" || task.reasoning === "high")) {
+      stateCard = "compact";
+    }
+  }
+
+  const hostVerify: ScaffoldProfile["hostVerify"] =
+    mode === "agent" && !task.readOnly
+      ? task.verification.includes("tests")
+        ? "diagnostics+tests"
+        : "diagnostics"
+      : "off";
+
+  let thinking: ScaffoldProfile["thinking"];
+  if (tier === "tiny") {
+    thinking = task.reasoning === "high" ? "low" : "off";
+  } else if (tier === "small") {
+    thinking = task.reasoning === "high" ? "medium" : task.reasoning === "medium" ? "low" : "off";
+  } else if (tier === "medium") {
+    thinking = task.reasoning === "high" ? "high" : task.reasoning === "medium" ? "medium" : "low";
+  } else {
+    thinking = task.reasoning === "high" ? "high" : "medium";
+  }
+
+  return {
+    preset,
+    ruleVerbosity,
+    toolCards,
+    shortlistSize,
+    examples,
+    stateCard,
+    hostVerify,
+    hostOrient: false,
+    promptBudget: { ...PROMPT_BUDGET_CLAMPS[preset] },
+    sampling: { ...SPLIT_SAMPLING[preset] },
+    thinking,
+    nudgePolicy: { ...NUDGE_POLICY_BY_PRESET[preset] },
+  };
+}
 
 /** Standard context window presets selectable by the user or auto-planner. */
 export const CONTEXT_WINDOW_BUCKETS = [8192, 16384, 32768, 65536, 131072, 262144] as const;
@@ -33,8 +157,10 @@ export function buildPlan(input:OrchestratorInput):AdaptivePlan{
   const {model,machine,mode,reserveOutputTokens,adaptiveEnabled}=input;
   const rationale:string[]=[];
   const tier=model.tier??"small";
-  const task=input.task??analyzeTask(input.prompt??"",mode);
-  const capabilities=capabilityForModel(model,input.bench);
+  const task=input.task??analyzeTask(input.prompt??"",mode,0,input.sessionTaskContext);
+  const frozen=input.freezeAdaptivity===true;
+  const livePassport=frozen?undefined:input.passport;
+  const capabilities=capabilityForModel(model,input.bench,livePassport);
   const auto=adaptiveEnabled&&input.intelligence==="auto";
   const level:IntelligenceLevel=auto
     ? deriveScaffoldingLevel(tier,capabilities,task)
@@ -55,6 +181,7 @@ export function buildPlan(input:OrchestratorInput):AdaptivePlan{
     rationale.push(`Adaptive Assistance: ${level} (pinned by user) — ${scaffoldingLabel[level]}.`);
   }
   rationale.push(`Task: ${task.scope}, reasoning=${task.reasoning}, risk=${task.risk}, verification=${task.verification.join(",")||"none"}.`);
+  if(task.carriedForward)rationale.push("Session continuity: carried forward prior task scope and verification requirements.");
   if(isFreshInfoRequest(input.prompt??""))rationale.push("Fresh-data request detected; web-capable tools are prioritized and grounded synthesis is enforced.");
 
   const ctxSelection=computeOptimalContextWindow(model,machine,adaptiveEnabled);
@@ -76,6 +203,10 @@ export function buildPlan(input:OrchestratorInput):AdaptivePlan{
   const nativeEligible=shouldUseNativeToolProtocol(model,capabilities,input.bench,level);
   let toolProtocol:AdaptivePlan["toolProtocol"]="photon-block";
   if(nativeEligible&&(isCloud?(input.cloudNativeTools??true):true))toolProtocol="native";
+  if(toolProtocol==="native"&&!isCloud&&passportNativeUnreliable(livePassport)){
+    toolProtocol="photon-block";
+    rationale.push("Capability Passport: native tool calling repeatedly fell back on this device; using the Photon block protocol.");
+  }
   if(toolProtocol==="native"){
     rationale.push("Protocol: Native tool calling with structured result-framing & anti-hallucination guidance.");
   }else{
@@ -85,7 +216,7 @@ export function buildPlan(input:OrchestratorInput):AdaptivePlan{
   // Spec §5: hard iteration caps per user turn — enforce, not just suggest
   const hardCap=MODE_CAPS[mode];
   // Never starve small models of tools; cap only by mode or total available tools
-  const maxTools=profile.maxTools;
+  const maxTools=MAX_PLAN_TOOLS;
   // Lower temperature for smaller models / high-scaffolding turns reduces tool & fact hallucination
   const defaultTemp=mode==="chat"?profile.chatTemp:profile.taskTemp;
   const temperature=(typeof input.sampling?.temp==="number"&&Number.isFinite(input.sampling.temp))
@@ -98,13 +229,20 @@ export function buildPlan(input:OrchestratorInput):AdaptivePlan{
     ? Math.floor(input.sampling.seed)
     : undefined;
   const policy=buildExecutionPolicy(task,capabilities,hardCap,maxTools)!;
-  policy.maxConcurrent=task.risk==="destructive"?1:1;
   policy.stepBudget=hardCap;
+  const allowParallelTools = policy.maxConcurrent > 1 && policy.allowParallelReads && toolProtocol === "native";
   const effectiveOutputReserve=Math.max(256,Math.min(reserveOutputTokens,Math.floor(numCtx*.5)));
   const contextBudget=Math.max(256,numCtx-effectiveOutputReserve);
   const maxOutputTokens=Math.max(256,Math.min(contextBudget,Math.floor(numCtx*.5),profile.outputCap,effectiveOutputReserve));
   policy.generationBudgetTokens=Math.min(policy.generationBudgetTokens,maxOutputTokens);
   const verification=buildVerificationPlan(task);
+
+  const scaffoldOptimizations=input.scaffoldOptimizations!==false;
+  const samplingOverridden=Boolean(input.sampling&&typeof input.sampling.temp==="number"&&Number.isFinite(input.sampling.temp));
+  const scaffoldProfile=deriveScaffoldProfile(tier,capabilities,task,mode,numCtx,level,{legacyMode:!scaffoldOptimizations,modelThinking:model.thinking});
+  const initialRung=scaffoldOptimizations&&!frozen?suggestedInitialRung(livePassport):0;
+  if(initialRung>0)rationale.push(`Capability Passport: this model needed extra help on earlier turns; starting at governor rung ${initialRung}.`);
+  if(frozen)rationale.push("Adaptivity frozen by user: governor observes only (no rung, protocol or host actions).");
 
   if(model.vision)rationale.push(`${model.name} accepts images.`);
   if(model.thinking)rationale.push(`${model.name} exposes native thinking/reasoning capability; Photon will bound it per task.`);
@@ -112,9 +250,14 @@ export function buildPlan(input:OrchestratorInput):AdaptivePlan{
   if(input.sampling && (input.sampling.temp!==undefined||input.sampling.topP!==undefined||input.sampling.seed!==undefined)){
     rationale.push(`Per-model sampling override applied: temp=${temperature}, topP=${topP}${seed!==undefined?`, seed=${seed}`:""}.`);
   }
+  rationale.push(
+    scaffoldOptimizations
+      ? `Scaffold profile: cards=${scaffoldProfile.toolCards}(${scaffoldProfile.shortlistSize}), stateCard=${scaffoldProfile.stateCard}, thinking=${scaffoldProfile.thinking}, temp(tool=${scaffoldProfile.sampling.toolTurnTemp}, answer=${scaffoldProfile.sampling.answerTurnTemp}).`
+      : "Scaffold optimizations disabled (legacy full-card prompt)."
+  );
   rationale.push(`Execution: temp=${temperature}, generationBudget=${policy.generationBudgetTokens} tok, stepBudget=${policy.stepBudget}.`);
 
-  return{model:model.name,mode,contextWindow:numCtx,numCtx,temperature,topP,...(seed!==undefined?{seed}:{}),maxOutputTokens,toolProtocol,maxTools,allowParallelTools:false,intelligence:level,intelligenceAuto:auto,rationale,task,modelCapabilities:capabilities,executionPolicy:policy,verification};
+  return{model:model.name,mode,contextWindow:numCtx,numCtx,temperature,topP,...(seed!==undefined?{seed}:{}),maxOutputTokens,toolProtocol,maxTools,allowParallelTools,intelligence:level,intelligenceAuto:auto,rationale,task,modelCapabilities:capabilities,executionPolicy:policy,verification,scaffoldProfile,scaffoldOptimizations,...(samplingOverridden?{samplingOverridden:true}:{}),...(initialRung>0?{initialRung}:{}),...(frozen?{adaptivityFrozen:true}:{})};
 }
 
 /**

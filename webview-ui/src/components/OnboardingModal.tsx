@@ -94,7 +94,6 @@ export function OnboardingModal({
     setIsScanning(true);
     actions.detectProviders();
     actions.refreshModels();
-    actions.requestRecommendations(state.recommendations?.goal ?? "coding");
     setTimeout(() => setIsScanning(false), 900);
   };
 
@@ -120,6 +119,20 @@ export function OnboardingModal({
     () => (state.recommendations?.evaluatedInstalled ?? []).find((e) => e.recommended),
     [state.recommendations]
   );
+
+  // When entering the Local Setup step and local models are already installed,
+  // auto-select the best installed local model if none is currently selected.
+  useEffect(() => {
+    if (step !== "local" || sortedLocalInstalled.length === 0) return;
+    const hasLocalSelected =
+      state.selectedModel && sortedLocalInstalled.some((m) => m.name === state.selectedModel);
+    if (!hasLocalSelected) {
+      const target = bestInstalledEval?.name ?? sortedLocalInstalled[0].name;
+      if (target) {
+        actions.setModel(target);
+      }
+    }
+  }, [step, sortedLocalInstalled, bestInstalledEval, state.selectedModel, actions]);
 
   const anyLocalRuntimePresent = useMemo(
     () =>
@@ -216,6 +229,9 @@ export function OnboardingModal({
     const trimmed = apiKeyInput.trim();
     if (!trimmed) return;
     actions.setProviderApiKey(selectedProviderId, trimmed);
+    if (state.config.interfaceMode !== "cloud") {
+      actions.setInterfaceMode("cloud");
+    }
     setApiKeyInput("");
   };
 
@@ -258,6 +274,17 @@ export function OnboardingModal({
     actions.setModel(modelName);
   };
 
+  const handleFinishOrSkipOnboarding = () => {
+    if (
+      state.config.interfaceMode === "cloud" &&
+      !providers.some((p) => p.configured) &&
+      localInstalled.length > 0
+    ) {
+      actions.setInterfaceMode("local");
+    }
+    actions.completeOnboarding();
+  };
+
   const hwLabel = state.machine
     ? `${
         state.machine.gpu
@@ -289,7 +316,7 @@ export function OnboardingModal({
             <button
               type="button"
               className="btn btn-sm ghost onboarding-skip-top"
-              onClick={() => actions.completeOnboarding()}
+              onClick={handleFinishOrSkipOnboarding}
               title="Skip setup and go straight to the workspace"
             >
               <span>Skip</span>
@@ -328,7 +355,7 @@ export function OnboardingModal({
           {step === "choose" && (
             <div className="onboarding-choose-view">
               <p className="onboarding-lead">
-                How would you like to power Photon? You can switch between Local and Cloud engines anytime from the header.
+                How would you like to power Photon? You can switch between Local and Cloud engines anytime from the composer bar.
               </p>
 
               <div className="onboarding-mode-cards">
@@ -373,7 +400,9 @@ export function OnboardingModal({
                   type="button"
                   className="onboarding-mode-card"
                   onClick={() => {
-                    actions.setInterfaceMode("cloud");
+                    if (providers.some((p) => p.configured)) {
+                      actions.setInterfaceMode("cloud");
+                    }
                     setStep("cloud");
                   }}
                 >
@@ -446,7 +475,12 @@ export function OnboardingModal({
                         }`}
                       >
                         <div className="onboarding-runtime-top">
-                          <span className="onboarding-runtime-name">{r.label}</span>
+                          <span className="onboarding-runtime-title">
+                            <span className="onboarding-runtime-logo" aria-hidden="true">
+                              <ProviderLogo providerId={r.id} label={r.label} baseUrl={r.baseUrl} size={14} />
+                            </span>
+                            <span className="onboarding-runtime-name">{r.label}</span>
+                          </span>
                           <span
                             className={`hub-badge ${
                               isRunning ? "ok" : isStopped || isStarting ? "warn" : isConflict ? "error" : "faint"
@@ -1116,14 +1150,14 @@ export function OnboardingModal({
             <button
               type="button"
               className="btn btn-sm ghost"
-              onClick={() => actions.completeOnboarding()}
+              onClick={handleFinishOrSkipOnboarding}
             >
               Skip
             </button>
             <button
               type="button"
               className="btn btn-sm primary onboarding-finish-btn"
-              onClick={() => actions.completeOnboarding()}
+              onClick={handleFinishOrSkipOnboarding}
             >
               <CheckIcon size={12} />
               <span>{state.selectedModel ? "Start Coding" : "Finish Setup"}</span>

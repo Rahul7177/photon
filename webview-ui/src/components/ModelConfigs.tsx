@@ -7,6 +7,7 @@ import {
 } from "../../../src/shared/types";
 import type { Actions, AppState } from "../state/store";
 import { ChevronRightIcon } from "./Icons";
+import { HelpTip } from "./HelpTip";
 
 export interface ModelConfigEntry {
   name: string;
@@ -320,8 +321,11 @@ function ModelEditor({
       )}
 
       <label className="custom-endpoint-field">
-        <span>
-          Context window override — empty/0 = auto ({isLocal ? "hardware-fit / default" : "model native"})
+        <span className="field-label-with-help">
+          <span>
+            Context window ({isLocal ? "0 = auto hardware fit" : "0 = model native"})
+          </span>
+          <HelpTip text="Maximum tokens of conversation and file content this model can read at once. Leave empty or 0 for automatic sizing." />
         </span>
         <input
           type="number"
@@ -334,7 +338,10 @@ function ModelEditor({
 
       <div className="model-config-grid-3">
         <label className="custom-endpoint-field">
-          <span>Temp (0–2)</span>
+          <span className="field-label-with-help">
+            <span>Temp (0–2)</span>
+            <HelpTip text="Controls randomness. Lower (0.1–0.3) is more focused and accurate for coding; higher (0.7+) is more creative." />
+          </span>
           <input
             type="number"
             step="0.05"
@@ -346,7 +353,10 @@ function ModelEditor({
           />
         </label>
         <label className="custom-endpoint-field">
-          <span>Top P (0–1)</span>
+          <span className="field-label-with-help">
+            <span>Top P (0–1)</span>
+            <HelpTip text="Limits word choices to the most likely options. Leave on auto unless fine-tuning generation." />
+          </span>
           <input
             type="number"
             step="0.05"
@@ -358,7 +368,10 @@ function ModelEditor({
           />
         </label>
         <label className="custom-endpoint-field">
-          <span>Seed</span>
+          <span className="field-label-with-help">
+            <span>Seed</span>
+            <HelpTip text="Fixed random number so the model gives repeatable answers for the same prompt." />
+          </span>
           <input
             type="number"
             min={0}
@@ -373,7 +386,10 @@ function ModelEditor({
         <>
           <div className="model-config-grid">
             <label className="custom-endpoint-field">
-              <span>-ngl (GPU layers, &quot;all&quot; or 0..N)</span>
+              <span className="field-label-with-help">
+                <span>GPU layers (-ngl)</span>
+                <HelpTip text="How many model layers run on your GPU. Use 'all' for maximum speed, or lower it if you run out of VRAM." />
+              </span>
               <input
                 placeholder="all"
                 value={nglStr}
@@ -381,7 +397,10 @@ function ModelEditor({
               />
             </label>
             <label className="custom-endpoint-field">
-              <span>-np (parallel slots)</span>
+              <span className="field-label-with-help">
+                <span>Parallel slots (-np)</span>
+                <HelpTip text="Simultaneous requests llama-server can handle. Keep at 1 to save VRAM." />
+              </span>
               <input
                 type="number"
                 min={1}
@@ -398,7 +417,10 @@ function ModelEditor({
           </div>
           <div className="model-config-grid">
             <label className="custom-endpoint-field">
-              <span>--fit</span>
+              <span className="field-label-with-help">
+                <span>Auto-fit VRAM (--fit)</span>
+                <HelpTip text="Automatically adjusts GPU layers and context size so the model fits in your available VRAM." />
+              </span>
               <select
                 value={lc.fit === undefined ? "" : lc.fit ? "on" : "off"}
                 onChange={(e) =>
@@ -414,7 +436,10 @@ function ModelEditor({
               </select>
             </label>
             <label className="custom-endpoint-field">
-              <span>-fa (flash attn)</span>
+              <span className="field-label-with-help">
+                <span>Flash Attention (-fa)</span>
+                <HelpTip text="Speeds up generation and reduces memory usage on supported GPUs." />
+              </span>
               <select
                 value={lc.fa === undefined ? "" : lc.fa ? "on" : "off"}
                 onChange={(e) =>
@@ -432,7 +457,10 @@ function ModelEditor({
           </div>
           <div className="model-config-grid">
             <label className="custom-endpoint-field">
-              <span>-ctk (cache K, e.g. q8_0)</span>
+              <span className="field-label-with-help">
+                <span>Cache K quant (-ctk)</span>
+                <HelpTip text="Compresses the K memory cache (e.g. q8_0 or q4_0) to fit larger context windows in less VRAM." />
+              </span>
               <input
                 placeholder="q8_0"
                 value={lc.ctk ?? ""}
@@ -440,7 +468,10 @@ function ModelEditor({
               />
             </label>
             <label className="custom-endpoint-field">
-              <span>-ctv (cache V)</span>
+              <span className="field-label-with-help">
+                <span>Cache V quant (-ctv)</span>
+                <HelpTip text="Compresses the V memory cache (e.g. q8_0 or q4_0) to save additional VRAM on long chats." />
+              </span>
               <input
                 placeholder="q8_0"
                 value={lc.ctv ?? ""}
@@ -449,7 +480,10 @@ function ModelEditor({
             </label>
           </div>
           <label className="custom-endpoint-field">
-            <span>Extra args</span>
+            <span className="field-label-with-help">
+              <span>Extra launch flags</span>
+              <HelpTip text="Additional command-line arguments passed directly to llama-server when launching this model." />
+            </span>
             <input
               placeholder="e.g. --jinja --reasoning-format deepseek"
               value={lc.extraArgs ?? ""}
@@ -484,7 +518,10 @@ function ModelEditor({
         </>
       )}
       <label className="custom-endpoint-field">
-        <span>Note</span>
+        <span className="field-label-with-help">
+          <span>Note</span>
+          <HelpTip text="Optional personal label or reminder shown next to this model." />
+        </span>
         <input
           placeholder="e.g. Low temp for strict edits"
           value={note}

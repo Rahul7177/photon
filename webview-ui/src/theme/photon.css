@@ -3702,11 +3702,12 @@ select option:focus,
 }
 
 .settings-tab:hover {
-  color: var(--text-dim);
+  color: var(--text);
 }
 
-.settings-tab.active {
-  color: #FFFFFF;
+.settings-tab.active,
+.settings-tab.active:hover {
+  color: #FFFFFF !important;
   border-bottom-color: #FFFFFF;
 }
 
@@ -6834,19 +6835,15 @@ select option:focus,
   color: var(--text-dim);
 }
 
-.ctx-header-btn.handoff-ready {
-  color: var(--amber);
-  border-color: rgba(255, 179, 71, 0.35);
-}
-
 .ctx-handoff-dot {
   position: absolute;
-  top: 3px;
-  right: 3px;
-  width: 5px;
-  height: 5px;
+  top: 4px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
   background: var(--amber);
+  box-shadow: 0 0 0 1.5px var(--space-900);
 }
 
 /* ==========================================================================
@@ -8529,6 +8526,26 @@ select option:focus,
   gap: 8px;
 }
 
+.sensed-runtime-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sensed-runtime-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  color: var(--text);
+  flex-shrink: 0;
+}
+
 .sensed-runtime-name {
   font-weight: 600;
   font-size: 12.5px;
@@ -8607,14 +8624,15 @@ select option:focus,
   flex-wrap: wrap;
 }
 
-/* Universal guard: active pills use theme polarity contrast cleanly on hover */
-button.active:hover,
-.active button:hover,
+/* Universal guard: active filled pills use theme polarity contrast cleanly on hover
+   (exclude underline tabs, subtle cards, and icon buttons so their active text stays legible) */
 .btn.primary:hover,
 .btn-accent:hover,
 .switch.on:hover,
 .hero-card.active .hero-card-pill:hover,
 .preset-chip.active:hover,
+.category-pill.active:hover,
+.custom-scope-btn.active:hover,
 .ctx-tab.active:hover,
 .iface-toggle button.active:hover,
 .hero-tab-btn.active:hover,
@@ -9340,6 +9358,21 @@ button.revert-file-tag {
   align-items: center;
   justify-content: space-between;
   gap: 4px;
+}
+
+.onboarding-runtime-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.onboarding-runtime-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text);
+  flex-shrink: 0;
 }
 
 .onboarding-runtime-name {
@@ -10134,8 +10167,9 @@ body[data-theme="light"] {
   background: var(--accent-pill-fg);
 }
 
-:is(body.vscode-light:not([data-theme="dark"]), body.vscode-high-contrast-light:not([data-theme="dark"]), body[data-theme="light"]) .settings-tab.active {
-  color: var(--text);
+:is(body.vscode-light:not([data-theme="dark"]), body.vscode-high-contrast-light:not([data-theme="dark"]), body[data-theme="light"]) .settings-tab.active,
+:is(body.vscode-light:not([data-theme="dark"]), body.vscode-high-contrast-light:not([data-theme="dark"]), body[data-theme="light"]) .settings-tab.active:hover {
+  color: var(--text) !important;
   border-bottom-color: var(--text);
 }
 
@@ -10782,4 +10816,193 @@ body[data-theme="light"] {
 :is(body.vscode-light:not([data-theme="dark"]), body.vscode-high-contrast-light:not([data-theme="dark"]), body[data-theme="light"]) .custom-field select,
 :is(body.vscode-light:not([data-theme="dark"]), body.vscode-high-contrast-light:not([data-theme="dark"]), body[data-theme="light"]) .custom-field textarea {
   background: var(--space-850);
+}
+
+.prompt-breakdown-strip {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.transparency-telemetry {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.transparency-telemetry-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.transparency-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 2px;
+  padding-left: 6px;
+  border-left: 2px solid var(--line);
+}
+
+.timeline-row {
+  display: flex;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-dim);
+}
+
+.timeline-step {
+  flex-shrink: 0;
+  font-family: var(--mono);
+  color: var(--text);
+}
+
+.timeline-reason {
+  color: var(--text-dim);
+  word-break: break-word;
+}
+
+.transparency-freeze-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 6px;
+  border-top: 1px dashed var(--line);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+/* ───── Settings HelpTip (? icon + hover/click popover) ───── */
+.settings-row-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-dim);
+}
+
+.field-label-with-help {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.help-tip-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+  background: var(--space-800);
+  color: var(--text-faint);
+  font-family: var(--font);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+  flex-shrink: 0;
+  transition: color 0.14s ease, border-color 0.14s ease, background 0.14s ease, transform 0.12s ease;
+}
+
+.help-tip-trigger:hover,
+.help-tip-trigger:focus-visible,
+.help-tip-trigger.active {
+  color: var(--text);
+  border-color: var(--text-dim);
+  background: var(--space-700);
+  outline: none;
+}
+
+.help-tip-trigger.pinned {
+  color: var(--accent-pill-fg);
+  background: var(--accent-pill-bg);
+  border-color: var(--accent-pill-bg);
+}
+
+.help-tip-popover {
+  position: fixed;
+  z-index: 10050;
+  background: var(--space-800);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 11.5px;
+  font-weight: 400;
+  line-height: 1.45;
+  pointer-events: auto;
+  animation: helpTipFadeIn 0.12s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.help-tip-popover.above {
+  transform: translateY(-100%);
+  animation-name: helpTipFadeInAbove;
+}
+
+.help-tip-content {
+  word-break: break-word;
+}
+
+.help-tip-arrow {
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  background: var(--space-800);
+  border-left: 1px solid var(--line-strong);
+  border-top: 1px solid var(--line-strong);
+  transform: translateX(-50%) rotate(45deg);
+}
+
+.help-tip-popover.below .help-tip-arrow {
+  top: -4.5px;
+}
+
+.help-tip-popover.above .help-tip-arrow {
+  bottom: -4.5px;
+  transform: translateX(-50%) rotate(225deg);
+}
+
+@keyframes helpTipFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes helpTipFadeInAbove {
+  from {
+    opacity: 0;
+    transform: translateY(calc(-100% + 2px));
+  }
+  to {
+    opacity: 1;
+    transform: translateY(-100%);
+  }
+}
+
+:is(body.vscode-light:not([data-theme="dark"]), body.vscode-high-contrast-light:not([data-theme="dark"]), body[data-theme="light"]) .help-tip-popover {
+  background: var(--space-900);
+  box-shadow: 0 8px 24px rgba(28, 31, 38, 0.18);
+}
+
+:is(body.vscode-light:not([data-theme="dark"]), body.vscode-high-contrast-light:not([data-theme="dark"]), body[data-theme="light"]) .help-tip-arrow {
+  background: var(--space-900);
 }

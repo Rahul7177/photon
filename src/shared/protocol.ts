@@ -43,6 +43,7 @@ import type {
   ThinkingLevel,
   TokenUsage,
   ToolCall,
+  TurnReliabilitySummary,
 } from "./types";
 
 /* ------------------------------ host -> webview ------------------------------ */
@@ -102,6 +103,7 @@ export type HostMessage =
   | { type: "openRevertModal"; payload?: { checkpoints?: CheckpointSummary[] } }
   | { type: "onboardingStatus"; payload: { show: boolean } }
   | { type: "customizations"; payload: CustomizationsSnapshot }
+  | { type: "turnTelemetry"; payload: TurnReliabilitySummary }
   | { type: "error"; payload: { message: string } };
 
 export interface CheckpointSummary {
@@ -129,6 +131,7 @@ export interface ProjectConfigStatus {
 export interface PhotonConfig {
   autoApprove: boolean;
   adaptiveEnabled: boolean;
+  adaptivityFrozen?: boolean;
   webSearchProvider: "google" | "duckduckgo" | "none";
   ollamaBaseUrl: string;
   llamacppBaseUrl: string;
@@ -207,6 +210,7 @@ export type ViewMessage =
   | { type: "setContextWindow"; payload: { numCtx: number } }
   | { type: "setAutoApprove"; payload: { enabled: boolean } }
   | { type: "setAdaptiveEnabled"; payload: { enabled: boolean } }
+  | { type: "setAdaptivityFrozen"; payload: { frozen: boolean } }
   | { type: "setIntelligence"; payload: { level: IntelligenceSetting } }
   | { type: "setWebSearchProvider"; payload: { provider: "google" | "duckduckgo" | "none" } }
   | { type: "setProviderEnabled"; payload: { id: string; enabled: boolean } }

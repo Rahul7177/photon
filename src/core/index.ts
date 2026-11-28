@@ -30,7 +30,21 @@ export {
 } from "./llm/catalogs";
 
 // --- Adaptive orchestration + Auto Mode (M8) ------------------------------
-export { buildPlan, type OrchestratorInput } from "./adaptive/orchestrator";
+export {
+  analyzeTask,
+  extractFileReferences,
+  isContinuationPrompt,
+  isFreshInfoRequest,
+  toComplexity,
+  capabilityForModel,
+  shouldUseNativeToolProtocol,
+  buildExecutionPolicy,
+  buildVerificationPlan,
+  selectToolSpecs,
+  rankTools,
+  inferStepPhase,
+} from "./intelligence/policy";
+export { buildPlan, deriveScaffoldProfile, type OrchestratorInput } from "./adaptive/orchestrator";
 export { classifyComplexity, type ComplexityInput } from "./adaptive/complexity";
 export {
   planRequest,
@@ -66,7 +80,26 @@ export {
   type TaskRecommendOptions,
   type BackgroundBenchGuardInput,
 } from "./adaptive/modelAdvisor";
-export { CloudUsageTracker, estimateCloudCost, getModelPricing, type CloudPricing } from "./telemetry/cloudUsage";
+export {
+  ReliabilityGovernor,
+  countDiagnosticErrors,
+  type GovernorAction,
+  type GovernorInit,
+} from "./adaptive/governor";
+export {
+  passportKey,
+  updatePassport,
+  passportWeight,
+  blendCapabilitiesWithPassport,
+  suggestedInitialRung,
+  passportNativeUnreliable,
+  PASSPORT_SHRINKAGE_K,
+  PASSPORT_MAX_EVIDENCE_PER_TURN,
+  type PassportEntry,
+  type PassportIdentity,
+} from "./adaptive/passport";
+export { buildStepStateCard, type StateCardInput } from "./adaptive/stateCard";
+export { CloudUsageTracker, estimateCloudCost, getModelPricing, computeCacheHitRate, type CloudPricing } from "./telemetry/cloudUsage";
 
 // --- Agent turn loop (M9 repair) ------------------------------------------
 export { AgentEngine, type EngineDeps, type TurnEmitter } from "./agent/engine";
@@ -78,7 +111,7 @@ export {
 } from "./agent/errorRecovery";
 export { runCloudTurn, cloudHistoryFromSession, normalizeCloudToolCall, type CloudEmitter, type CloudTurnInput } from "./agent/cloudEngine";
 export { cloudTools } from "./tools/cloud/cloudTools";
-export { buildCloudSystemPrompt, type CloudSystemInput } from "./prompts/cloudSystem";
+export { buildCloudSystemPrompt, buildCloudSystemPromptWithReport, type CloudSystemInput } from "./prompts/cloudSystem";
 export { fitToWindow, type FitResult } from "./agent/contextManager";
 export {
   compactSessionMessages,
@@ -119,6 +152,7 @@ export {
   evaluateCodingPatchOutput,
   compareRoutingVsBaseline,
   BENCH_VERSION,
+  BENCH_TOOLCALL_SAMPLES,
   type BenchOptions,
   type CodingOutcomeMetrics,
   type RoutingEvalOutcome,
@@ -158,7 +192,16 @@ export {
 export type { ToolContext, Tool, ToolResult } from "./tools/types";
 
 // --- Prompt + protocol -----------------------------------------------------
-export { buildSystemPrompt, type SystemPromptInput } from "./prompts/system";
+export { buildSystemPrompt, buildSystemPromptWithReport, type SystemPromptInput } from "./prompts/system";
+export {
+  CORE_PROMPT_RULES,
+  editFilePatchParamNames,
+  selectDeduplicatedRules,
+  toolRequiredSignature,
+  type PromptRule,
+  type PromptSectionId,
+  type RuleRenderContext,
+} from "./prompts/rulebook";
 export {
   parsePhotonBlocks,
   validateAgainstSpec,
@@ -166,6 +209,8 @@ export {
 } from "./protocol/parse";
 export {
   renderToolInstructions,
+  renderToolInstructionsWithMeta,
   renderToolResult,
   toNativeTools,
+  type ToolInstructionsRenderResult,
 } from "./protocol/serialize";

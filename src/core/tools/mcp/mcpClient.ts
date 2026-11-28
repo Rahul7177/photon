@@ -73,10 +73,22 @@ export function createPinnedDispatcher(
 
         resolveDns()
           .then((records) => {
+            const sorted = [...records].sort(
+              (a, b) => (a.family === 4 ? -1 : 1) - (b.family === 4 ? -1 : 1)
+            );
+            const reqFamily =
+              opts && typeof (opts as { family?: number }).family === "number"
+                ? (opts as { family?: number }).family
+                : 0;
+            const filtered =
+              reqFamily === 4 || reqFamily === 6
+                ? sorted.filter((r) => r.family === reqFamily)
+                : sorted;
+            const finalRecords = filtered.length > 0 ? filtered : sorted;
             if (opts && (opts as { all?: boolean }).all) {
-              cb(null, records as any);
+              cb(null, finalRecords as any);
             } else {
-              const first = records[0];
+              const first = finalRecords[0];
               cb(null, first.address as any, first.family);
             }
           })

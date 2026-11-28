@@ -77,6 +77,12 @@ export function getModelPricing(modelName: string): CloudPricing {
   return { inputPerMillion: 2.0, outputPerMillion: 8.0, cachedInputPerMillion: 0.5, source: "estimated" };
 }
 
+export function computeCacheHitRate(inputTokens: number, cachedTokens: number): number {
+  if (!Number.isFinite(inputTokens) || inputTokens <= 0) return 0;
+  const safeCached = Math.min(inputTokens, Math.max(0, Number.isFinite(cachedTokens) ? cachedTokens : 0));
+  return Math.round((safeCached / inputTokens) * 1000) / 10;
+}
+
 export function estimateCloudCost(
   model: string,
   inputTokens: number,
@@ -172,12 +178,16 @@ export class CloudUsageTracker {
       sessionCachedTokens: this.sessionCached,
       sessionSavedTokens: this.sessionSaved,
       sessionEstimatedCostUsd: Math.round(this.sessionCost * 1_000_000) / 1_000_000,
+      sessionCacheHitPct: computeCacheHitRate(this.sessionInput, this.sessionCached),
       totalInputTokens: this.totalInput,
       totalOutputTokens: this.totalOutput,
       totalCachedTokens: this.totalCached,
       totalSavedTokens: this.totalSaved,
       totalEstimatedCostUsd: Math.round(this.totalCost * 1_000_000) / 1_000_000,
-      byModel: Array.from(this.modelUsage.values()).sort((a, b) => b.estimatedCostUsd - a.estimatedCostUsd),
+      totalCacheHitPct: computeCacheHitRate(this.totalInput, this.totalCached),
+      byModel: Array.from(this.modelUsage.values())
+        .map((m) => ({ ...m, cacheHitPct: computeCacheHitRate(m.inputTokens, m.cachedTokens) }))
+        .sort((a, b) => b.estimatedCostUsd - a.estimatedCostUsd),
     };
   }
 

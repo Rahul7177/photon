@@ -70,11 +70,13 @@ export function classifyCloudToolPolicy(mode: unknown, text: string, hasHistory 
 
 interface WebSearchState {
   calls: number;
+  attempts: number;
   cache: Map<string, string>;
 }
 
 const WEB_SEARCH_STATE = new WeakMap<AbortSignal, WebSearchState>();
 const MAX_WEB_SEARCH_CALLS = 3;
+const MAX_WEB_SEARCH_ATTEMPTS = 4;
 
 const COMMAND_TIMEOUT_MS = 180_000;
 
@@ -341,28 +343,50 @@ export const cloudWebSearch: Tool = {
     const state = getWebSearchState(ctx.signal);
     const key = normalizeSearchQuery(query);
     const cached = state.cache.get(key);
-    if (cached) return ok(`${cached}\n\n[Photon reused the existing web evidence for this repeated query.]`);
-    if (state.calls >= MAX_WEB_SEARCH_CALLS) {
+    if (cached) {
       return ok(
-        `${[...state.cache.values()][0] ?? "No usable web evidence has been collected."}\n\n[Photon stopped repeated web searches for this turn. Use web_fetch on a relevant source above or answer from the evidence already collected.]`
+        `${cached}\n\n[Photon reused the existing web evidence for this repeated query. Stop calling web_search and answer from the evidence above.]`
       );
     }
-    state.calls++;
+    if (state.calls >= MAX_WEB_SEARCH_CALLS || state.attempts >= MAX_WEB_SEARCH_ATTEMPTS) {
+      const firstCached = [...state.cache.values()][0];
+      if (firstCached) {
+        return ok(
+          `${firstCached}\n\n[Photon stopped repeated web searches for this turn. Do NOT call web_search again — synthesize your final answer from the evidence already collected.]`
+        );
+      }
+      return fail(
+        "Web search limit reached for this turn with no matching results found. Do NOT call web_search again or guess URLs for web_fetch — reply directly to the user."
+      );
+    }
+    state.attempts++;
     const result = await webSearchTool.execute(args, ctx);
     if (!result.ok) return result;
 
     let output = result.output;
+    const isEmptyResult = /^no results found\b/i.test(output.trim());
+    if (isEmptyResult) {
+      return ok(output);
+    }
+
+    state.calls++;
     if (isFreshOrExactQuery(query)) {
-      const urls = [...output.matchAll(/https:\/\/[^\s)]+/gi)]
+      const urls = [...output.matchAll(/https:\/\/[^\s)\]]+/gi)]
         .map((m) => m[0].replace(/[.,;]+$/, ""))
         .filter((url, i, all) => all.indexOf(url) === i)
-        .slice(0, 1);
-      if (urls[0]) {
-        const fetched = await webFetchTool.execute({ url: urls[0] }, ctx);
-        if (fetched.ok) {
-          output += `\n\n--- PRIMARY SOURCE EVIDENCE ---\n${fetched.output}\n--- END PRIMARY SOURCE EVIDENCE ---`;
-        } else {
-          output += "\n\nIMPORTANT: This is a search lead only. For an exact/current value, fetch one of the returned URLs before answering.";
+        .slice(0, 2);
+      if (urls.length > 0) {
+        const fetchedPages = await Promise.all(
+          urls.map(async (u) => {
+            const fetched = await webFetchTool.execute({ url: u }, ctx);
+            return fetched.ok && fetched.output.trim()
+              ? `Source (${u}):\n${fetched.output}`
+              : "";
+          })
+        );
+        const validEvidence = fetchedPages.filter(Boolean);
+        if (validEvidence.length > 0) {
+          output += `\n\n--- PRIMARY SOURCE EVIDENCE ---\n${validEvidence.join("\n\n---\n")}\n--- END PRIMARY SOURCE EVIDENCE ---`;
         }
       }
     }
@@ -455,7 +479,7 @@ export function cloudTools(mode: Mode = "agent", extraMcpTools: Tool[] = []): To
 function getWebSearchState(signal: AbortSignal): WebSearchState {
   let state = WEB_SEARCH_STATE.get(signal);
   if (!state) {
-    state = { calls: 0, cache: new Map<string, string>() };
+    state = { calls: 0, attempts: 0, cache: new Map<string, string>() };
     WEB_SEARCH_STATE.set(signal, state);
   }
   return state;

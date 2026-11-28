@@ -8,8 +8,10 @@ import {
   parseLsof,
   parseNetstat,
   portConflictMessage,
+  scanDiskOllamaModels,
   type DetectorDeps,
 } from "../../src/core/adaptive/runtimeDetector";
+import { matchInstalledModelName } from "../../src/shared/types";
 
 type Reply = { status: number; body: string } | "refuse";
 
@@ -206,6 +208,21 @@ describe("port conflicts", () => {
     assert.equal(parseNetstat("TCP 0.0.0.0:111434 0.0.0.0:0 LISTENING 4", 11434), undefined);
     assert.equal(parseLsof(""), undefined);
     assert.match(portConflictMessage("Ollama", 1, undefined), /another process/);
+  });
+
+  it("matches equivalent family tags (deepseek-r1:7b <-> deepseek-r1:8b, deepseek-coder-v2:lite <-> 16b)", () => {
+    assert.equal(
+      matchInstalledModelName("deepseek-r1:8b", ["deepseek-r1:7b", "qwen2.5-coder:7b"]),
+      "deepseek-r1:7b"
+    );
+    assert.equal(
+      matchInstalledModelName("deepseek-coder-v2:16b", ["deepseek-coder-v2:lite"]),
+      "deepseek-coder-v2:lite"
+    );
+    assert.equal(
+      matchInstalledModelName("phi4-mini:3.8b", ["phi4-mini:latest"]),
+      "phi4-mini:latest"
+    );
   });
 });
 

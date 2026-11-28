@@ -302,7 +302,7 @@ export const listDirTool: Tool = {
           const line = `${node.prefix}${e.name}${e.isDirectory() ? "/" : ""}`;
           out.push(line);
           if (e.isDirectory() && node.depth < maxDepth) {
-            queue.push({ abs: path.join(node.abs, e.name), prefix: `${line}/`, depth: node.depth + 1 });
+            queue.push({ abs: path.join(node.abs, e.name), prefix: line, depth: node.depth + 1 });
           }
         }
       }

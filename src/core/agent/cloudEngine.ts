@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import type { ChatMessage, Mode, ToolCall, TokenUsage } from "../../shared/types";
+import type { ChatMessage, IntelligenceLevel, Mode, PromptTokenReport, ToolCall, TokenUsage, TurnReliabilitySummary } from "../../shared/types";
 import type { LLMChatOptions, LLMMessage, LLMProvider } from "../llm/types";
 import { toNativeTools } from "../protocol/serialize";
 import { estimateTokens, estimateToolSchemasTokens } from "../adaptive/tokens";
+import { ReliabilityGovernor, countDiagnosticErrors } from "../adaptive/governor";
 import { fitToWindow } from "./contextManager";
 import { clamp } from "../tools/types";
 import type { Tool, ToolContext } from "../tools/types";
@@ -15,7 +16,7 @@ import {
   waitWithBackoff,
 } from "./errorRecovery";
 import { compactMidTurnLLMHistory } from "./compactor";
-import { executionFingerprint, looksLikeNarration } from "../intelligence/policy";
+import { executionFingerprint, looksLikeNarration, looksLikeWebLinkDeflection } from "../intelligence/policy";
 
 /**
  * CLOUD ENGINE — token-economical native tool-calling loop for frontier cloud models.
@@ -57,8 +58,10 @@ export interface CloudEmitter {
   onToolCall(messageId: string, call: ToolCall): void;
   onToolUpdate(messageId: string, call: ToolCall): void;
   onPhase(phase: "thinking" | "working", detail?: string): void;
+  onCompacting?(active: boolean): void;
   onUsage(usage: TokenUsage): void;
   onGenerationStats(stats: import("../../shared/types").GenerationStats | null): void;
+  onTurnTelemetry?(summary: TurnReliabilitySummary): void;
   onDone(messageId: string, notice?: string): void;
   onError(message: string): void;
 }
@@ -85,6 +88,8 @@ export interface CloudTurnInput {
   mode?: Mode;
   maxSteps?: number;
   options?: LLMChatOptions;
+  promptReport?: PromptTokenReport;
+  intelligence?: IntelligenceLevel;
 }
 
 export interface PendingCall {
@@ -533,6 +538,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
   let continuations = 0;
   let narrationNudges = 0;
   let duplicateOnlySteps = 0;
+  let unproductiveWebSteps = 0;
   let hasBlockedWriteInChat = false;
   let forceTextOnlyNextStep = false;
   let forcedTextUsed = false;
@@ -547,7 +553,25 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
   const modeCap = input.mode ? (MODE_CAPS[input.mode] ?? 200) : 200;
   const effectiveMaxSteps = Math.min(input.maxSteps ?? modeCap, modeCap);
 
+  const governor = new ReliabilityGovernor({
+    model,
+    mode: input.mode ?? "agent",
+    protocol: "native",
+    intelligence: input.intelligence ?? "max",
+  });
+  let stepsObserved = 0;
+  let baselineDiagErrors: number | undefined;
+  let telemetryEmitted = false;
+  const emitTelemetryOnce = () => {
+    if (telemetryEmitted) return;
+    telemetryEmitted = true;
+    ctx.log(governor.formatLogLine(stepsObserved));
+    emitter.onTurnTelemetry?.(governor.summary(stepsObserved));
+  };
+
+  try {
   for (let step = 0; step < effectiveMaxSteps; step++) {
+    stepsObserved = step + 1;
     if (signal.aborted) return;
 
     const disablingToolsThisStep = forceTextOnlyNextStep;
@@ -561,6 +585,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
     let fit = fitToWindow(system, compacted, 0, contextWindow, model, {
       preserveFirstUser: true,
       toolSchemasTokens: activeNativeTools ? toolSchemasTokens : 0,
+      promptReport: input.promptReport,
     });
 
     const usableInputWindow = Math.max(1024, contextWindow - 1000);
@@ -572,15 +597,21 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
       usableInputWindow >= 2048 &&
       (fit.droppedCount > 0 || fit.usage.used >= usableInputWindow * 0.8)
     ) {
+      emitter.onCompacting?.(true);
       emitter.onPhase("thinking", "Compacting context window");
-      const mid = await compactMidTurnLLMHistory({
-        history,
-        contextWindow,
-        model,
-        provider,
-        signal,
-        useProviderSummarizer: true,
-      });
+      let mid: Awaited<ReturnType<typeof compactMidTurnLLMHistory>>;
+      try {
+        mid = await compactMidTurnLLMHistory({
+          history,
+          contextWindow,
+          model,
+          provider,
+          signal,
+          useProviderSummarizer: true,
+        });
+      } finally {
+        emitter.onCompacting?.(false);
+      }
       if (mid.compacted) {
         midTurnCompactions++;
         history.splice(0, history.length, ...mid.history);
@@ -591,6 +622,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
         fit = fitToWindow(system, compacted, 0, contextWindow, model, {
           preserveFirstUser: true,
           toolSchemasTokens: activeNativeTools ? toolSchemasTokens : 0,
+          promptReport: input.promptReport,
         });
         ctx.log(`[cloud] mid-turn compacted history (${mid.strategy}) to keep context fit.`);
       }
@@ -758,17 +790,24 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
         overflowCompactions < 2
       ) {
         overflowCompactions++;
+        governor.record("context_overflow", { step });
         emitter.onAssistantCancel(assistantId);
+        emitter.onCompacting?.(true);
         emitter.onPhase("thinking", "Context overflow — compacting and retrying");
-        const mid = await compactMidTurnLLMHistory({
-          history,
-          contextWindow,
-          model,
-          provider,
-          signal,
-          maxRecentMessages: 4,
-          useProviderSummarizer: overflowCompactions === 1,
-        });
+        let mid: Awaited<ReturnType<typeof compactMidTurnLLMHistory>>;
+        try {
+          mid = await compactMidTurnLLMHistory({
+            history,
+            contextWindow,
+            model,
+            provider,
+            signal,
+            maxRecentMessages: 4,
+            useProviderSummarizer: overflowCompactions === 1,
+          });
+        } finally {
+          emitter.onCompacting?.(false);
+        }
         if (mid.compacted) {
           history.splice(0, history.length, ...mid.history);
           ctx.log(`[cloud] recovered from context overflow via mid-turn compaction (${mid.strategy}).`);
@@ -797,6 +836,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
       });
       if (canRetry.shouldRetry) {
         streamRetries++;
+        governor.record("stream_retry", { step, detail: classified.category });
         ctx.log(
           `[cloud] transient ${classified.category} error (${classified.rawMessage}) — retrying (${streamRetries}/${MAX_STREAM_RETRIES}) after ${classified.backoffMs}ms backoff.`
         );
@@ -828,6 +868,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
           { label: "Completion (output)", tokens: stepOutputTokens },
           ...(exactCachedTokens > 0 ? [{ label: "Cached input", tokens: exactCachedTokens }] : []),
         ],
+        ...(input.promptReport ? { promptReport: input.promptReport } : {}),
       });
     }
     if (stepInputTokens > 0 || stepOutputTokens > 0) {
@@ -849,6 +890,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
         return;
       }
       emptyStreak++;
+      governor.record("empty", { step });
       emitter.onAssistantCancel(assistantId);
       if (emptyStreak <= MAX_EMPTY_RETRIES) {
         ctx.log(`[cloud] empty generation ${emptyStreak}/${MAX_EMPTY_RETRIES} — nudging.`);
@@ -876,6 +918,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
       const cutOff = isLengthCutoff(doneReason) || hasUnclosedFence(content);
       if (cutOff && continuations < MAX_CONTINUATIONS) {
         continuations++;
+        governor.record("truncation", { step, detail: doneReason });
         emitter.onDone(assistantId);
         ctx.log(
           `[cloud] output cut off (reason: ${doneReason ?? "none"}, ${content.length} chars) — asking model to continue (${continuations}/${MAX_CONTINUATIONS}).`
@@ -891,6 +934,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
 
       if (!cutOff && narrationNudges < 1 && !forcedTextUsed && looksLikeNarration(content)) {
         narrationNudges++;
+        governor.record("narration", { step });
         emitter.onAssistantCancel(assistantId);
         ctx.log(`[cloud] narration-only response in ${input.mode ?? "cloud"} mode — nudging for completion.`);
         history.push({ role: "assistant", content });
@@ -908,6 +952,43 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
               : "Do not stop with narration of your next step. Invoke the tool you intended to run now, or if the task is finished, present the final summary.";
           history.push({ role: "user", content: narrationPrompt });
         }
+        continue;
+      }
+
+      const ranCloudWebSearch = history.some((m) => m.role === "tool" && m.name === "web_search");
+      const ranCloudWebFetch = history.some((m) => m.role === "tool" && m.name === "web_fetch");
+      const hasWebFetchTool = tools.some((t) => t.spec.name === "web_fetch");
+      if (
+        !cutOff &&
+        ranCloudWebSearch &&
+        !ranCloudWebFetch &&
+        hasWebFetchTool &&
+        narrationNudges < 2 &&
+        !forcedTextUsed &&
+        looksLikeWebLinkDeflection(content)
+      ) {
+        narrationNudges++;
+        emitter.onAssistantCancel(assistantId);
+        const searchToolMsgs = history
+          .filter((m) => m.role === "tool" && m.name === "web_search")
+          .map((m) => (typeof m.content === "string" ? m.content : ""))
+          .join("\n");
+        const candidateUrls = [...searchToolMsgs.matchAll(/https:\/\/[^\s)\]"'>]+/gi)]
+          .map((m) => m[0].replace(/[.,;]+$/, ""))
+          .filter((u) => !/duckduckgo\.com|google\.com\/search/i.test(u));
+        const bestUrl =
+          candidateUrls.find((u) =>
+            /moneycontrol\.com|niftytrader\.in|wikipedia\.org|reuters\.com|cnbc\.com|investing\.com|marketwatch\.com/i.test(
+              u
+            )
+          ) ??
+          candidateUrls[0] ??
+          "";
+        history.push({ role: "assistant", content });
+        history.push({
+          role: "user",
+          content: `Do NOT tell the user to visit external websites themselves. You have the web_fetch tool available and have not called it yet. Invoke web_fetch right now${bestUrl ? ` on "${bestUrl}"` : ""} to read the full page content and extract the specific live value requested by the user.`,
+        });
         continue;
       }
 
@@ -995,6 +1076,8 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
 
     let stepFreshCalls = 0;
     let stepBlockedWriteCalls = 0;
+    let stepAllWebTools = executableCalls.length > 0;
+    let stepAnyUsefulWebResult = false;
 
     const runOneCall = async (ec: { pending: PendingCall; tool?: Tool; callObj: ToolCall }) => {
       const { pending: c, tool, callObj } = ec;
@@ -1010,6 +1093,7 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
         (input.mode === "chat" || input.mode === "plan") && isMutatingOrExec;
       if (isForbiddenInReadOnly) {
         stepBlockedWriteCalls++;
+        governor.record("mode_violation", { step, tool: c.name });
         if (input.mode === "chat") {
           hasBlockedWriteInChat = true;
           const pathArg =
@@ -1039,20 +1123,24 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
             : `Side-effecting tool "${c.name}" is forbidden in "plan" mode (read-only planning). Do not modify files or run commands; continue clarifying/discussing or present the implementation plan in Markdown, and let the user switch to Agent mode to execute it.`;
         okResult = false;
       } else if (!tool) {
+        governor.record("invalid_args", { step, tool: c.name, detail: "unknown_tool" });
         output = `Unknown tool "${c.name}". Available: ${tools.map((t) => t.spec.name).join(", ")}.`;
         okResult = false;
       } else if (c.args.__malformedToolArgs) {
+        governor.record("invalid_args", { step, tool: c.name, detail: "malformed_json_args" });
         output = typeof c.args.__parseError === "string"
           ? `${c.args.__parseError} Re-emit "${c.name}" with valid JSON object arguments.`
           : `Malformed JSON arguments for tool "${c.name}". Re-emit the tool call with valid JSON object arguments.`;
         okResult = false;
       } else if (ctx.executionPolicy?.blockTerminalCommands && (c.name === "run_command" || c.name === "execute_command" || tool.spec.risk === "execute")) {
+        governor.record("mode_violation", { step, tool: c.name, detail: "blocked_terminal_policy" });
         output = `Terminal command execution is disabled by current execution policy.`;
         okResult = false;
       } else {
         const fp = !isMutatingOrExec ? executionFingerprint(callObj, mutationEpoch) : "";
         const prior = fp ? executed.get(fp) : undefined;
         if (fp && prior && prior.count >= 1 && step - prior.lastStep < 15) {
+          governor.record("duplicate", { step, tool: c.name });
           executed.set(fp, { count: prior.count + 1, lastStep: step });
           output =
             prior.count === 1
@@ -1060,7 +1148,6 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
               : `Duplicate tool call blocked: ${c.name} was already executed repeatedly with identical arguments.`;
           okResult = false;
         } else {
-          stepFreshCalls++;
           try {
             const r = await tool.execute(c.args, { ...ctx, pendingCallId: c.id });
             output = r.output;
@@ -1069,6 +1156,38 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
             output = (e as Error).message;
             okResult = false;
           }
+          const isWebTool = c.name === "web_search" || c.name === "web_fetch";
+          if (!isWebTool) {
+            stepAllWebTools = false;
+          }
+          const isCappedOrReusedWeb =
+            isWebTool &&
+            (output.includes("[Photon stopped repeated web searches") ||
+              output.includes("[Photon reused the existing web evidence") ||
+              output.includes("Web search limit reached for this turn"));
+          const isEmptyWeb = isWebTool && (!okResult || isCappedOrReusedWeb || /^no results found\b/i.test(output.trim()));
+          if (isWebTool && !isEmptyWeb) {
+            stepAnyUsefulWebResult = true;
+          }
+          if (!isCappedOrReusedWeb) {
+            stepFreshCalls++;
+          }
+          if (c.name === "get_diagnostics") {
+            const errs = countDiagnosticErrors(output);
+            if (mutationEpoch === 0 && baselineDiagErrors === undefined) {
+              baselineDiagErrors = errs;
+            } else if (mutationEpoch > 0 && errs > (baselineDiagErrors ?? 0)) {
+              governor.record("diag_regression", { step, tool: c.name, detail: `${baselineDiagErrors ?? 0}->${errs}` });
+              baselineDiagErrors = errs;
+            } else {
+              baselineDiagErrors = errs;
+            }
+          }
+          governor.record(okResult ? (isVerification ? "verify_ok" : "tool_ok") : "tool_error", {
+            step,
+            tool: c.name,
+            detail: okResult ? undefined : output,
+          });
           if (okResult) {
             if (isMutatingOrExec) {
               mutationEpoch++;
@@ -1170,6 +1289,22 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
       continue;
     }
 
+    if (stepAllWebTools && !stepAnyUsefulWebResult) {
+      unproductiveWebSteps++;
+      if (unproductiveWebSteps >= 4 && !forcedTextUsed && !disablingToolsThisStep && step < effectiveMaxSteps - 1) {
+        emitter.onDone(assistantId);
+        forceTextOnlyNextStep = true;
+        history.push({
+          role: "user",
+          content:
+            "Stop calling web_search and web_fetch — tools are now disabled. Answer the user directly using any information gathered above, or state clearly if live web results could not be retrieved.",
+        });
+        continue;
+      }
+    } else if (stepAnyUsefulWebResult || !stepAllWebTools) {
+      unproductiveWebSteps = 0;
+    }
+
     if (executableCalls.length > 0 && stepFreshCalls === 0) {
       duplicateOnlySteps++;
       if (duplicateOnlySteps >= 2) {
@@ -1225,6 +1360,9 @@ export async function runCloudTurn(input: CloudTurnInput): Promise<void> {
       `Reached the ${effectiveMaxSteps}-step safety limit in ${input.mode ?? "cloud"} mode. Ask me to continue if more work is needed.`
     );
   }
+  } finally {
+    emitTelemetryOnce();
+  }
 }
 
 export function cloudHistoryFromSession(messages: ChatMessage[]): LLMMessage[] {
@@ -1242,7 +1380,7 @@ export function cloudHistoryFromSession(messages: ChatMessage[]): LLMMessage[] {
       // <tool_result> wrappers whose outcomes are already reconstructed from
       // assistant.toolCalls, or internal step-level coaching nudges). Skip them so
       // Local -> Cloud mode transitions preserve clean conversation history.
-      if (m.hidden) continue;
+      if (m.hidden && !m.isCompacted) continue;
       const docs = (m.attachments ?? []).filter((a) => a.kind === "text" && a.text);
       let content = m.content;
       for (const d of docs) {

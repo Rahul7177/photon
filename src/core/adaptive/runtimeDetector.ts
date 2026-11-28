@@ -392,21 +392,105 @@ export async function detectLocalRuntimes(
 }
 
 /**
- * Sense installed Ollama models directly from disk manifests (`~/.ollama/models/manifests`
- * or `OLLAMA_MODELS/manifests`) so Photon knows which models are already downloaded even
- * before the Ollama server daemon is started or if it's temporarily unreachable.
+ * Discover candidate Ollama model root directories:
+ * 1. `OLLAMA_MODELS` environment variable
+ * 2. Default `~/.ollama/models`
+ * 3. Custom model directory configured in Ollama Desktop (`%LOCALAPPDATA%\Ollama\server.log` or `db.sqlite`)
+ */
+export function discoverOllamaModelRoots(
+  homedir: string = os.homedir(),
+  env: NodeJS.ProcessEnv = process.env
+): string[] {
+  const roots: string[] = [];
+  const addRoot = (candidate?: string) => {
+    if (!candidate) return;
+    const cleaned = candidate.trim().replace(/^["']|["']$/g, "");
+    if (!cleaned) return;
+    if (!roots.some((r) => r.toLowerCase() === cleaned.toLowerCase())) {
+      roots.push(cleaned);
+    }
+  };
+
+  if (env.OLLAMA_MODELS?.trim()) {
+    addRoot(env.OLLAMA_MODELS);
+  }
+  addRoot(path.join(homedir, ".ollama", "models"));
+
+  // Check Ollama Desktop app logs/db when using the real user home directory or explicit LOCALAPPDATA
+  const isDefaultHome = path.resolve(homedir).toLowerCase() === path.resolve(os.homedir()).toLowerCase();
+  const localAppData =
+    env.LOCALAPPDATA ??
+    env.LocalAppData ??
+    (isDefaultHome && process.platform === "win32" ? path.join(homedir, "AppData", "Local") : undefined);
+
+  const logCandidates: string[] = [];
+  if (localAppData) {
+    logCandidates.push(
+      path.join(localAppData, "Ollama", "server.log"),
+      path.join(localAppData, "Ollama", "server-1.log")
+    );
+  }
+  if (isDefaultHome && process.platform === "darwin") {
+    logCandidates.push(path.join(homedir, ".ollama", "logs", "server.log"));
+  }
+
+  for (const logPath of logCandidates) {
+    try {
+      if (!fs.existsSync(logPath)) continue;
+      // Read the first 16KB where Ollama logs `msg="server config" env="map[... OLLAMA_MODELS:... ]"`
+      const fd = fs.openSync(logPath, "r");
+      try {
+        const buf = Buffer.alloc(16_384);
+        const bytesRead = fs.readSync(fd, buf, 0, buf.length, 0);
+        const head = buf.toString("utf8", 0, bytesRead);
+        const m = head.match(/OLLAMA_MODELS:([^\s\]]+)/);
+        if (m && m[1]) {
+          const unescaped = m[1].replace(/\\\\/g, "\\");
+          if (fs.existsSync(path.join(unescaped, "manifests"))) {
+            addRoot(unescaped);
+          }
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      /* ignore inaccessible log */
+    }
+  }
+
+  if (localAppData) {
+    const dbPath = path.join(localAppData, "Ollama", "db.sqlite");
+    try {
+      if (fs.existsSync(dbPath)) {
+        const raw = fs.readFileSync(dbPath, "utf8");
+        const winPaths = raw.match(/[A-Za-z]:\\[^\x00-\x1f\x7f"'<>|*?\r\n]{2,120}/g) ?? [];
+        for (const p of winPaths) {
+          // Strip any trailing non-path characters that might follow the column in sqlite binary pages
+          const clean = p.replace(/[^A-Za-z0-9_\-.\\ /]+$/, "").trim();
+          if (clean && fs.existsSync(path.join(clean, "manifests"))) {
+            addRoot(clean);
+          }
+        }
+      }
+    } catch {
+      /* ignore inaccessible sqlite file */
+    }
+  }
+
+  return roots;
+}
+
+/**
+ * Sense installed Ollama models directly from disk manifests (`~/.ollama/models/manifests`,
+ * `OLLAMA_MODELS/manifests`, or custom Ollama Desktop storage roots) so Photon knows which
+ * models are already downloaded even before the Ollama daemon is started.
  */
 export function scanDiskOllamaModels(
   homedir: string = os.homedir(),
   env: NodeJS.ProcessEnv = process.env
 ): ModelInfo[] {
   try {
-    const modelsRoot = env.OLLAMA_MODELS
-      ? env.OLLAMA_MODELS.trim()
-      : path.join(homedir, ".ollama", "models");
-    const manifestsRoot = path.join(modelsRoot, "manifests");
-    if (!fs.existsSync(manifestsRoot)) return [];
-
+    const roots = discoverOllamaModelRoots(homedir, env);
     const results: ModelInfo[] = [];
     const seen = new Set<string>();
 
@@ -459,7 +543,12 @@ export function scanDiskOllamaModels(
       }
     };
 
-    walk(manifestsRoot, []);
+    for (const modelsRoot of roots) {
+      const manifestsRoot = path.join(modelsRoot, "manifests");
+      if (fs.existsSync(manifestsRoot)) {
+        walk(manifestsRoot, []);
+      }
+    }
     return results;
   } catch {
     return [];

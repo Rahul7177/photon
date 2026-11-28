@@ -27,6 +27,7 @@ export const AssistantTurn = memo(function AssistantTurn({
   isWorking,
   status,
   statusDetail,
+  isCompacting,
 }: {
   messages: ChatMessage[];
   pendingApproval?: ToolCall | null;
@@ -34,6 +35,7 @@ export const AssistantTurn = memo(function AssistantTurn({
   isWorking?: boolean;
   status?: string;
   statusDetail?: string | null;
+  isCompacting?: boolean;
 }) {
   const allAttachments: Attachment[] = [];
   const notices: string[] = [];
@@ -43,6 +45,7 @@ export const AssistantTurn = memo(function AssistantTurn({
   let hasTools = false;
 
   for (const m of messages) {
+    if (m.isCompacted || m.content?.includes("[Context Compaction Summary]")) continue;
     if (m.attachments?.length) allAttachments.push(...m.attachments);
     if (m.streaming) isStreaming = true;
     if (hasVisibleText(m.content)) hasContent = true;
@@ -52,16 +55,18 @@ export const AssistantTurn = memo(function AssistantTurn({
   }
 
   const turnActive = isStreaming || Boolean(isWorking);
+  const activelyCompacting = turnActive && Boolean(isCompacting || /compact/i.test(statusDetail || ""));
   const activeStreamMsg = [...messages].reverse().find((m) => m.streaming === true);
   const activeHasContent = activeStreamMsg ? hasVisibleText(activeStreamMsg.content) : false;
   const activeHasThinking = activeStreamMsg ? hasVisibleText(activeStreamMsg.thinking) : hasThinking;
   const activeHasRunningTool = activeStreamMsg?.toolCalls?.some((c) => c.status === "running") ?? false;
-  const showThinking = shouldShowTurnThinking({ turnActive, activeHasRunningTool });
+  const showThinking = activelyCompacting || shouldShowTurnThinking({ turnActive, activeHasRunningTool });
   const thinkingLabel = getClaudeThinkingLabel(
     statusDetail,
     status,
     isStreaming && !activeHasThinking,
-    activeHasThinking
+    activeHasThinking,
+    activelyCompacting
   );
 
   // Nothing to paint at all
@@ -99,10 +104,13 @@ export const AssistantTurn = memo(function AssistantTurn({
         actions={actions}
         isStreaming={turnActive}
         hasContent={turnActive ? activeHasContent : hasContent}
+        isCompacting={activelyCompacting}
+        statusDetail={statusDetail}
       />
 
       {/* Actual answer content */}
       {messages.map((m) => {
+        if (m.isCompacted || m.content?.includes("[Context Compaction Summary]")) return null;
         if (!hasVisibleText(m.content)) return null;
         return (
           <div key={m.id} className="msg-body">

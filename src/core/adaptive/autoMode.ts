@@ -9,10 +9,12 @@ import {
   type ModelInfo,
   type ModelScore,
   type RoutingSignalBreakdown,
+  type SessionTaskContext,
 } from "../../shared/types";
 import { capabilityForModel, analyzeTask, toComplexity } from "../intelligence/policy";
-import { buildPlan, type OrchestratorInput } from "./orchestrator";
+import { buildPlan, computeOptimalContextWindow, type OrchestratorInput } from "./orchestrator";
 import { estimateTokens } from "./tokens";
+import type { PassportEntry } from "./passport";
 import { getModelPricing } from "../telemetry/cloudUsage";
 
 const WEIGHTS = {
@@ -28,10 +30,16 @@ const WEIGHTS = {
   localPreference: 3,
 };
 
+const CONTINUITY_BONUS_LOCAL = 6;
+const CONTINUITY_BONUS_CLOUD = 4;
+
 export interface AutoModeInput {
   prompt: string;
   mode: Mode;
   attachmentCount?: number;
+  hasImageAttachments?: boolean;
+  sessionTaskContext?: SessionTaskContext;
+  perModelCtx?: (modelName: string) => number | undefined;
   models: ModelInfo[];
   machine: MachineProfile | null;
   benchByModel?: Map<string, BenchResult>;
@@ -40,6 +48,10 @@ export interface AutoModeInput {
   adaptiveEnabled?: boolean;
   localOnly?: boolean;
   allowCloudEscalation?: boolean;
+  /** Live per-model reliability learned on this device (Capability Passport). */
+  passportByModel?: Map<string, PassportEntry>;
+  /** User froze runtime adaptivity: ignore passport + disable governor actions. */
+  freezeAdaptivity?: boolean;
 }
 
 function classifyHardwareFit(
@@ -62,9 +74,17 @@ export function rankModels(
   complexity: ComplexityAssessment,
   benchByModel?: Map<string, BenchResult>,
   machine?: MachineProfile | null,
-  options?: { localOnly?: boolean; previousModel?: string }
+  options?: {
+    localOnly?: boolean;
+    previousModel?: string;
+    needsVision?: boolean;
+    adaptiveEnabled?: boolean;
+    perModelCtx?: (modelName: string) => number | undefined;
+    passportByModel?: Map<string, PassportEntry>;
+  }
 ): ModelScore[] {
   const task = complexity.task ?? analyzeTask("", "agent");
+  const needsVision = Boolean(options?.needsVision ?? task.needsVision);
   const tpsValues = [...(benchByModel?.values() ?? [])]
     .filter((b) => (b.methodologyVersion ?? 0) >= 1 && (Date.now() - b.ranAt <= 30 * 86_400_000))
     .map((b) => b.tokensPerSec)
@@ -79,10 +99,18 @@ export function rankModels(
       const bench = rawBench && (rawBench.methodologyVersion ?? 0) >= 1 && (Date.now() - rawBench.ranAt <= 30 * 86_400_000)
         ? rawBench
         : undefined;
-      const caps = capabilityForModel(m, bench);
-      const ctx = m.contextLength ?? 8192;
-      let fits = ctx >= complexity.minContextTokens;
+      const caps = capabilityForModel(m, bench, options?.passportByModel?.get(m.name));
       const local = isLocalModel(m);
+      const modelMaxCtx = m.contextLength && m.contextLength > 0 ? m.contextLength : local ? 8192 : 128000;
+      const perCtx = local ? options?.perModelCtx?.(m.name) : undefined;
+      const ctx = local
+        ? (perCtx && perCtx > 0
+            ? Math.min(perCtx, modelMaxCtx)
+            : (machine
+                ? computeOptimalContextWindow(m, machine, options?.adaptiveEnabled ?? true).numCtx
+                : modelMaxCtx))
+        : modelMaxCtx;
+      let fits = ctx >= complexity.minContextTokens;
       const hwFit = classifyHardwareFit(m, machine);
       const pricing = local ? { inputPerMillion: 0, outputPerMillion: 0 } : getModelPricing(m.name);
       const estimatedCostPer1MUsd = pricing.inputPerMillion ?? 0;
@@ -97,11 +125,23 @@ export function rankModels(
         score -= 200;
       }
 
+      // Vision hard constraint (R-1)
+      const hasVision = Boolean(m.vision ?? (m as { supportsVision?: boolean }).supportsVision);
+      if (needsVision) {
+        if (!hasVision) {
+          fits = false;
+          reasons.push("missing required vision capability");
+          score -= 200;
+        } else {
+          reasons.push("vision-capable");
+        }
+      }
+
       // 1. Task complexity signal
       reasons.push(`complexity:${complexity.level}`);
 
-      // 2. Context fit signal
-      if (fits) {
+      // 2. Achievable context fit signal (R-2)
+      if (ctx >= complexity.minContextTokens) {
         score += WEIGHTS.contextFit;
         score +=
           Math.min(1, (ctx - complexity.minContextTokens) / Math.max(1, complexity.minContextTokens)) *
@@ -125,14 +165,15 @@ export function rankModels(
         reasons.push(`reasoning ${Math.round(caps.reasoning * 100)}%`);
       }
 
-      // 4. Hardware & throughput signals
+      // 4. Hardware & throughput signals (R-3: hard-exclude tight hardware)
       if (bench && maxTps > 0) {
         score += (bench.tokensPerSec / maxTps) * WEIGHTS.throughput;
         reasons.push(`${Math.round(bench.tokensPerSec)} tok/s`);
       }
       if (hwFit === "tight") {
-        score -= 8;
-        reasons.push("hw:tight");
+        fits = false;
+        score -= 120;
+        reasons.push("hw:tight (exceeds safe memory)");
       } else {
         reasons.push(`hw:${hwFit}`);
       }
@@ -149,6 +190,13 @@ export function rankModels(
         }
       }
       if (bench?.capabilityProfile) reasons.push("bench-profiled");
+
+      // 6. Switch hysteresis / continuity bonus (S-5)
+      if (fits && options?.previousModel && m.name === options.previousModel) {
+        const bonus = local ? CONTINUITY_BONUS_LOCAL : CONTINUITY_BONUS_CLOUD;
+        score += bonus;
+        reasons.push(`continuity +${bonus}`);
+      }
 
       const signals: RoutingSignalBreakdown = {
         taskComplexity: complexity.level,
@@ -180,11 +228,22 @@ export function rankModels(
 
 export function decideModel(input: AutoModeInput): AutoDecision {
   const promptTokens = estimateTokens(input.prompt ?? "");
-  const task = analyzeTask(input.prompt, input.mode, input.attachmentCount ?? 0);
+  const taskCtx: SessionTaskContext | undefined =
+    input.sessionTaskContext || input.hasImageAttachments !== undefined
+      ? {
+          ...input.sessionTaskContext,
+          hasImageAttachments: input.hasImageAttachments ?? input.sessionTaskContext?.hasImageAttachments,
+        }
+      : undefined;
+  const task = analyzeTask(input.prompt, input.mode, input.attachmentCount ?? 0, taskCtx);
   const complexity = toComplexity(task, promptTokens);
   const scores = rankModels(input.models, complexity, input.benchByModel, input.machine, {
     localOnly: input.localOnly,
     previousModel: input.previousModel,
+    needsVision: task.needsVision,
+    adaptiveEnabled: input.adaptiveEnabled,
+    perModelCtx: input.perModelCtx,
+    passportByModel: input.freezeAdaptivity ? undefined : input.passportByModel,
   });
   const hasLocalModels = input.models.some((m) => isLocalModel(m));
 
@@ -233,7 +292,7 @@ export function decideModel(input: AutoModeInput): AutoDecision {
     };
   }
 
-  const best = scores[0];
+  const best = scores.find((s) => s.fits) ?? scores[0];
   if (!best) {
     return {
       chosenModel: "",
@@ -249,8 +308,7 @@ export function decideModel(input: AutoModeInput): AutoDecision {
   }
 
   const fallbacks = scores
-    .slice(1)
-    .filter((s) => s.fits)
+    .filter((s) => s.model !== best.model && s.fits)
     .map((s) => s.model);
 
   const cloudEscalated = Boolean(best.signals?.isCloud && hasLocalModels);
@@ -325,6 +383,7 @@ export interface PlanRequest extends AutoModeInput {
   adaptiveEnabled: boolean;
   userNumCtx?: number;
   cloudNativeTools?: boolean;
+  scaffoldOptimizations?: boolean;
 }
 
 export function planRequest(input: PlanRequest): { decision: AutoDecision; plan: AdaptivePlan | null } {
@@ -341,8 +400,11 @@ export function planRequest(input: PlanRequest): { decision: AutoDecision; plan:
     reserveOutputTokens: input.reserveOutputTokens,
     adaptiveEnabled: input.adaptiveEnabled,
     cloudNativeTools: input.cloudNativeTools,
+    scaffoldOptimizations: input.scaffoldOptimizations,
     task: decision.complexity.task,
     bench: input.benchByModel?.get(model.name),
+    passport: input.passportByModel?.get(model.name),
+    freezeAdaptivity: input.freezeAdaptivity,
   });
   return { decision, plan };
 }

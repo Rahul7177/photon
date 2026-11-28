@@ -4,7 +4,9 @@ import {
   canonicalToolName,
   parsePhotonBlocks,
   stripToolMarkup,
+  validateAgainstSpec,
 } from "../../src/core/protocol/parse";
+import { builtinTools } from "../../src/core/tools/builtin";
 import {
   renderToolInstructions,
   renderToolResult,
@@ -361,6 +363,29 @@ Also in plain JSON prose: {"name": "read", "description": "just a normal object"
 
       const result = parsePhotonBlocks(proseWithCodeAndJson, specs);
       assert.equal(result.calls.length, 0, "Arbitrary code fences and JSON objects must not trigger tools");
+    });
+
+    it("preserves find_files pattern and aliases query/glob -> pattern against builtinTools", () => {
+      const builtinSpecs = builtinTools().map((t) => t.spec);
+      const byPattern = parsePhotonBlocks(
+        "```tool\nTOOL_NAME: find_files\nBEGIN_ARG: pattern\n*math*\nEND_ARG\n```",
+        builtinSpecs
+      );
+      assert.equal(byPattern.calls.length, 1);
+      assert.deepEqual(byPattern.calls[0].errors, []);
+      assert.equal(byPattern.calls[0].args.pattern, "*math*");
+
+      const byQuery = parsePhotonBlocks(
+        "```tool\nTOOL_NAME: find_files\nBEGIN_ARG: query\n*.ts\nEND_ARG\n```",
+        builtinSpecs
+      );
+      assert.equal(byQuery.calls.length, 1);
+      assert.deepEqual(byQuery.calls[0].errors, []);
+      assert.equal(byQuery.calls[0].args.pattern, "*.ts");
+
+      const nativeValidated = validateAgainstSpec("find_files", { glob: "src/**/*.ts" }, builtinSpecs);
+      assert.deepEqual(nativeValidated.errors, []);
+      assert.equal(nativeValidated.args.pattern, "src/**/*.ts");
     });
   });
 });

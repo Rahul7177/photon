@@ -41,7 +41,7 @@ import { McpManager, type McpServerConfig } from "../core/tools/mcp/bridge";
 import { AgentEngine, type TurnEmitter } from "../core/agent/engine";
 import { runCloudTurn, cloudHistoryFromSession } from "../core/agent/cloudEngine";
 import { cloudTools, classifyCloudToolPolicy, getCloudToolPolicy, setCloudToolPolicy } from "../core/tools/cloud/cloudTools";
-import { buildCloudSystemPrompt } from "../core/prompts/cloudSystem";
+import { buildCloudSystemPromptWithReport } from "../core/prompts/cloudSystem";
 import { buildWorkspaceMap } from "../core/tools/workspaceMap";
 import { compactSessionMessages, shouldAutoCompact } from "../core/agent/compactor";
 import { estimateMessageTokens } from "../core/adaptive/tokens";
@@ -53,6 +53,7 @@ import type { OpenAICompatConfig } from "../core/llm/providers/openaiCompatProvi
 import type { LLMProvider } from "../core/llm/types";
 import { SessionStore, redactSecrets } from "./sessionStore";
 import { BenchStore } from "./benchStore";
+import { PassportStore } from "./passportStore";
 import { ProjectStore, computeMcpConfigFingerprint, type McpTrustScope } from "./projectStore";
 import { IndexService } from "./indexService";
 import { ModelConfigStore } from "./modelConfigStore";
@@ -109,6 +110,7 @@ export class PhotonController {
   private engine: AgentEngine;
   private sessionStore: SessionStore;
   private benchStore: BenchStore;
+  private passportStore: PassportStore;
   private projectStore: ProjectStore;
   private mcp: McpManager;
   private index: IndexService;
@@ -146,6 +148,8 @@ export class PhotonController {
   private readonly customizations: CustomizationsStore;
   /** Explicitly invoked skill IDs for the current prompt turn. */
   private invokedSkillIdsForTurn: string[] = [];
+  /** Last resolved task analysis & mode per session for continuation carry-forward (S-4). */
+  private lastTurnTaskBySession = new Map<string, { task: import("../shared/types").TaskAnalysis; mode: Mode }>();
 
   private get models(): ModelInfo[] {
     return this.providerService.getModels();
@@ -276,6 +280,7 @@ export class PhotonController {
       });
     };
     this.benchStore = new BenchStore(context);
+    this.passportStore = new PassportStore(context);
     this.projectStore = new ProjectStore(context);
     this.modelConfigs = new ModelConfigStore(context);
     this.mcp = new McpManager(this.registry, (m) => this.output.appendLine(`[mcp] ${m}`));
@@ -702,10 +707,24 @@ export class PhotonController {
       .getConfiguration("photon")
       .update("interfaceMode", mode, vscode.ConfigurationTarget.Global);
 
+    // Ensure local models (including disk-sensed Ollama models) are loaded when switching to Local mode.
+    if (mode === "local" && (this.modelsForUi().length === 0 || !this.reachable)) {
+      await this.connectAndLoad();
+    }
+
     // The pinned/selected model must belong to the active stack.
     const visible = this.modelsForUi();
     if (!visible.some((m) => m.name === this.selectedModel)) {
-      this.selectedModel = visible[0]?.name ?? "";
+      if (mode === "local" && visible.length > 0) {
+        const rec = recommendModels(this.machine, {
+          installed: visible.map((m) => m.name),
+          installedModels: visible,
+          benchmarks: this.benchStore.byModel(),
+        });
+        this.selectedModel = rec.bestInstalledName ?? visible[0]?.name ?? "";
+      } else {
+        this.selectedModel = visible[0]?.name ?? "";
+      }
     }
     this.cancelActiveTurn();
     this.recomputePlan();
@@ -771,7 +790,8 @@ export class PhotonController {
       if (r.state === "not_installed") r.installOptions = installOptions(r.id, process.platform);
     }
     this.safePost({ type: "providerRuntimes", payload: runtimes });
-    if (reloadModels) {
+    const hasLocalModels = this.models.some((m) => isLocalModel(m));
+    if (reloadModels || !hasLocalModels) {
       await this.connectAndLoad();
       this.recomputePlan();
       this.safePost({
@@ -1208,6 +1228,14 @@ export class PhotonController {
         this.pushPlan();
         this.pushConfig();
         return;
+      case "setAdaptivityFrozen":
+        await vscode.workspace
+          .getConfiguration("photon")
+          .update("adaptive.freeze", msg.payload.frozen, vscode.ConfigurationTarget.Global);
+        this.recomputePlan();
+        this.pushPlan();
+        this.pushConfig();
+        return;
       case "setIntelligence":
         await vscode.workspace
           .getConfiguration("photon")
@@ -1330,6 +1358,17 @@ export class PhotonController {
         await this.detectProviders(true);
         return;
       case "requestRecommendations":
+        if (!this.models.some((m) => isLocalModel(m))) {
+          await this.connectAndLoad();
+          this.safePost({
+            type: "models",
+            payload: {
+              models: this.models,
+              selected: this.selectedModel,
+              ollamaReachable: this.reachable,
+            },
+          });
+        }
         this.sendRecommendations(msg.payload?.goal, msg.payload?.ctxTokens, {
           taskPrompt: msg.payload?.taskPrompt,
           runtime: msg.payload?.runtime,
@@ -1787,18 +1826,34 @@ export class PhotonController {
     // Per-model ctx: if a model has a stored numCtx/llamacpp.ctx, honor it for THIS turn.
     const perModelCtx = (m: string) => this.effectiveNumCtxFor(m);
     const prevModel = this.selectedModel || undefined;
+    const hasImageAttachments = Boolean(attachments?.some((a) => a.kind === "image"));
+    const prevTurn = this.lastTurnTaskBySession.get(this.session.id);
+    const openTodoCount = this.ctxMgr?.getSummary()?.latestHandoff?.pendingTodos?.length ?? 0;
+    const sessionTaskContext = {
+      previousTask: prevTurn?.task,
+      previousMode: prevTurn?.mode,
+      openTodoCount,
+      hasImageAttachments,
+    };
+    const freezeAdaptivity = this.adaptivityFrozen();
+    const passportByModel = this.passportStore.byModel(this.modelsForUi());
     let { decision, plan } = planRequest({
       prompt: effectivePrompt,
       mode: this.mode,
       attachmentCount: attachments?.length ?? 0,
+      hasImageAttachments,
+      sessionTaskContext,
+      perModelCtx,
       models: this.modelsForUi(),
       machine: this.machine,
       benchByModel: this.benchStore.byModel(),
+      passportByModel,
       pinnedModel: this.autoSelect ? undefined : this.selectedModel || undefined,
       previousModel: prevModel,
       intelligence: this.effectiveIntelligence(),
       reserveOutputTokens: cfg.get<number>("context.reserveOutputTokens", 1024),
       adaptiveEnabled: this.adaptiveEnabled(),
+      freezeAdaptivity,
       userNumCtx: this.effectiveNumCtx(),
     });
     if (!plan) {
@@ -1817,13 +1872,18 @@ export class PhotonController {
         prompt: effectivePrompt,
         mode: this.mode,
         attachmentCount: attachments?.length ?? 0,
+        hasImageAttachments,
+        sessionTaskContext,
+        perModelCtx,
         models: this.modelsForUi(),
         machine: this.machine,
         benchByModel: this.benchStore.byModel(),
+        passportByModel,
         pinnedModel: plan.model,
         intelligence: this.effectiveIntelligence(),
         reserveOutputTokens: cfg.get<number>("context.reserveOutputTokens", 1024),
         adaptiveEnabled: this.adaptiveEnabled(),
+        freezeAdaptivity,
         userNumCtx: perCtx,
       });
       if (reb.plan) { plan = reb.plan; decision = reb.decision; }
@@ -1838,7 +1898,7 @@ export class PhotonController {
       const targetModelName = plan.model;
       const m = this.models.find((x) => x.name === targetModelName) ?? this.modelsForUi()[0];
       if (m) {
-        const cPlan = this.cloudPlan(m, this.mode, effectivePrompt);
+        const cPlan = this.cloudPlan(m, this.mode, effectivePrompt, sessionTaskContext);
         const eff = this.effectiveModelConfig(m.name);
         const pCtx = eff?.numCtx ?? eff?.llamacpp?.ctx;
         if (pCtx && pCtx > 0) { cPlan.numCtx = pCtx; cPlan.contextWindow = pCtx; }
@@ -1846,6 +1906,9 @@ export class PhotonController {
         plan = cPlan;
         this.plan = cPlan;
       }
+    }
+    if (plan.task) {
+      this.lastTurnTaskBySession.set(this.session.id, { task: plan.task, mode: this.mode });
     }
     this.lastDecision = decision;
     if (decision.escalationNotice) {
@@ -1872,19 +1935,18 @@ export class PhotonController {
       },
       plan.model
     );
-    if (
-      shouldAutoCompact(this.session.messages, activeCtxWindow, plan.model, 0.75, {
+    const needsPreTurnAutoCompact = shouldAutoCompact(
+      this.session.messages,
+      activeCtxWindow,
+      plan.model,
+      0.75,
+      {
         incomingTokens,
         fixedOverheadTokens: estFixedOverhead,
         // fitToWindow reserves this same generation budget before each request.
         reserveOutputTokens: plan.maxOutputTokens,
-      })
-    ) {
-      this.output.appendLine(
-        `[compactor] Projected context usage >= 75% of the usable ${activeCtxWindow}-token window (model=${plan.model}) — auto-compacting session before turn.`
-      );
-      await this.runCompactCommand(undefined, true);
-    }
+      }
+    );
 
     // Pin the target session for this turn so a mid-stream session switch
     // can't cause late callbacks to land in the wrong conversation.
@@ -1901,6 +1963,14 @@ export class PhotonController {
     if (session.messages.length === 1) {
       session.title = effectivePrompt.slice(0, 40);
     }
+
+    if (needsPreTurnAutoCompact) {
+      this.output.appendLine(
+        `[compactor] Projected context usage >= 75% of the usable ${activeCtxWindow}-token window (model=${plan.model}) — auto-compacting session before turn.`
+      );
+      await this.runCompactCommand(undefined, true);
+    }
+
     await this.persistActiveSession(session);
     this.checkpointCoord.beginTurn(session.id, userMsg.id, effectivePrompt);
     this.providers.setThinkingLevel((this.thinkingLevel ?? "auto") as any);
@@ -2048,6 +2118,12 @@ export class PhotonController {
 
       resultCompacted = true;
 
+      if (isAuto) {
+        for (const m of result.newMessages) {
+          if (m.isCompacted) m.hidden = true;
+        }
+      }
+
       session.messages = result.newMessages;
       session.updatedAt = Date.now();
       await this.persistActiveSession(session);
@@ -2064,7 +2140,9 @@ export class PhotonController {
         },
       });
 
-      this.safePost({ type: "sessionLoaded", payload: session });
+      if (!isAuto) {
+        this.safePost({ type: "sessionLoaded", payload: session });
+      }
       this.safePost({
         type: "contextCompacted",
         payload: {
@@ -2182,6 +2260,10 @@ export class PhotonController {
           payload: { kind: phase === "thinking" ? "thinking" : "running", detail },
         });
       },
+      onCompacting: (active) => {
+        if (!isLive()) return;
+        this.safePost({ type: "compactingStatus", payload: { active } });
+      },
       onToolCall: (id, call) => {
         const m = ensure(id);
         m.toolCalls = [...(m.toolCalls ?? []), call];
@@ -2255,6 +2337,22 @@ export class PhotonController {
         if (!isLive()) return;
         this.safePost({ type: "error", payload: { message } });
       },
+      onTurnTelemetry: (summary) => {
+        const extra = [
+          summary.peakRung && summary.peakRung > summary.rung ? ` peak=${summary.peakRung}` : "",
+          summary.protocolDowngraded ? " downgraded" : "",
+          summary.autoReverted?.length ? ` reverted=${summary.autoReverted.join(",")}` : "",
+        ].join("");
+        this.output.appendLine(
+          `[telemetry] model=${summary.model} steps=${summary.steps} rung=${summary.rung}${extra} counts=${JSON.stringify(summary.counts)}`
+        );
+        const mInfo = this.models.find((m) => m.name === summary.model) ?? { name: summary.model };
+        if (!this.adaptivityFrozen() && this.adaptiveEnabled() && isLocalModel(mInfo)) {
+          void this.passportStore.recordTurn(mInfo, summary);
+        }
+        if (!isLive()) return;
+        this.safePost({ type: "turnTelemetry", payload: summary });
+      },
     };
   }
 
@@ -2262,9 +2360,14 @@ export class PhotonController {
 
   /** A permissive plan for cloud models: the model's own context window,
    *  native tool calling, no tool caps, and generous mode-governed loop ceilings. */
-  private cloudPlan(model: ModelInfo, mode: Mode, prompt?: string): AdaptivePlan {
+  private cloudPlan(
+    model: ModelInfo,
+    mode: Mode,
+    prompt?: string,
+    sessionTaskCtx?: import("../shared/types").SessionTaskContext
+  ): AdaptivePlan {
     const contextWindow = model.contextLength ?? 128_000;
-    const task = analyzeTask(prompt ?? "", mode);
+    const task = analyzeTask(prompt ?? "", mode, 0, sessionTaskCtx);
     const MODE_CAPS: Record<Mode, number> = { chat: 100, plan: 150, agent: 200 };
     const hardCap = MODE_CAPS[mode] ?? 200;
     const capabilities = capabilityForModel(model);
@@ -2279,10 +2382,10 @@ export class PhotonController {
       maxOutputTokens: Math.floor(contextWindow * 0.25),
       toolProtocol: "native",
       maxTools: 100,
-      allowParallelTools: false,
-      intelligence: "max",
+      allowParallelTools: policy?.allowParallelReads ?? true,
+      intelligence: "low",
       intelligenceAuto: false,
-      rationale: ["Cloud mode: direct native tool calling with mode-governed step caps."],
+      rationale: ["Cloud mode: lean autonomous prompt with native tool calling and mode-governed step caps."],
       task,
       modelCapabilities: capabilities,
       executionPolicy: policy,
@@ -2335,7 +2438,7 @@ export class PhotonController {
         signal.removeEventListener("abort", onParentAbort);
       }
     }
-    const system = buildCloudSystemPrompt({
+    const cloudPrompt = buildCloudSystemPromptWithReport({
       mode: plan.mode,
       workspaceName: vscode.workspace.workspaceFolders?.[0]?.name,
       workspaceMap,
@@ -2344,6 +2447,13 @@ export class PhotonController {
       retrievedContext,
       customizationsPrompt: this.buildActiveCustomizationsPrompt(),
     });
+    const system = cloudPrompt.text;
+    const promptSectionSummary = cloudPrompt.report.sections
+      .map((s) => `${s.id}:${s.tokens}${s.status !== "kept" ? `(${s.status})` : ""}`)
+      .join(", ");
+    this.output.appendLine(
+      `[cloud-prompt] model=${plan.model} policy=${toolPolicy} total=${cloudPrompt.report.totalTokens} tok (${promptSectionSummary})`
+    );
     const MODE_CAPS: Record<Mode, number> = { chat: 100, plan: 150, agent: 200 };
     const prevPolicy = getCloudToolPolicy();
     setCloudToolPolicy(toolPolicy);
@@ -2361,6 +2471,8 @@ export class PhotonController {
         provider: this.providers,
         model: plan.model,
         system,
+        promptReport: cloudPrompt.report,
+        intelligence: plan.intelligence,
         history: cloudHistoryFromSession(session.messages),
         tools: cloudTools(plan.mode, mcpTools),
         contextWindow: this.getActiveContextLimit(plan.model),
@@ -2402,13 +2514,13 @@ export class PhotonController {
       log: (m) => this.output.appendLine(`[tool] ${m}`),
       webSearchProvider: vscode.workspace
         .getConfiguration("photon")
-        .get<"google" | "duckduckgo" | "none">("webSearch.provider", "google"),
+        .get<"google" | "duckduckgo" | "none">("webSearch.provider", "duckduckgo"),
       requestApproval: (call) => this.requestApproval(call),
       findFiles: (query, maxResults) => this.findFiles(query, maxResults),
       // Scales every tool's output budget: tiny models get tight clamps that
       // protect their context window; strong/cloud models get generous ones so
       // results are never needlessly truncated.
-      capability: this.plan?.intelligence ?? "medium",
+      capability: this.interfaceMode === "cloud" ? "max" : (this.plan?.intelligence ?? "medium"),
       getDiagnostics: (absPath) => this.collectDiagnostics(absPath),
       todos: [],
       checkpointTracker: {
@@ -2501,6 +2613,7 @@ export class PhotonController {
     if (!sp) return;
     if (typeof sp.temp === "number" && Number.isFinite(sp.temp)) {
       plan.temperature = Math.max(0, Math.min(2, sp.temp));
+      plan.samplingOverridden = true;
     }
     if (typeof sp.topP === "number" && Number.isFinite(sp.topP) && sp.topP > 0 && sp.topP <= 1) {
       plan.topP = sp.topP;
@@ -2535,6 +2648,8 @@ export class PhotonController {
       intelligence: this.effectiveIntelligence(),
       reserveOutputTokens: cfg.get<number>("context.reserveOutputTokens", 1024),
       adaptiveEnabled: this.adaptiveEnabled(),
+      passport: this.passportStore.forModel(model),
+      freezeAdaptivity: this.adaptivityFrozen(),
       sampling: perCfg?.sampling,
     });
   }
@@ -2547,12 +2662,17 @@ export class PhotonController {
     return vscode.workspace.getConfiguration("photon").get<boolean>("adaptive.enabled", true);
   }
 
+  private adaptivityFrozen(): boolean {
+    return vscode.workspace.getConfiguration("photon").get<boolean>("adaptive.freeze", false);
+  }
+
   private buildConfig(): PhotonConfig {
     const cfg = vscode.workspace.getConfiguration("photon");
     return {
       autoApprove: this.approvals.autoApprove,
       adaptiveEnabled: this.adaptiveEnabled(),
-      webSearchProvider: cfg.get<"google" | "duckduckgo" | "none">("webSearch.provider", "google"),
+      adaptivityFrozen: this.adaptivityFrozen(),
+      webSearchProvider: cfg.get<"google" | "duckduckgo" | "none">("webSearch.provider", "duckduckgo"),
       ollamaBaseUrl: this.client.baseUrl,
       llamacppBaseUrl: cfg.get<string>("llamacpp.baseUrl", "http://localhost:8080"),
       numCtxOverride: this.effectiveNumCtx() ?? 0,

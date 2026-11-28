@@ -44,10 +44,12 @@ import {
   ChevronRightIcon,
 } from "./Icons";
 import { Toggle } from "./Toggle";
+import { HelpTip } from "./HelpTip";
 import { AddCustomEndpoint, CloudProviderCard } from "./CloudProviders";
 import { CapabilityBadges } from "./CapabilityBadges";
 import { ModelConfigs } from "./ModelConfigs";
 import { LocalProviderHub } from "./LocalProviderHub";
+import { ProviderLogo } from "./ProviderLogos";
 import { PullProgressBar } from "./PullProgressBar";
 import { CustomizationsTab, type CustomizationSection } from "./CustomizationsTab";
 import {
@@ -79,11 +81,11 @@ function indexSummary(s: IndexStatus): string {
 }
 
 const INTELLIGENCE_OPTIONS: { value: IntelligenceSetting; label: string; hint: string }[] = [
-  { value: "auto", label: "Auto", hint: "Scales scaffolding automatically by model size." },
-  { value: "max", label: "Max", hint: "Maximum guidance and worked examples for 2–8B models." },
-  { value: "high", label: "High", hint: "Structured workflow and tool verification rules." },
-  { value: "medium", label: "Balanced", hint: "Standard workflow and tool result synthesis." },
-  { value: "low", label: "Minimal", hint: "Minimal prompt overhead for frontier models." },
+  { value: "auto", label: "Auto", hint: "Automatically picks the best guidance level for your active model." },
+  { value: "max", label: "Max", hint: "Extra examples and strict step-by-step help for small local models (2B–8B)." },
+  { value: "high", label: "High", hint: "Clear workflow and tool-checking rules for mid-sized models." },
+  { value: "medium", label: "Balanced", hint: "Standard guidance for capable local and cloud models." },
+  { value: "low", label: "Minimal", hint: "Lightest prompt for top cloud models to save tokens." },
 ];
 
 type Tab = "general" | "tools" | "models" | "providers" | "customizations" | "advanced";
@@ -210,7 +212,11 @@ export function SettingsPanel({
           {/* ───── General ───── */}
           {tab === "general" && (
             <>
-              <Category title="Appearance" iconNode={<SparkleIcon />}>
+              <Category
+                title="Appearance"
+                iconNode={<SparkleIcon />}
+                help="Choose whether Photon follows your VS Code theme or stays in dark or light mode."
+              >
                 <div className="intelligence-grid">
                   {(
                     [
@@ -230,16 +236,13 @@ export function SettingsPanel({
                     </button>
                   ))}
                 </div>
-                <div className="settings-hint">
-                  {themePref === "auto"
-                    ? "Matches your VS Code dark or light theme automatically."
-                    : themePref === "light"
-                      ? "Warm stone frosted light palette with softened contrast."
-                      : "Soft charcoal frosted dark theme with gentle contrast."}
-                </div>
               </Category>
 
-              <Category title="Adaptive Scaffolding" iconNode={<BoltIcon />}>
+              <Category
+                title="AI Guidance Level"
+                iconNode={<BoltIcon />}
+                help="Controls how much step-by-step guidance Photon gives the AI. Smaller local models work best with higher guidance; large cloud models need less."
+              >
                 <div className="intelligence-grid">
                   {INTELLIGENCE_OPTIONS.map((opt) => (
                     <button
@@ -259,16 +262,36 @@ export function SettingsPanel({
                 </div>
               </Category>
 
-              <Category title="Adaptive Engine" iconNode={<SlidersIcon />}>
-                <Row label="Hardware-aware context & model tuning">
+              <Category
+                title="Adaptive Engine"
+                iconNode={<SlidersIcon />}
+                help="Automatically tunes memory limits, tool formats, and recovery steps while the AI works."
+              >
+                <Row
+                  label="Auto-tune for your hardware"
+                  help="Automatically picks safe memory limits and settings based on your GPU, VRAM, and RAM."
+                >
                   <Toggle
                     checked={state.config.adaptiveEnabled}
                     onChange={actions.setAdaptiveEnabled}
                   />
                 </Row>
+                <Row
+                  label="Lock settings during a reply"
+                  help="Keeps prompt and tool rules fixed during a turn instead of adjusting mid-response."
+                >
+                  <Toggle
+                    checked={Boolean(state.config.adaptivityFrozen)}
+                    onChange={actions.setAdaptivityFrozen}
+                  />
+                </Row>
               </Category>
 
-              <Category title="Context Limit" iconNode={<RulerIcon />}>
+              <Category
+                title="Memory Window (Context Limit)"
+                iconNode={<RulerIcon />}
+                help="How much conversation history and file content the AI can read at once. Larger windows remember more but use more RAM/VRAM."
+              >
                 <div className="ctx-preset-grid">
                   {CONTEXT_PRESETS.map((p) => {
                     const isCloud = state.config.interfaceMode === "cloud";
@@ -298,9 +321,10 @@ export function SettingsPanel({
                   })}
                 </div>
                 <Row
-                  label={`Custom tokens (${
+                  label={`Custom token limit (${
                     state.plan ? `active: ${formatK(state.plan.numCtx)}` : "0 = Auto"
                   })`}
+                  help="Set an exact token limit, or enter 0 to let Photon size it automatically for your hardware."
                 >
                   <input
                     className="settings-input"
@@ -318,7 +342,11 @@ export function SettingsPanel({
                 </Row>
               </Category>
 
-              <Category title="Project Configuration" iconNode={<FolderIcon />}>
+              <Category
+                title="Project Config"
+                iconNode={<FolderIcon />}
+                help="Save shared model defaults and per-model settings in .photon/config.json inside your project folder for your team."
+              >
                 {state.config.projectConfig?.error ? (
                   <div className="project-config-status error">
                     <div className="project-config-head">
@@ -372,19 +400,17 @@ export function SettingsPanel({
                     )}
                   </div>
                 ) : (
-                  <div className="project-config-status empty">
-                    <div className="settings-hint">
-                      No checked-in <code>.photon/config.json</code> found in this workspace. Create one to share team defaults and per-model overrides.
-                    </div>
-                    <div className="project-config-actions">
-                      <button
-                        type="button"
-                        className="btn btn-sm"
-                        onClick={() => actions.createProjectConfig()}
-                      >
-                        Create .photon/config.json
-                      </button>
-                    </div>
+                  <div className="settings-row">
+                    <span className="settings-hint">
+                      No <code>.photon/config.json</code> in this workspace.
+                    </span>
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      onClick={() => actions.createProjectConfig()}
+                    >
+                      Create Config
+                    </button>
                   </div>
                 )}
               </Category>
@@ -394,7 +420,11 @@ export function SettingsPanel({
           {/* ───── Models ───── */}
           {tab === "models" && (
             <>
-              <Category title="Active Model" iconNode={<BotIcon />}>
+              <Category
+                title="Active Model"
+                iconNode={<BotIcon />}
+                help="The AI model currently answering your chats, plus any local models currently loaded in your GPU or RAM."
+              >
                 {model ? (
                   <>
                     <div className="settings-row">
@@ -451,10 +481,14 @@ export function SettingsPanel({
                 )}
               </Category>
 
-              <Category title="Installed Local Models" iconNode={<CpuIcon />}>
+              <Category
+                title="Installed Local Models"
+                iconNode={<CpuIcon />}
+                help="Models already downloaded on your computer. Click 'Use Model' to switch to one immediately."
+              >
                 <div className="sensed-runtimes-head">
                   <span className="settings-hint">
-                    Models sensed on your machine ({state.models.filter((m) => isLocalModel(m)).length} found)
+                    {state.models.filter((m) => isLocalModel(m)).length} model(s) on your machine
                   </span>
                   <button
                     type="button"
@@ -478,7 +512,7 @@ export function SettingsPanel({
                   if (localInstalled.length === 0) {
                     return (
                       <div className="settings-hint" style={{ padding: "6px 0" }}>
-                        No local models sensed yet. Click <strong>Scan Models</strong> or pull a recommended model below.
+                        No local models found yet. Click <strong>Scan Models</strong> or pull one below.
                       </div>
                     );
                   }
@@ -547,7 +581,11 @@ export function SettingsPanel({
                 })()}
               </Category>
 
-              <Category title="Recommended Local Models Catalog" iconNode={<SparkleIcon />}>
+              <Category
+                title="Recommended Local Models"
+                iconNode={<SparkleIcon />}
+                help="Curated local models matched to your GPU and RAM. Filter by Code, Reason, Vision, or Fast, then click Pull to download."
+              >
                 <div className="sensed-runtimes-head">
                   <span className="settings-hint">
                     {state.machine?.gpu
@@ -718,23 +756,36 @@ export function SettingsPanel({
                 </div>
               </Category>
 
-              <Category title="Model Parameters" iconNode={<WrenchIcon />} defaultOpen={false}>
+              <Category
+                title="Model Parameters"
+                iconNode={<WrenchIcon />}
+                defaultOpen={false}
+                help="Customize memory limit, creativity (temperature), and GPU launch flags for individual models."
+              >
                 <ModelConfigs state={state} actions={actions} />
               </Category>
 
-              <Category title="Benchmarks" iconNode={<ChartIcon />} defaultOpen={false}>
-                <Row label="Measure local tok/s & tool reliability">
+              <Category
+                title="Speed & Reliability Test"
+                iconNode={<ChartIcon />}
+                defaultOpen={false}
+                help="Runs a quick local benchmark to measure generation speed (tokens/sec), tool accuracy, and reasoning."
+              >
+                <Row
+                  label="Test local speed & tool accuracy"
+                  help="Measures how fast your local model generates text (tok/s) and whether it calls tools reliably."
+                >
                   <button className="btn btn-sm" onClick={() => actions.runBench()}>
-                    Run Bench
+                    Run Test
                   </button>
                 </Row>
                 {state.benchResults.length > 0 && (
                   <div className="bench-table">
                     <div className="bench-head">
                       <span>Model</span>
-                      <span>tok/s</span>
-                      <span>tools</span>
-                      <span>reason</span>
+                      <span title="Tokens generated per second">tok/s</span>
+                      <span title="Tool calling reliability score">tools</span>
+                      <span title="Passed logic & reasoning check">reason</span>
                       <span />
                     </div>
                     {state.benchResults.map((b) => (
@@ -779,11 +830,19 @@ export function SettingsPanel({
           {/* ───── Providers ───── */}
           {tab === "providers" && (
             <>
-              <Category title="Local Engine" iconNode={<CpuIcon />}>
+              <Category
+                title="Local Engine"
+                iconNode={<CpuIcon />}
+                help="Start, stop, or monitor the local background engine (Ollama or llama.cpp) running on your computer."
+              >
                 <LocalProviderHub state={state} actions={actions} />
               </Category>
 
-              <Category title="Detected Local Runtimes" iconNode={<PlugIcon />}>
+              <Category
+                title="Detected Local Runtimes"
+                iconNode={<PlugIcon />}
+                help="Local AI servers found on your computer and their active ports."
+              >
                 <div className="sensed-runtimes-head">
                   <span className="settings-hint">Ollama, llama.cpp, LM Studio &amp; vLLM</span>
                   <button
@@ -809,7 +868,12 @@ export function SettingsPanel({
                     return (
                       <div key={r.id} className={`sensed-runtime-card ${r.state}`}>
                         <div className="sensed-runtime-head">
-                          <span className="sensed-runtime-name">{r.label}</span>
+                          <span className="sensed-runtime-title">
+                            <span className="sensed-runtime-logo" title={r.label}>
+                              <ProviderLogo providerId={r.id} label={r.label} baseUrl={r.baseUrl} size={15} />
+                            </span>
+                            <span className="sensed-runtime-name">{r.label}</span>
+                          </span>
                           <span className={`sensed-runtime-badge ${r.state}`}>
                             {isRunning ? (
                               <>
@@ -893,7 +957,11 @@ export function SettingsPanel({
                 </div>
               </Category>
 
-              <Category title="Cloud Providers" iconNode={<LinkIcon />}>
+              <Category
+                title="Cloud Providers"
+                iconNode={<LinkIcon />}
+                help="Connect cloud AI services (OpenAI, Claude, Gemini, Groq, OpenRouter, etc.) using your API keys."
+              >
                 <div className="provider-list">
                   {state.config.providers
                     .filter((p) => !p.isLocal && p.id !== "ollama" && p.id !== "llamacpp")
@@ -914,14 +982,28 @@ export function SettingsPanel({
           {/* ───── Tools ───── */}
           {tab === "tools" && (
             <>
-              <Category title="Execution Safety" iconNode={<ShieldIcon />}>
-                <Row label="Auto-approve file edits & terminal commands">
+              <Category
+                title="Approval & Safety"
+                iconNode={<ShieldIcon />}
+                help="Control whether Photon asks your permission before editing files or running terminal commands."
+              >
+                <Row
+                  label="Auto-approve file edits & terminal commands"
+                  help="When off, Photon pauses and asks you to approve every file change or terminal command before running it."
+                >
                   <Toggle checked={state.config.autoApprove} onChange={actions.setAutoApprove} />
                 </Row>
               </Category>
 
-              <Category title="Web Search" iconNode={<SearchIcon />}>
-                <Row label="Search engine">
+              <Category
+                title="Web Search"
+                iconNode={<SearchIcon />}
+                help="Lets the AI search the live web for documentation, current facts, and weather."
+              >
+                <Row
+                  label="Search engine"
+                  help="Choose which search provider the AI uses, or select Disabled to turn off live web search."
+                >
                   <select
                     className="settings-select"
                     value={state.config.webSearchProvider}
@@ -940,14 +1022,18 @@ export function SettingsPanel({
 
               {state.tools.length > 0 && (
                 <Category
-                  title={`Registered Tools (${state.tools.length})`}
+                  title={`Built-in Tools (${state.tools.length})`}
                   iconNode={<ToolboxIcon />}
                   defaultOpen={false}
+                  help="Tools the AI can call to read files, search code, edit files, and run commands. Tools marked 'writes' can modify your project."
                 >
                   <div className="tool-list">
                     {state.tools.map((t) => (
                       <div key={t.name} className="tool-list-row" title={t.summary}>
-                        <span className="tool-list-name">{t.name}</span>
+                        <span className="settings-row-label">
+                          <span className="tool-list-name">{t.name}</span>
+                          {t.summary && <HelpTip text={t.summary} />}
+                        </span>
                         {t.sideEffecting && <span className="tool-list-badge">writes</span>}
                       </div>
                     ))}
@@ -960,14 +1046,24 @@ export function SettingsPanel({
           {/* ───── Advanced ───── */}
           {tab === "advanced" && (
             <>
-              <Category title="Workspace Index" iconNode={<FolderIcon />}>
-                <Row label="Local code & symbol indexing">
+              <Category
+                title="Codebase Indexing"
+                iconNode={<FolderIcon />}
+                help="Builds a local search index of your workspace so the AI can quickly find relevant files and functions."
+              >
+                <Row
+                  label="Enable local code indexing"
+                  help="Indexes your project files in the background using a small local embedding model."
+                >
                   <Toggle
                     checked={state.config.indexingEnabled}
                     onChange={actions.setIndexingEnabled}
                   />
                 </Row>
-                <Row label="Embedding model">
+                <Row
+                  label="Embedding model"
+                  help="Small local Ollama model used to convert code into searchable vectors (nomic-embed-text recommended)."
+                >
                   <select
                     className="settings-select"
                     value={state.config.embeddingModel}
@@ -1018,27 +1114,29 @@ export function SettingsPanel({
                 </div>
               </Category>
 
-              <Category title="MCP Servers" iconNode={<LinkIcon />}>
+              <Category
+                title="MCP Servers"
+                iconNode={<LinkIcon />}
+                help="Connect external tools, databases, and services using the Model Context Protocol (MCP)."
+              >
                 {CUSTOMIZATIONS_ENABLED ? (
-                  <>
-                    <div className="settings-hint">
+                  <div className="settings-row">
+                    <span className="settings-hint">
                       {state.mcpServers.length === 0
-                        ? "No MCP servers configured yet."
-                        : `${state.mcpServers.filter((s) => s.status === "connected").length} of ${state.mcpServers.length} MCP server(s) connected.`}
-                    </div>
-                    <div style={{ marginTop: 8 }}>
-                      <button
-                        type="button"
-                        className="btn btn-sm"
-                        onClick={() => {
-                          setCustomSection("mcp");
-                          setTab("customizations");
-                        }}
-                      >
-                        Manage in Customizations →
-                      </button>
-                    </div>
-                  </>
+                        ? "No MCP servers configured."
+                        : `${state.mcpServers.filter((s) => s.status === "connected").length} of ${state.mcpServers.length} connected.`}
+                    </span>
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      onClick={() => {
+                        setCustomSection("mcp");
+                        setTab("customizations");
+                      }}
+                    >
+                      Manage →
+                    </button>
+                  </div>
                 ) : state.mcpServers.length === 0 ? (
                   <div className="settings-hint">
                     Configure MCP servers in <code>.vscode/mcp.json</code>.
@@ -1096,10 +1194,20 @@ export function SettingsPanel({
                 )}
               </Category>
 
-              <Category title="Diagnostics" iconNode={<HeartPulseIcon />} defaultOpen={false}>
-                <button className="btn btn-sm" onClick={actions.diagnostics}>
-                  Open Output Diagnostics
-                </button>
+              <Category
+                title="Diagnostics"
+                iconNode={<HeartPulseIcon />}
+                defaultOpen={false}
+                help="View hardware detection, provider status, and adaptive engine logs in the VS Code Output panel."
+              >
+                <Row
+                  label="System & model diagnostics log"
+                  help="Opens the Photon Diagnostics channel in VS Code Output with full hardware and engine details."
+                >
+                  <button className="btn btn-sm" onClick={actions.diagnostics}>
+                    Open Logs
+                  </button>
+                </Row>
               </Category>
             </>
           )}
@@ -1131,10 +1239,21 @@ export function SettingsPanel({
   );
 }
 
-function Row({ label, children }: { label: string; children: ReactNode }) {
+function Row({
+  label,
+  help,
+  children,
+}: {
+  label: string;
+  help?: string;
+  children: ReactNode;
+}) {
   return (
     <div className="settings-row">
-      <span>{label}</span>
+      <span className="settings-row-label">
+        <span>{label}</span>
+        {help && <HelpTip text={help} />}
+      </span>
       {children}
     </div>
   );
@@ -1143,11 +1262,13 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
 function Category({
   title,
   iconNode,
+  help,
   children,
   defaultOpen = true,
 }: {
   title: string;
   iconNode: ReactNode;
+  help?: string;
   children: ReactNode;
   defaultOpen?: boolean;
 }) {
@@ -1158,6 +1279,7 @@ function Category({
         <span className="category-label">
           <span className="category-icon">{iconNode}</span>
           <span>{title}</span>
+          {help && <HelpTip text={help} />}
         </span>
         <span className="category-chevron">
           <ChevronRightIcon />

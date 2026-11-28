@@ -14,6 +14,8 @@ import {
 import { runCloudTurn } from "../../src/core/agent/cloudEngine";
 import { runUnifiedTurn } from "../../src/core/agent/unifiedEngine";
 import { enforceSessionMessageCap } from "../../src/host/sessionCoordinator";
+import { getClaudeThinkingLabel } from "../../webview-ui/src/components/StatusIndicator";
+import { computeSummary } from "../../webview-ui/src/components/TurnProcess";
 import type { AdaptivePlan, ChatMessage, SessionState, ToolCall } from "../../src/shared/types";
 import type { LLMChatChunk, LLMChatRequest, LLMProvider } from "../../src/core/llm/types";
 import type { Tool } from "../../src/core/tools/types";
@@ -1139,6 +1141,129 @@ describe("Context Compaction Engine (P1 Item 4)", () => {
         "openai:gpt-4.1",
         "openai:gpt-4.1",
       ]);
+    });
+
+    it("surfaces live compacting status during mid-turn compaction and hides mid-turn compaction cards at the end of the response", async () => {
+      // 1. Verify StatusIndicator and TurnProcess labels during live compaction
+      assert.equal(
+        getClaudeThinkingLabel("Compacting context window", "thinking"),
+        "Compacting context window...",
+        "Must NOT misclassify 'Compacting context window' as 'Understanding request...'"
+      );
+      assert.equal(
+        getClaudeThinkingLabel("Context overflow — compacting and retrying", "thinking"),
+        "Compacting context window..."
+      );
+      const procSummary = computeSummary([], 0, true, false, false, true);
+      assert.equal(procSummary.badge, "Compacting");
+      assert.equal(procSummary.text, "Compacting context window…");
+
+      // 2. Verify UnifiedEngine emits onCompacting(true -> false) at compaction time and marks mid-turn digest hidden
+      const compactingEvents: boolean[] = [];
+      let attempt = 0;
+      const plan: AdaptivePlan = {
+        model: "qwen2.5-coder:7b",
+        mode: "chat",
+        contextWindow: 8192,
+        numCtx: 8192,
+        temperature: 0.2,
+        topP: 0.9,
+        maxOutputTokens: 1024,
+        toolProtocol: "native",
+        maxTools: 4,
+        allowParallelTools: false,
+        intelligence: "medium",
+        intelligenceAuto: false,
+        rationale: [],
+      };
+      const session = {
+        messages: [
+          makeUserMsg("u1", "Analyze module"),
+          makeAssistantMsg("a1", "Checked part 1"),
+          makeUserMsg("u2", "Check part 2"),
+          makeAssistantMsg("a2", "Checked part 2"),
+          makeUserMsg("u3", "Give final overview"),
+        ],
+      };
+      const provider: LLMProvider = {
+        id: "ollama",
+        label: "Ollama",
+        enabled: true,
+        isConfigured: () => true,
+        ping: async () => true,
+        listModels: async () => [],
+        async *chatStream(req: LLMChatRequest): AsyncGenerator<LLMChatChunk> {
+          if (req.messages[0]?.content.includes("context compaction engine")) {
+            // While summarizer is streaming, onCompacting(true) must already have been emitted
+            assert.deepEqual(compactingEvents, [true]);
+            yield {
+              done: true,
+              message: {
+                role: "assistant",
+                content: "### 🎯 Summary\n- Reviewed parts 1 and 2 successfully.",
+              },
+            };
+            return;
+          }
+          attempt++;
+          if (attempt === 1) {
+            throw new Error("prompt is too long for context window");
+          }
+          // By the time the retry step streams, onCompacting(false) must have been emitted
+          assert.deepEqual(compactingEvents, [true, false]);
+          yield {
+            done: true,
+            done_reason: "stop",
+            message: { role: "assistant", content: "Final answer." },
+          };
+        },
+      };
+
+      await runUnifiedTurn(
+        session,
+        plan,
+        {
+          onAssistantStart: () => {},
+          onDelta: () => {},
+          onContent: () => {},
+          onAssistantCancel: () => {},
+          onPhase: () => {},
+          onCompacting: (active) => compactingEvents.push(active),
+          onToolCall: () => {},
+          onToolUpdate: () => {},
+          onUsage: () => {},
+          onGenerationStats: () => {},
+          onDone: () => {},
+          onError: () => {},
+        },
+        new AbortController().signal,
+        {
+          provider,
+          tools: [],
+          buildToolContext: (sig) => ({
+            mode: "chat",
+            workspaceRoot: "B:/repo",
+            signal: sig,
+            log: () => {},
+            webSearchProvider: "duckduckgo",
+            findFiles: async () => [],
+            capability: "medium",
+            getDiagnostics: async () => [],
+            todos: [],
+            requestApproval: async () => true,
+          }),
+          reserveOutputTokens: 1024,
+        }
+      );
+
+      assert.deepEqual(compactingEvents, [true, false]);
+      const compactedMsg = session.messages.find((m) => m.isCompacted);
+      assert.ok(compactedMsg);
+      assert.equal(
+        compactedMsg?.hidden,
+        true,
+        "Mid-turn compacted digest must be hidden so it does not render a 'Context Window Compacted' card at the end of the response"
+      );
     });
   });
 });

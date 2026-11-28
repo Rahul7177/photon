@@ -2,6 +2,7 @@ import { useState, useMemo } from "react";
 import type { AppState, Actions } from "../state/store";
 import type { ModelInfo } from "../../../src/shared/types";
 import { Toggle } from "./Toggle";
+import { HelpTip } from "./HelpTip";
 import { CapabilityBadges } from "./CapabilityBadges";
 import {
   CheckIcon,
@@ -39,49 +40,49 @@ const PROVIDER_META: Record<string, ProviderMeta> = {
   gemini: {
     id: "gemini",
     docsUrl: "https://aistudio.google.com/app/apikey",
-    hint: "Google Gemini via the Generative Language API. Connecting validates your key, auto-adds top models, and lists every model your account can use.",
+    hint: "Google Gemini API. Paste your AI Studio key to unlock Gemini 2.5 Pro & Flash models.",
     live: true,
   },
   claude: {
     id: "claude",
     docsUrl: "https://console.anthropic.com/settings/keys",
-    hint: "Anthropic Claude via /v1/messages with automatic ephemeral prompt caching (up to 90% input token discount on multi-step tasks).",
+    hint: "Anthropic Claude API with automatic prompt caching to reduce token costs on multi-step tasks.",
     live: true,
   },
   openai: {
     id: "openai",
     docsUrl: "https://platform.openai.com/api-keys",
-    hint: "OpenAI chat-completions API. Connecting validates your key and lists the models your organization can access.",
+    hint: "OpenAI API. Connect your key to list and use GPT and o-series reasoning models.",
     live: true,
   },
   nvidia: {
     id: "nvidia",
     docsUrl: "https://build.nvidia.com",
-    hint: "NVIDIA NIM — hosted Meta Llama, DeepSeek, Qwen, Nemotron and more via an OpenAI-compatible API.",
+    hint: "NVIDIA NIM — hosted Llama, DeepSeek, Qwen, and Nemotron models via an OpenAI-compatible API.",
     live: true,
   },
   openrouter: {
     id: "openrouter",
     docsUrl: "https://openrouter.ai/keys",
-    hint: "OpenRouter — one key, hundreds of models. Filter by category, ping latency, and add models in 1 click.",
+    hint: "One API key for hundreds of cloud models. Filter by category, test latency, and add models in one click.",
     live: true,
   },
   opencode: {
     id: "opencode",
     docsUrl: "https://opencode.ai/auth",
-    hint: "OpenCode Zen — curated, benchmarked coding models behind an OpenAI-compatible gateway.",
+    hint: "OpenCode Zen — curated coding models through an OpenAI-compatible gateway.",
     live: true,
   },
   blackbox: {
     id: "blackbox",
     docsUrl: "https://www.blackbox.ai",
-    hint: "Blackbox AI — OpenAI-compatible API. Add model IDs manually below.",
+    hint: "Blackbox AI — OpenAI-compatible coding API. Add model IDs below after connecting.",
     live: false,
   },
   llamacpp: {
     id: "llamacpp",
     docsUrl: "https://github.com/ggerganov/llama.cpp",
-    hint: "llama.cpp — local OpenAI-compatible server at photon.llamacpp.baseUrl/v1. Run with: llama-server -m model.gguf --port 8080. No API key needed.",
+    hint: "Local llama.cpp server (llama-server -m model.gguf --port 8080). No API key required.",
     live: true,
   },
 };
@@ -352,6 +353,7 @@ export function CloudProviderCard({
         <div className="provider-info">
           <div className="provider-title-row">
             <span className="provider-name">{provider.label}</span>
+            {meta.hint && <HelpTip text={meta.hint} />}
             {provider.configured && (
               <span className="provider-status-dot connected" title="Configured & Ready">
                 ●
@@ -414,9 +416,9 @@ export function CloudProviderCard({
       {/* ── Expandable Configuration & Models View ── */}
       {expanded && (
         <div className="provider-expand">
-          <div className="provider-hint-bar">
-            <span className="provider-hint-text">{meta.hint}</span>
-            {isCustom && (
+          {isCustom && (
+            <div className="provider-hint-bar">
+              <span className="provider-hint-text">{provider.baseUrl}</span>
               <button
                 type="button"
                 className="btn btn-sm ghost provider-edit-endpoint-btn"
@@ -430,8 +432,8 @@ export function CloudProviderCard({
               >
                 {editingEndpoint ? "Cancel Edit" : "Edit Endpoint"}
               </button>
-            )}
-          </div>
+            </div>
+          )}
 
           {isCustom && editingEndpoint && (
             <div className="provider-edit-endpoint-form">

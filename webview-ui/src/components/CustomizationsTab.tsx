@@ -23,6 +23,7 @@ import {
   TrashIcon,
 } from "./Icons";
 import { Toggle } from "./Toggle";
+import { HelpTip } from "./HelpTip";
 
 export type CustomizationSection = "mcp" | "skills" | "instructions" | "agents";
 
@@ -591,6 +592,13 @@ export function CustomizationsTab({
             <ChevronRightIcon />
           </span>
           <span className="custom-group-label">{label}</span>
+          <HelpTip
+            text={
+              scope === "user"
+                ? "Saved in your user profile (~/.photon) and shared across all your projects."
+                : "Saved inside this project folder (.photon or .vscode) for this workspace."
+            }
+          />
           <span className="custom-count-pill">{count}</span>
         </button>
         <div className="custom-group-actions">
@@ -655,9 +663,9 @@ export function CustomizationsTab({
 
       <div className="custom-pane">
         <div className="custom-pane-head">
-          <div>
+          <div className="settings-row-label">
             <h3 className="custom-pane-title">{meta.title}</h3>
-            <p className="custom-pane-sub">{meta.subtitle}</p>
+            <HelpTip text={meta.subtitle} />
           </div>
           <button
             type="button"

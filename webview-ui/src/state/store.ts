@@ -30,6 +30,7 @@ import type {
   ThinkingSetting,
   ToolCall,
   TokenUsage,
+  TurnReliabilitySummary,
 } from "../../../src/shared/types";
 import type { HostMessage, PhotonConfig, ToolSummary, CheckpointSummary } from "../../../src/shared/protocol";
 import { onHostMessage, post } from "../vscode";
@@ -80,11 +81,13 @@ export interface AppState {
   draftPrompt: string | null;
   revertModalOpen: boolean;
   showOnboarding: boolean;
+  turnTelemetry: TurnReliabilitySummary | null;
 }
 
 const initialConfig: PhotonConfig = {
   autoApprove: false,
   adaptiveEnabled: true,
+  adaptivityFrozen: false,
   webSearchProvider: "duckduckgo",
   ollamaBaseUrl: "",
   llamacppBaseUrl: "http://localhost:8080",
@@ -145,6 +148,7 @@ export const initial: AppState = {
   draftPrompt: null,
   revertModalOpen: false,
   showOnboarding: false,
+  turnTelemetry: null,
 };
 
 type LocalAction =
@@ -191,10 +195,11 @@ export function reducer(state: AppState, msg: Action): AppState {
         queuedTools: [],
         toolStartTimes: isSameSession ? state.toolStartTimes : {},
         decision: isSameSession ? state.decision : null,
+        turnTelemetry: isSameSession ? state.turnTelemetry : null,
       };
     }
     case "sessionList": return { ...state, sessions: msg.payload.sessions, activeSessionId: msg.payload.activeId };
-    case "planUpdated": return { ...state, plan: msg.payload };
+    case "planUpdated": return { ...state, plan: msg.payload, mode: msg.payload.mode ?? state.mode };
     case "config": return { ...state, config: msg.payload };
     case "messageAppended": return { ...state, messages: upsertLive(state.messages, msg.payload) };
     case "messageDelta": return { ...state, messages: state.messages.map((m) => m.id === msg.payload.id ? { ...m, content: capContent(m.content + msg.payload.delta), streaming: true } : m) };
@@ -284,6 +289,7 @@ export function reducer(state: AppState, msg: Action): AppState {
     case "indexStatus": return { ...state, indexStatus: msg.payload };
     case "mcpServers": return { ...state, mcpServers: msg.payload };
     case "customizations": return { ...state, customizations: msg.payload };
+    case "turnTelemetry": return { ...state, turnTelemetry: msg.payload };
     case "tools": return { ...state, tools: msg.payload };
     case "providerModels": return { ...state, providerModelsFetching: state.providerModelsFetching.filter((id) => id !== msg.payload.id), providerModels: { ...state.providerModels, [msg.payload.id]: msg.payload.models }, providerModelsError: { ...state.providerModelsError, [msg.payload.id]: msg.payload.error || "" } };
     case "modelTestResult": { const key = modelTestKey(msg.payload.providerId, msg.payload.model.name); return { ...state, modelTestRunning: state.modelTestRunning.filter((k) => k !== key), modelTestResults: { ...state.modelTestResults, [key]: { ok: msg.payload.ok, latencyMs: msg.payload.latencyMs, error: msg.payload.error } } }; }
@@ -439,6 +445,7 @@ export function useAppState() {
     setContextWindow: (numCtx: number) => post({ type: "setContextWindow", payload: { numCtx } }),
     setAutoApprove: (enabled: boolean) => post({ type: "setAutoApprove", payload: { enabled } }),
     setAdaptiveEnabled: (enabled: boolean) => post({ type: "setAdaptiveEnabled", payload: { enabled } }),
+    setAdaptivityFrozen: (frozen: boolean) => post({ type: "setAdaptivityFrozen", payload: { frozen } }),
     setIntelligence: (level: IntelligenceSetting) => post({ type: "setIntelligence", payload: { level } }),
     setWebSearchProvider: (provider: "google" | "duckduckgo" | "none") => post({ type: "setWebSearchProvider", payload: { provider } }),
     setProviderEnabled: (id: string, enabled: boolean) => post({ type: "setProviderEnabled", payload: { id, enabled } }),

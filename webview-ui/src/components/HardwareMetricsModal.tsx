@@ -95,6 +95,16 @@ export function HardwareMetricsModal({
     (ramTotal > 0 ? Math.min(100, Math.round((ramUsed / ramTotal) * 100)) : 0);
 
   const cu = state.cloudUsage;
+  const sessionHitPct =
+    cu?.sessionCacheHitPct ??
+    (cu && cu.sessionInputTokens > 0
+      ? Math.round((Math.min(cu.sessionInputTokens, cu.sessionCachedTokens) / cu.sessionInputTokens) * 1000) / 10
+      : 0);
+  const totalHitPct =
+    cu?.totalCacheHitPct ??
+    (cu && cu.totalInputTokens > 0
+      ? Math.round((Math.min(cu.totalInputTokens, cu.totalCachedTokens) / cu.totalInputTokens) * 1000) / 10
+      : 0);
   const localModels = state.models.filter(
     (m) => !m.provider || m.provider === "ollama" || m.provider === "llamacpp"
   );
@@ -389,6 +399,12 @@ export function HardwareMetricsModal({
                   <span className="cloud-stat-k">Est. Total Cost</span>
                   <span className="cloud-stat-v">{fmtUsd(cu?.totalEstimatedCostUsd)}</span>
                 </div>
+                <div className="cloud-stat-item">
+                  <span className="cloud-stat-k">Cache Hit Rate</span>
+                  <span className="cloud-stat-v" title={`Session: ${(cu?.sessionCachedTokens ?? 0).toLocaleString()} / ${(cu?.sessionInputTokens ?? 0).toLocaleString()} · All-time: ${totalHitPct}%`}>
+                    {sessionHitPct}% ({totalHitPct}% total)
+                  </span>
+                </div>
               </div>
 
               <div className="hw-models-section">
@@ -442,6 +458,14 @@ export function HardwareMetricsModal({
                         <span>{m.turns} turns</span>
                         <span>· {m.inputTokens.toLocaleString()} in</span>
                         <span>· {m.outputTokens.toLocaleString()} out</span>
+                        {m.inputTokens > 0 && (() => {
+                          const hitPct = m.cacheHitPct ?? Math.round((Math.min(m.inputTokens, m.cachedTokens) / m.inputTokens) * 1000) / 10;
+                          return (
+                            <span>
+                              · {hitPct}% cached ({m.cachedTokens.toLocaleString()} tok)
+                            </span>
+                          );
+                        })()}
                         {m.savedTokens > 0 && (
                           <span className="hw-tag-ok">
                             · ~{m.savedTokens.toLocaleString()} saved

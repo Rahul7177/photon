@@ -28,6 +28,11 @@ function groupTurns(messages: ChatMessage[]): TurnGroup[] {
 
   for (const m of messages) {
     if (m.hidden) continue;
+    if (m.isCompacted || m.content.includes("[Context Compaction Summary]")) {
+      flushAssistant();
+      groups.push({ kind: "system", id: m.id, message: m });
+      continue;
+    }
     if (m.role === "assistant") {
       currentAssistant.push(m);
     } else if (m.role === "user") {
@@ -81,15 +86,17 @@ export function MessageList({
       {turnGroups.map((g, idx) => {
         if (g.kind === "assistant") {
           const isWorking = state.status === "thinking" || state.status === "running";
+          const isLastGroup = idx === turnGroups.length - 1;
           return (
             <AssistantTurn
               key={g.id}
               messages={g.messages}
               pendingApproval={state.pendingApproval}
               actions={actions}
-              isWorking={isWorking && idx === turnGroups.length - 1}
+              isWorking={isWorking && isLastGroup}
               status={state.status}
               statusDetail={state.statusDetail}
+              isCompacting={state.isCompacting && isLastGroup}
             />
           );
         }
@@ -105,14 +112,20 @@ export function MessageList({
 
       {/* Claude Code-style live thinking indicator when turn is active before assistant chunks */}
       {(() => {
-        const isWorking = state.status === "thinking" || state.status === "running";
+        const isWorking = state.status === "thinking" || state.status === "running" || state.isCompacting;
         const lastGroup = turnGroups[turnGroups.length - 1];
         if (isWorking && (!lastGroup || lastGroup.kind !== "assistant")) {
           return (
             <div className="msg assistant">
               <div className="msg-body">
                 <ClaudeThinkingIndicator
-                  label={getClaudeThinkingLabel(state.statusDetail, state.status)}
+                  label={getClaudeThinkingLabel(
+                    state.statusDetail,
+                    state.status,
+                    false,
+                    false,
+                    state.isCompacting
+                  )}
                 />
               </div>
             </div>
@@ -121,21 +134,23 @@ export function MessageList({
         return null;
       })()}
 
-      {state.isCompacting && (
-        <div className="msg-compact-wrapper in-progress" role="status" aria-live="polite">
-          <div className="msg-compact-card in-progress">
-            <div className="msg-compact-header in-progress">
-              <div className="msg-compact-title-group">
-                <span className="msg-compact-icon pulse">
-                  <BoltIcon />
-                </span>
-                <span className="msg-compact-title">Compacting Context Window...</span>
-                <span className="msg-compact-badge pulse">Compressing earlier turns</span>
+      {state.isCompacting &&
+        state.status === "idle" &&
+        turnGroups[turnGroups.length - 1]?.kind === "assistant" && (
+          <div className="msg-compact-wrapper in-progress" role="status" aria-live="polite">
+            <div className="msg-compact-card in-progress">
+              <div className="msg-compact-header in-progress">
+                <div className="msg-compact-title-group">
+                  <span className="msg-compact-icon pulse">
+                    <BoltIcon />
+                  </span>
+                  <span className="msg-compact-title">Compacting Context Window...</span>
+                  <span className="msg-compact-badge pulse">Compressing earlier turns</span>
+                </div>
               </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
       <div ref={endRef} />
     </div>

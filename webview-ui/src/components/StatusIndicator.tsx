@@ -14,11 +14,14 @@ export function getClaudeThinkingLabel(
   detail?: string | null,
   status?: string,
   streaming?: boolean,
-  hasThinking?: boolean
+  hasThinking?: boolean,
+  isCompacting?: boolean
 ): string {
+  if (isCompacting) return "Compacting context window...";
   if (detail) {
-    if (/\(\d+s\)/.test(detail)) return detail;
     const d = detail.toLowerCase();
+    if (d.includes("compact")) return "Compacting context window...";
+    if (/\(\d+s\)/.test(detail)) return detail;
     if (d.includes("select") || d.includes("plan") || d.includes("routing")) return "Understanding request...";
     if (d.includes("retriev") || d.includes("context") || d.includes("read") || d.includes("analyz")) return "Understanding request...";
     if (d.includes("generat") || d.includes("respond")) return "Generating response...";
@@ -155,6 +158,7 @@ export function computeStatusInfo(state: AppState): StatusDisplayInfo | null {
 }
 
 function resolveThinkingStage(detail: string): string {
+  if (/compact/i.test(detail)) return "Compacting";
   if (/selecting model/i.test(detail)) return "Routing";
   if (/retrieving.*context/i.test(detail)) return "Context";
   if (/waiting for/i.test(detail)) return "Provider";

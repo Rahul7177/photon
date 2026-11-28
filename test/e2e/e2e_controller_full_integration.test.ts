@@ -625,6 +625,7 @@ describe("Extension Host, ChatViewProvider, ChatParticipant & PhotonController F
       await ctrl.handleMessage({ type: "setContextWindow", payload: { numCtx: 16384 } });
       await ctrl.handleMessage({ type: "setAutoApprove", payload: { enabled: true } });
       await ctrl.handleMessage({ type: "setAdaptiveEnabled", payload: { enabled: false } });
+      await ctrl.handleMessage({ type: "setAdaptivityFrozen", payload: { frozen: true } });
       await ctrl.handleMessage({ type: "setIntelligence", payload: { level: "high" } });
       await ctrl.handleMessage({ type: "setWebSearchProvider", payload: { provider: "duckduckgo" } });
       await ctrl.handleMessage({ type: "setThinkingLevel", payload: { level: "medium" } });
@@ -636,6 +637,7 @@ describe("Extension Host, ChatViewProvider, ChatParticipant & PhotonController F
       assert.ok(lastConfig && lastConfig.type === "config");
       assert.equal(lastConfig.payload.autoApprove, true);
       assert.equal(lastConfig.payload.adaptiveEnabled, false);
+      assert.equal(lastConfig.payload.adaptivityFrozen, true);
       assert.equal(lastConfig.payload.intelligence, "high");
       assert.equal(lastConfig.payload.webSearchProvider, "duckduckgo");
       assert.equal(lastConfig.payload.numCtxOverride, 16384);

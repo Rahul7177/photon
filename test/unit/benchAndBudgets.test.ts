@@ -21,8 +21,8 @@ import type { BenchResult } from "../../src/shared/types";
 
 describe("Phase 10: Benchmark Validity & Performance Budgets", () => {
   describe("10.1 Photon Bench Methodology & Evaluation", () => {
-    it("increments BENCH_VERSION to 4 to invalidate incompatible legacy records", () => {
-      assert.equal(BENCH_VERSION, 4);
+    it("increments BENCH_VERSION to 5 to invalidate incompatible legacy records", () => {
+      assert.equal(BENCH_VERSION, 5);
     });
 
     it("evaluates complete inspect -> edit -> test lifecycle in a disposable temporary workspace", () => {

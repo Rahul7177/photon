@@ -19,21 +19,118 @@ export interface ToolSpec{name:string;summary:string;params:ToolParam[];inputSch
 export interface ToolParam{name:string;type:"string"|"number"|"boolean"|"integer"|"array"|"object"|"null";required:boolean;description:string;enum?:unknown[];items?:JsonSchema;properties?:Record<string,JsonSchema>;}
 export interface ExecutionPolicy{maxConcurrent:number;allowParallelReads:boolean;serializeMutations:boolean;generationBudgetTokens:number;stepBudget:number;requireExplicitApproval?:boolean;blockTerminalCommands?:boolean;}
 export interface VerificationPlan{required:VerificationKind[];completed:VerificationKind[];evidence:string[];}
-export interface TaskAnalysis{scope:"single_file"|"multi_file"|"codebase";reasoning:"low"|"medium"|"high";risk:"low"|"medium"|"high"|"destructive";verification:VerificationKind[];ambiguity:"low"|"medium"|"high";estimatedSteps:number;}
-export interface AdaptivePlan{model:string;mode:Mode;contextWindow:number;numCtx:number;temperature:number;topP:number;seed?:number;maxOutputTokens:number;toolProtocol:ToolProtocol;maxTools:number;allowParallelTools:boolean;intelligence:IntelligenceLevel;intelligenceAuto:boolean;rationale:string[];task?:TaskAnalysis;modelCapabilities?:ModelCapabilityProfile;executionPolicy?:ExecutionPolicy;verification?:VerificationPlan;}
+export interface TaskAnalysis{scope:"single_file"|"multi_file"|"codebase";reasoning:"low"|"medium"|"high";risk:"low"|"medium"|"high"|"destructive";verification:VerificationKind[];ambiguity:"low"|"medium"|"high";estimatedSteps:number;needsVision?:boolean;readOnly?:boolean;carriedForward?:boolean;}
+export interface SessionTaskContext{previousTask?:TaskAnalysis;previousMode?:Mode;openTodoCount?:number;hasImageAttachments?:boolean;recentFailures?:number;}
+export type AgentPhase = "orient" | "edit" | "verify" | "final";
+export interface ScaffoldProfile {
+  preset: IntelligenceLevel;
+  ruleVerbosity: "terse" | "standard" | "guided";
+  toolCards: "names_only" | "shortlist" | "full";
+  shortlistSize: number;
+  examples: "none" | "phase" | "phase+failing";
+  stateCard: "off" | "compact" | "rich";
+  hostVerify: "off" | "diagnostics" | "diagnostics+tests";
+  hostOrient: boolean;
+  promptBudget: { frac: number; minTokens: number; maxTokens: number };
+  sampling: { toolTurnTemp: number; answerTurnTemp: number };
+  thinking: "off" | "low" | "medium" | "high";
+  nudgePolicy: { continue: number; finalAnswer: number; truncation: number };
+}
+export interface AdaptivePlan{model:string;mode:Mode;contextWindow:number;numCtx:number;temperature:number;topP:number;seed?:number;maxOutputTokens:number;toolProtocol:ToolProtocol;maxTools:number;allowParallelTools:boolean;intelligence:IntelligenceLevel;intelligenceAuto:boolean;rationale:string[];task?:TaskAnalysis;modelCapabilities?:ModelCapabilityProfile;executionPolicy?:ExecutionPolicy;verification?:VerificationPlan;scaffoldProfile?:ScaffoldProfile;scaffoldOptimizations?:boolean;samplingOverridden?:boolean;/** Governor rung a turn starts on, learned from the Capability Passport (Phase 3). */initialRung?:number;/** User froze runtime adaptivity: governor only observes, no rung/protocol/host actions. */adaptivityFrozen?:boolean;}
 export type ToolProtocol="native"|"photon-block";
 export interface SessionState{id:string;title:string;mode:Mode;model:string;messages:ChatMessage[];createdAt:number;updatedAt:number;usage?:TokenUsage;pinned?:boolean;pinnedAt?:number;}
 export interface SessionSummary{id:string;title:string;mode:Mode;model:string;updatedAt:number;messageCount:number;pinned?:boolean;pinnedAt?:number;searchText?:string;}
-export interface TokenUsage{used:number;window:number;breakdown:{label:string;tokens:number}[];}
+export type PromptSectionStatus = "kept" | "trimmed" | "dropped";
+export interface PromptSectionBreakdown {
+  id: string;
+  label: string;
+  tokens: number;
+  status: PromptSectionStatus;
+}
+export interface PromptTokenReport {
+  totalTokens: number;
+  budgetTokens?: number;
+  sections: PromptSectionBreakdown[];
+  renderedExampleTools?: string[];
+  renderedToolCount?: number;
+}
+export interface TokenUsage{used:number;window:number;breakdown:{label:string;tokens:number}[];promptReport?:PromptTokenReport;}
+export type GovernorEventKind =
+  | "parse_fail"
+  | "invalid_args"
+  | "repair"
+  | "narration"
+  | "duplicate"
+  | "truncation"
+  | "empty"
+  | "mode_violation"
+  | "tool_error"
+  | "diag_regression"
+  | "stream_retry"
+  | "context_overflow"
+  | "tool_ok"
+  | "verify_ok";
+
+export interface GovernorEventRecord {
+  kind: GovernorEventKind;
+  step: number;
+  tool?: string;
+  detail?: string;
+  at: number;
+}
+
+export type GovernorTimelineType =
+  | "escalate"
+  | "deescalate"
+  | "protocol_downgrade"
+  | "host_verify"
+  | "auto_revert"
+  | "force_conclude";
+
+/** One attributable adaptive action taken during a turn (Phase 3 governor timeline). */
+export interface GovernorTimelineEntry {
+  step: number;
+  type: GovernorTimelineType;
+  fromRung: number;
+  toRung: number;
+  reason: string;
+  at: number;
+}
+
+export interface TurnReliabilitySummary {
+  model: string;
+  mode: Mode;
+  protocol: ToolProtocol;
+  intelligence: IntelligenceLevel;
+  rung: number;
+  steps: number;
+  counts: Partial<Record<GovernorEventKind, number>>;
+  events: GovernorEventRecord[];
+  /** Highest rung reached this turn (the final `rung` may have de-escalated). */
+  peakRung?: number;
+  /** Rung the turn started at (learned from the Capability Passport). */
+  initialRung?: number;
+  /** Every rung change / host action with its reason (Phase 3). */
+  timeline?: GovernorTimelineEntry[];
+  /** True when native tool calling was abandoned mid-turn for the Photon block protocol. */
+  protocolDowngraded?: boolean;
+  /** True when governor actions were live; false when observation-only or frozen by the user. */
+  adaptive?: boolean;
+  /** Files the host automatically restored after a diagnostics regression. */
+  autoReverted?: string[];
+  taskScope?: TaskAnalysis["scope"];
+  taskReasoning?: TaskAnalysis["reasoning"];
+  completedAt: number;
+}
 export type ComplexityLevel="simple"|"moderate"|"complex";
 export interface ComplexitySignals{filesReferenced:number;estimatedSteps:number;keywords:string[];promptTokens:number;scope?:TaskAnalysis["scope"];reasoning?:TaskAnalysis["reasoning"];risk?:TaskAnalysis["risk"];verification?:VerificationKind[];ambiguity?:TaskAnalysis["ambiguity"];}
 export interface ComplexityAssessment{level:ComplexityLevel;minContextTokens:number;signals:ComplexitySignals;task?:TaskAnalysis;}
 export interface RoutingSignalBreakdown{taskComplexity:ComplexityLevel;contextFit:boolean;toolReliability:number;hardwareFit:"gpu"|"hybrid"|"cpu"|"cloud"|"tight";estimatedCostPer1MUsd:number;isCloud:boolean;}
 export interface ModelScore{model:string;score:number;fits:boolean;reasons:string[];signals?:RoutingSignalBreakdown;}
 export interface AutoDecision{chosenModel:string;auto:boolean;pinned:boolean;complexity:ComplexityAssessment;scores:ModelScore[];reason:string;signals?:RoutingSignalBreakdown;fallbackModels?:string[];cloudEscalated?:boolean;previousModel?:string;escalationNotice?:string;}
-export type BenchTaskId="throughput"|"toolcall"|"schema"|"tool_selection"|"recovery"|"edit"|"verification"|"context"|"reasoning";
+export type BenchTaskId="throughput"|"toolcall"|"native_toolcall"|"schema"|"tool_selection"|"recovery"|"edit"|"verification"|"context"|"reasoning";
 export interface BenchTaskOutcome{id:BenchTaskId;passed:boolean;detail:string;}
-export interface BenchResult{model:string;quantization?:string;hardwareClass:string;methodologyVersion:number;tokensPerSec:number;firstTokenMs:number;toolCallReliability:number;reasoningPass:boolean;tasks:BenchTaskOutcome[];ranAt:number;capabilityProfile?:ModelCapabilityProfile;}
+export interface BenchResult{model:string;quantization?:string;hardwareClass:string;methodologyVersion:number;tokensPerSec:number;firstTokenMs:number;toolCallReliability:number;/** Measured pass rate on Photon block-protocol probes under the real system prompt (Bench v5). */blockToolCallReliability?:number;/** Measured pass rate on provider-native function-calling probes (Bench v5). */nativeToolCallReliability?:number;/** Number of probe samples per tool-calling skill (Bench v5 default >= 5). */sampleCount?:number;reasoningPass:boolean;tasks:BenchTaskOutcome[];ranAt:number;capabilityProfile?:ModelCapabilityProfile;}
 export type BenchPhase="idle"|"running"|"done"|"error";
 export type IndexPhase="idle"|"indexing"|"validating"|"ready"|"unavailable"|"error";
 export interface IndexStatus{phase:IndexPhase;filesIndexed:number;chunks:number;pending:number;embeddingModel?:string;message?:string;}
@@ -51,8 +148,8 @@ export interface PullProgress{model:string;phase:"pulling"|"done"|"error";status
   resumable?:boolean;}
 
 export interface HardwareMetrics{gpuName?:string;gpuUtilPercent?:number;vramUsedBytes?:number;vramTotalBytes?:number;vramFreeBytes?:number;gpuTempC?:number;ramUsedBytes:number;ramTotalBytes:number;ramFreeBytes:number;ramUsedPercent:number;updatedAt:number;}
-export interface CloudModelUsage{model:string;turns:number;inputTokens:number;outputTokens:number;cachedTokens:number;savedTokens:number;estimatedCostUsd:number;}
-export interface CloudUsageSummary{sessionInputTokens:number;sessionOutputTokens:number;sessionCachedTokens:number;sessionSavedTokens:number;sessionEstimatedCostUsd:number;totalInputTokens:number;totalOutputTokens:number;totalCachedTokens:number;totalSavedTokens:number;totalEstimatedCostUsd:number;byModel:CloudModelUsage[];}
+export interface CloudModelUsage{model:string;turns:number;inputTokens:number;outputTokens:number;cachedTokens:number;savedTokens:number;estimatedCostUsd:number;cacheHitPct?:number;}
+export interface CloudUsageSummary{sessionInputTokens:number;sessionOutputTokens:number;sessionCachedTokens:number;sessionSavedTokens:number;sessionEstimatedCostUsd:number;sessionCacheHitPct?:number;totalInputTokens:number;totalOutputTokens:number;totalCachedTokens:number;totalSavedTokens:number;totalEstimatedCostUsd:number;totalCacheHitPct?:number;byModel:CloudModelUsage[];}
 export interface ProjectMemoryNote{id:string;category:"architecture"|"convention"|"decision"|"task"|"gotcha";title:string;content:string;relatedFiles?:string[];createdBy:string;updatedAt:number;}
 export interface ModelHandoffRecord{fromModel:string;toModel?:string;timestamp:number;taskSummary:string;activeFiles:string[];recentEdits:{path:string;summary:string;timestamp:number}[];pendingTodos:string[];keyFindings:string[];}
 export interface ProjectContextSummary{workspaceName:string;totalFiles:number;totalSymbols:number;totalLines:number;lastUpdatedAt:number;languages:string[];frameworks:string[];scripts:Record<string,string>;entryPoints:string[];topDirectories:{path:string;fileCount:number;purpose:string}[];recentFiles:{path:string;summary:string;lineCount:number;symbolCount:number;lastAction:"read"|"edited"|"indexed";timestamp:number}[];notes:ProjectMemoryNote[];latestHandoff:ModelHandoffRecord|null;estimatedTokensSaved:number;queryHits:number;}
@@ -266,6 +363,14 @@ const DEFAULT_LATEST_TAGS: Record<string, string> = {
   "command-r": "35b",
   "phi3": "3.8b",
   "phi4": "14b",
+  "phi4-mini": "3.8b",
+};
+
+/** Equivalent parameter/variant tags within the same model family (e.g. deepseek-r1:7b <-> deepseek-r1:8b). */
+const EQUIVALENT_FAMILY_TAGS: Record<string, string[][]> = {
+  "deepseek-r1": [["7b", "8b", "latest"]],
+  "deepseek-coder-v2": [["16b", "lite", "latest"]],
+  "phi4-mini": [["3.8b", "4b", "latest"]],
 };
 
 function parseModelParts(rawName: string): { raw: string; stripped: string; family: string; tag: string; baseTag: string } {
@@ -319,6 +424,17 @@ export function matchInstalledModelName(
         (target.tag === "latest" && p.baseTag === defaultTag)
       ) {
         return inst;
+      }
+    }
+    const equivGroups = EQUIVALENT_FAMILY_TAGS[target.family];
+    if (equivGroups) {
+      for (const group of equivGroups) {
+        if (
+          (group.includes(target.baseTag) || group.includes(target.tag)) &&
+          (group.includes(p.baseTag) || group.includes(p.tag))
+        ) {
+          return inst;
+        }
       }
     }
   }

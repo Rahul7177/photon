@@ -115,7 +115,8 @@
           "type": "boolean",
           "default": false,
           "description": "Automatically run Photon Bench on every un-benchmarked local model in the background. Off by default: each benchmark loads a different model, which evicts your chat model from the GPU on single-GPU machines. You can still run the bench manually from Settings."
-        },        "photon.ollama.preloadOnStartup": {
+        },
+        "photon.ollama.preloadOnStartup": {
           "type": "boolean",
           "default": true,
           "description": "Load the selected local model into memory in the background after startup/refresh, so the first prompt doesn't pay the cold-load wait. Best-effort and silent on failure."
@@ -173,6 +174,11 @@
           "type": "boolean",
           "default": true,
           "description": "Let Photon auto-tune settings, prompt shape, and tool protocol to the machine + model."
+        },
+        "photon.adaptive.freeze": {
+          "type": "boolean",
+          "default": false,
+          "description": "Freeze runtime adaptivity (disable live Reliability Governor escalations, protocol fallback, host auto-revert, and Capability Passport priors while keeping telemetry active)."
         },
         "photon.intelligence.level": {
           "type": "string",
@@ -309,6 +315,9 @@
   },
   "scripts": {
     "test": "tsx --test src/**/*.test.ts test/**/*.test.ts",
+    "eval:baseline": "tsx test/eval/runner.ts",
+    "eval:ablation": "tsx test/eval/ablation.ts",
+    "eval:gate": "tsx test/eval/releaseGate.ts",
     "build": "npm run build:webview && npm run build:ext",
     "build:ext": "node esbuild.mjs --production",
     "build:webview": "vite build",
@@ -316,7 +325,9 @@
     "watch:webview": "vite build --watch",
     "dev": "concurrently -k -n ext,web \"npm:watch\" \"npm:watch:webview\"",
     "typecheck": "node --max-old-space-size=4096 ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node --max-old-space-size=4096 ./node_modules/typescript/bin/tsc --noEmit -p webview-ui/tsconfig.json",
-    "package": "npm run build && vsce package --no-dependencies"
+    "package": "npm run build && vsce package --no-dependencies",
+    "workbench": "tsx scripts/liveWorkbench.ts",
+    "test:live": "tsx scripts/testLiveExtension.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

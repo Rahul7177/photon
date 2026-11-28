@@ -81,7 +81,7 @@ Extracts multidimensional signals from `(prompt, mode, attachmentCount)`:
   - `adaptiveEnabled === false`: keeps `previousModel` (or pinned/first) untouched; still computes scores/fallbacks.
   - `pinnedModel` set: honors user choice directly (`auto: false, pinned: true`).
 - **Scoring (`rankModels`)** when Auto Mode is enabled (`autoSelect = true`):
-  - `contextFit` (`+30` if `model.contextLength >= minContextTokens`, `-22.5` penalty if tight) + `contextHeadroom` (up to `+6`)
+  - `contextFit` (`+30` if `model.contextLength >= minContextTokens`, `-22.5` penalty if tight) + `contextHeadroom` (up to `+6`). *(Note: `rankModels` currently evaluates `contextFit` against advertised `model.contextLength` rather than hardware-computed `numCtx`; achievable-context routing is scheduled for Phase 1.)*
   - Capability & ideal-target fit: `toolCalling` (`×18`), `coding` (`×14`), `recovery` (`×10`), `verification` (`×8`), proximity to `idealReasoning` (`×12`), proximity to `idealTool` (`×8`)
   - `throughput`: normalized `bench.tokensPerSec` (`×12`)
   - Hardware fit (`classifyHardwareFit`):
@@ -112,7 +112,7 @@ Extracts multidimensional signals from `(prompt, mode, attachmentCount)`:
 | Parameter | Local Adaptive (`buildPlan`) | Cloud (`cloudPlan`) |
 | :--- | :--- | :--- |
 | Context Window | Hardware-computed `numCtx` (or pinned `userNumCtx`) | Full model `contextLength` (default `128_000`) |
-| Scaffolding Level | Derived (`max` / `high` / `medium` / `low`) unless pinned | Fixed `"max"` profile metadata; direct [`buildCloudSystemPrompt`](../src/core/prompts/cloudSystem.ts) |
+| Scaffolding Level | Derived (`max` / `high` / `medium` / `low`) unless pinned | Fixed `"max"` plan metadata only; prompt comes directly from [`buildCloudSystemPrompt`](../src/core/prompts/cloudSystem.ts) |
 | Tool Protocol | [`shouldUseNativeToolProtocol`](../src/core/intelligence/policy.ts#L175) → `"native"` or `"photon-block"` | Always `"native"` |
 | Temperatures (`chat` / `task`) | `max`: `0.15/0.1`, `high`: `0.2/0.1`, `medium`/`low`: `0.25/0.15` | `0.3` |
 | Step Ceilings (`MODE_CAPS`) | `chat: 100`, `plan: 150`, `agent: 200` | `chat: 100`, `plan: 150`, `agent: 200` |
@@ -124,15 +124,37 @@ Extracts multidimensional signals from `(prompt, mode, attachmentCount)`:
 
 **`shouldUseNativeToolProtocol(model, capabilities, bench, intelligence)`**:
 - Cloud model → always `true` (`"native"`).
-- Local model → `true` ONLY if model metadata reports native `"tools"` capability, **or** (`intelligence !== "low"` AND fresh bench has `toolCallReliability >= 0.80 && schemaAdherence >= 0.82 && toolCalling >= 0.82`). Otherwise stays on tolerant `"photon-block"`.
+- Local model → `true` ONLY if model metadata reports native `"tools"` capability, **or** (`intelligence !== "low"` AND fresh bench has `toolCallReliability >= 0.80 && schemaAdherence >= 0.82 && toolCalling >= 0.82`). *(Note: `bench.ts` uses `TOOLCALL_ATTEMPTS = 3` on `photon-block` probes, so possible `toolCallReliability` scores are `0 / 0.33 / 0.67 / 1.0`, making `>= 0.80` effectively `3/3`.)* Otherwise stays on tolerant `"photon-block"`.
 
 ### 3.7 Runtime Adaptation (`system.ts`, `policy.ts`, `contextManager.ts`, `compactor.ts`)
 - **Prompt & RAG Budgeting (`buildSystemPrompt`)**: Allocates a `numCtx` fraction by scaffolding tier (`low: 20% / 30 map lines`, `medium: 26% / 60`, `high: 34% / 90`, `max: 42% / 120`) for identity, mode rules, tool instructions, project context digest, workspace map, and retrieved RAG chunks.
-- **Phase-Aware Tool Ordering (`selectToolSpecs`, `rankTools`)**: Enforces mode boundaries (`chat` = read/web only, no MCP; `plan` = read/web only; `agent` = full + MCP) and re-ranks tools per phase (`orient` boosts read/search/web; `edit` boosts write; `verify` boosts `get_diagnostics`/`run_command`; `freshInfo` places `web_search`/`web_fetch` first).
+- **Phase-Aware Tool Ordering (`selectToolSpecs`, `rankTools`)**: Enforces mode boundaries (`chat` = read/web only, no MCP; `plan` = read/web only; `agent` = full + MCP) and ranks tools by phase (`orient` boosts read/search/web; `edit` boosts write; `verify` boosts `get_diagnostics`/`run_command`; `freshInfo` places `web_search`/`web_fetch` first). *(Note: [`unifiedEngine.ts`](../src/core/agent/unifiedEngine.ts) currently invokes `selectToolSpecs(allSpecs, plan, "orient", freshInfo)` once per turn before the step loop; per-step phase transitions are scheduled for Phase 2.)*
 - **Execution Guardrails (`buildExecutionPolicy`)**: Computes concurrency (`1–4` raw policy, serialized `1` in `buildPlan` / destructive risk), generation/reasoning token budgets, approval requirement (`high`/`destructive`), and blocks terminal commands on `"destructive"` tasks.
 - **Adaptive Context Fit & Compaction (`fitToWindow`, `compactor.ts`)**:
   - Reserves output tokens, clamps oversized tool payloads without breaking JSON/line boundaries (`clampStructuredToolResult`), and preserves task anchor + latest active tool pairs (`sanitizeToolPairing`).
   - Pre-turn auto-compaction triggers at `>= 75%` of usable input window (accounting for `incomingTokens`, `fixedOverheadTokens`, and `reserveOutputTokens`), plus mid-turn compaction & reactive context-overflow recovery inside both `runCloudTurn` and `runUnifiedTurn`.
+
+### 3.8 Observability & Baseline Harness (Phase 0)
+- **Prompt Section Token Breakdown**: [`buildSystemPromptWithReport`](../src/core/prompts/system.ts) and [`buildCloudSystemPromptWithReport`](../src/core/prompts/cloudSystem.ts) return section-by-section token counts and statuses (`kept`, `trimmed`, `dropped`) attached to `TokenUsage.promptReport`, logged to the output channel, and surfaced in `ContextMeter` and `TransparencyPanel`.
+- **Reliability Governor (Observation-Only)**: [`ReliabilityGovernor`](../src/core/adaptive/governor.ts) counts per-turn reliability events (`parse_fail`, `invalid_args`, `repair`, `narration`, `duplicate`, `truncation`, `empty`, `mode_violation`, `tool_error`, `diag_regression`, `stream_retry`, `context_overflow`, `tool_ok`, `verify_ok`) across both `runUnifiedTurn` and `runCloudTurn`, emitting `turnTelemetry` without altering control flow in Phase 0.
+- **Cloud Cache Hit-Rate**: [`CloudUsageTracker`](../src/core/telemetry/cloudUsage.ts) computes `sessionCacheHitPct`, `totalCacheHitPct`, and per-model `cacheHitPct` displayed in [`HardwareMetricsModal`](../webview-ui/src/components/HardwareMetricsModal.tsx).
+- **Behavioral Baseline Eval (`test/eval/`)**: 12 disposable-workspace tasks (`npm run eval:baseline`) locking prompt token budgets, worked-example distributions, and task postconditions in [`BASELINE_PHASE0.md`](../test/eval/BASELINE_PHASE0.md).
+
+### 3.9 Scaffold Profile, Phase-Aware Surface, Split Sampling & Working Memory (Phase 2)
+- **`ScaffoldProfile` Vector**: [`deriveScaffoldProfile`](../src/core/adaptive/orchestrator.ts) replaces static single-enum scaffolding with independent dimensions (`ruleVerbosity`, `toolCards`, `shortlistSize`, `examples`, `stateCard`, `hostVerify`, `hostOrient`, `promptBudget`, `sampling`, `thinking`, `nudgePolicy`), reversible via `scaffoldOptimizations: false`.
+- **Clamped Budgets & Priority Trimming**: [`buildSystemPromptWithReport`](../src/core/prompts/system.ts) clamps prompt budgets (`{ frac, minTokens, maxTokens }`), reserves an extras floor so 8k windows keep digest and workspace map non-zero, and trims non-essential `workflow`/`result_framing` sections while protecting `identity`, `mode`, `tools`, and Language Integrity.
+- **Dynamic Phase Surface & Shortlist Cards**: [`inferStepPhase`](../src/core/intelligence/policy.ts) and [`renderToolInstructionsWithMeta`](../src/core/protocol/serialize.ts) transition `orient → edit → verify → final` across steps inside `runUnifiedTurn`, rendering compact cards + phase-matched worked examples (`edit_file`/`append_file` in `edit`, plus failing tools) while keeping every registered tool callable via one-line signatures.
+- **Split Sampling, Thinking Bounds & Working Memory Card**: Tool turns run cooler (`toolTurnTemp`) than final answers (`answerTurnTemp`), tiny models default thinking to `"off"` unless `reasoning === "high"`, user overrides stay sticky, and [`buildStepStateCard`](../src/core/adaptive/stateCard.ts) injects a transient `<working_memory>` block on multi-step turns without mutating `session.messages`.
+
+### 3.10 Active Reliability Governor, Capability Passport & Freeze Control (Phase 3)
+- **Live Rungs (`1–4`) with Hysteresis**: [`ReliabilityGovernor`](../src/core/adaptive/governor.ts) escalates on live protocol/narration/empty failures inside [`runUnifiedTurn`](../src/core/agent/unifiedEngine.ts): Rung 1 adds failing-tool worked examples, Rung 2 forces `<working_memory>` + reduces `toolTurnTemp` by `0.05`, Rung 3 downgrades local `"native"` turns to `"photon-block"` after 2 native failures, and Rung 4 runs host diagnostics and forces a plain-text conclusion. Clean tool calls relax Rung 1→0 (`3` calls) and Rung 2→1 (`4` steps).
+- **Host Verify & Auto-Revert on Regression**: In Agent mode (`hostVerify !== "off"`), `runUnifiedTurn` snapshots files before edits (`edit_file`, `write_file`, `append_file`), runs `getDiagnostics`, reports `N→M` status, and restores the pre-edit content when errors increase.
+- **On-Device Capability Passport**: [`passport.ts`](../src/core/adaptive/passport.ts) & [`PassportStore`](../src/host/passportStore.ts) maintain a per-`(model, quantization, runtime)` EWMA shrunk against priors (`K = 100`, capped at `5` evidence units/turn) so single bad turns move estimates `< 0.05` while learning `initialRung` and gating unreliable local native models.
+- **Freeze Adaptivity & Timeline UI**: Users can inspect attributable rung/host timelines and toggle `photon.adaptive.freeze` directly in [`TransparencyPanel`](../webview-ui/src/components/TransparencyPanel.tsx) or [`SettingsPanel`](../webview-ui/src/components/SettingsPanel.tsx).
+
+### 3.11 Bench v5, Ablations & Release Gate (Phase 4)
+- **Bench v5 Native vs Block Probes (`BENCH_VERSION = 5`)**: [`runBench`](../src/core/bench/bench.ts) evaluates `BENCH_TOOLCALL_SAMPLES = 5` samples per protocol under the real `buildSystemPrompt` system message, separately measuring `blockToolCallReliability` and `nativeToolCallReliability`. [`shouldUseNativeToolProtocol`](../src/core/intelligence/policy.ts) gates local native tool calling directly against `nativeToolCallReliability` (`< 0.60` forces `"photon-block"`).
+- **Ablation Matrix & CI Release Gate**: `npm run eval:ablation` ([`ablation.ts`](../test/eval/ablation.ts)) compares `full_phase4`, `legacy_flag_off`, `toolCards_full`, `stateCard_off`, `examples_none`, and `adaptivity_frozen` across tiers into [`ABLATION_PHASE4.md`](../test/eval/ABLATION_PHASE4.md). `npm run eval:gate` ([`releaseGate.ts`](../test/eval/releaseGate.ts)) fails CI if any tier drops more than `2` points below baseline or regresses tool-card savings.
 
 ---
 

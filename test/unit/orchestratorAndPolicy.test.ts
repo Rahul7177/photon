@@ -5,6 +5,8 @@ import {
   buildExecutionPolicy,
   shouldUseNativeToolProtocol,
   capabilityForModel,
+  extractFileReferences,
+  isContinuationPrompt,
 } from "../../src/core/intelligence/policy";
 import {
   buildPlan,
@@ -509,6 +511,213 @@ describe("Phase 6.2: Orchestrator, Auto Mode & Policy Intelligence", () => {
 
       assert.equal(executedCall, false, "Side-effecting tool execute must not be called in chat mode");
       assert.equal(lastToolStatus, "error");
+    });
+  });
+
+  describe("Phase 1: File-Ref Regex, Session Carry-Forward & Router Fixes (T-1, S-4, R-1..3, S-5, S-9)", () => {
+    it("avoids false-positive file references on prose abbreviations, versions, URLs, and runtime names (T-1)", () => {
+      assert.deepEqual(extractFileReferences("e.g. fix the bug in node.js handler, see v1.2 notes"), []);
+      assert.deepEqual(extractFileReferences("check https://nodejs.org/dist/v20.1.0/docs for next.js 15.1 details"), []);
+      assert.deepEqual(extractFileReferences("compare src/node.js and @src/auth.ts."), ["src/auth.ts", "src/node.js"]);
+      assert.deepEqual(extractFileReferences("inspect prisma.schema and package.json"), ["prisma.schema", "package.json"]);
+
+      const falseMulti = analyzeTask("e.g. fix the bug in node.js handler, see v1.2 notes", "agent");
+      assert.equal(falseMulti.scope, "single_file");
+    });
+
+    it("carries forward Plan/Agent task context on continuation follow-ups without over-escalating fresh queries (S-4)", () => {
+      const planTask = analyzeTask("plan how to refactor src/a.ts, src/b.ts, and src/c.ts with unit tests", "plan");
+      assert.equal(planTask.scope, "multi_file");
+      assert.equal(planTask.reasoning, "high");
+      assert.ok(planTask.verification.includes("tests"));
+
+      assert.equal(isContinuationPrompt("yes, go ahead"), true);
+      assert.equal(isContinuationPrompt("what is the weather in Tokyo today?"), false);
+
+      const followUp = analyzeTask("yes, go ahead", "agent", 0, {
+        previousTask: planTask,
+        previousMode: "plan",
+      });
+      assert.equal(followUp.scope, "multi_file");
+      assert.equal(followUp.reasoning, "high");
+      assert.equal(followUp.carriedForward, true);
+      assert.ok(followUp.verification.includes("tests"));
+
+      const largeModel: ModelInfo = { name: "qwen2.5-coder:32b", provider: "ollama", paramsB: 32, tier: "large", contextLength: 32768 };
+      const followPlan = buildPlan({
+        model: largeModel,
+        machine: null,
+        mode: "agent",
+        prompt: "yes, go ahead",
+        intelligence: "auto",
+        reserveOutputTokens: 1024,
+        adaptiveEnabled: true,
+        sessionTaskContext: { previousTask: planTask, previousMode: "plan" },
+      });
+      assert.equal(followPlan.intelligence, "high");
+      assert.ok(followPlan.rationale.some((r) => r.includes("Session continuity")));
+
+      const freshWeather = analyzeTask("what is the weather in Tokyo today?", "chat", 0, {
+        previousTask: planTask,
+        previousMode: "plan",
+      });
+      assert.equal(freshWeather.scope, "single_file");
+      assert.equal(freshWeather.carriedForward, undefined);
+    });
+
+    it("enforces vision hard constraint, achievable context, and tight-hardware exclusion in routing (R-1, R-2, R-3)", () => {
+      const laptopMachine: MachineProfile = {
+        totalRamBytes: 8 * 1024 ** 3,
+        freeRamBytes: 4 * 1024 ** 3,
+        cpuCores: 8,
+        cpuModel: "Laptop CPU",
+        platform: "win32",
+        arch: "x64",
+        gpu: { name: "Laptop 4GB", vramBytes: 4 * 1024 ** 3 },
+        tier: "low",
+      };
+
+      // R-1: Image attachment excludes text-only models even with higher coding priors
+      const textOnly: ModelInfo = { name: "qwen2.5-coder:7b", provider: "ollama", paramsB: 7, tier: "small", contextLength: 32768, vision: false, toolTrained: true };
+      const visionModel: ModelInfo = { name: "gemma4:e4b", provider: "ollama", paramsB: 4, tier: "tiny", contextLength: 32768, vision: true, toolTrained: true };
+      const visionDecision = decideModel({
+        prompt: "describe this screenshot error",
+        mode: "chat",
+        hasImageAttachments: true,
+        models: [textOnly, visionModel],
+        machine: laptopMachine,
+        adaptiveEnabled: true,
+      });
+      assert.equal(visionDecision.chosenModel, "gemma4:e4b");
+      assert.equal(visionDecision.scores.find((s) => s.model === "qwen2.5-coder:7b")?.fits, false);
+
+      // R-2: Advertised 32k context shrinks to 8192 achievable on a 4GB/no-GPU machine -> fails 12,288 complex floor
+      const lowRamMachine: MachineProfile = {
+        totalRamBytes: 6 * 1024 ** 3,
+        freeRamBytes: 1.5 * 1024 ** 3,
+        cpuCores: 4,
+        cpuModel: "Tight CPU",
+        platform: "win32",
+        arch: "x64",
+        tier: "low",
+      };
+      const localBigCtx: ModelInfo = { name: "qwen2.5-coder:7b", provider: "ollama", paramsB: 7, tier: "small", contextLength: 32768, sizeBytes: 4.5 * 1024 ** 3 };
+      const cloudHuge: ModelInfo = { name: "claude-sonnet-4", provider: "anthropic", tier: "large", contextLength: 200000 };
+      const ctxDecision = decideModel({
+        prompt: "refactor entire codebase architecture across all files",
+        mode: "agent",
+        models: [localBigCtx, cloudHuge],
+        machine: lowRamMachine,
+        adaptiveEnabled: true,
+      });
+      assert.equal(ctxDecision.scores.find((s) => s.model === "qwen2.5-coder:7b")?.fits, false);
+      assert.equal(ctxDecision.chosenModel, "claude-sonnet-4");
+
+      // R-3: tight hardware model is excluded (fits: false) and loses to fitting local model
+      const hugeLocal: ModelInfo = { name: "command-r:35b", provider: "ollama", paramsB: 35, tier: "large", contextLength: 32768, sizeBytes: 22 * 1024 ** 3, toolTrained: true };
+      const fittingLocal: ModelInfo = { name: "qwen2.5-coder:3b", provider: "ollama", paramsB: 3, tier: "tiny", contextLength: 32768, sizeBytes: 2.0 * 1024 ** 3, toolTrained: true };
+      const hwDecision = decideModel({
+        prompt: "fix bug in src/app.ts",
+        mode: "agent",
+        models: [hugeLocal, fittingLocal],
+        machine: laptopMachine,
+        adaptiveEnabled: true,
+      });
+      const hugeScore = hwDecision.scores.find((s) => s.model === "command-r:35b");
+      assert.equal(hugeScore?.signals?.hardwareFit, "tight");
+      assert.equal(hugeScore?.fits, false);
+      assert.equal(hwDecision.chosenModel, "qwen2.5-coder:3b");
+    });
+
+    it("applies switch hysteresis continuity bonus on near-ties and switches on clear winners (S-5)", () => {
+      const m1: ModelInfo = { name: "model-a:7b", provider: "ollama", paramsB: 7, tier: "small", contextLength: 32768, toolTrained: true };
+      const m2: ModelInfo = { name: "model-b:7b", provider: "ollama", paramsB: 7, tier: "small", contextLength: 65536, toolTrained: true };
+
+      // Near-tie (<6 points from contextHeadroom difference alone): previousModel stays sticky
+      const sticky = decideModel({
+        prompt: "fix bug in src/app.ts",
+        mode: "agent",
+        models: [m1, m2],
+        machine: null,
+        previousModel: "model-a:7b",
+        adaptiveEnabled: true,
+      });
+      assert.equal(sticky.chosenModel, "model-a:7b");
+      assert.ok(sticky.scores.find((s) => s.model === "model-a:7b")?.reasons.some((r) => r.includes("continuity +6")));
+
+      // Strong challenger (>10 points via high benchmark) overcomes continuity bonus
+      const benchMap = new Map<string, BenchResult>([
+        [
+          "model-b:7b",
+          {
+            model: "model-b:7b",
+            hardwareClass: "mid",
+            methodologyVersion: 1,
+            tokensPerSec: 90,
+            firstTokenMs: 120,
+            toolCallReliability: 1,
+            reasoningPass: true,
+            tasks: [],
+            ranAt: Date.now(),
+            capabilityProfile: {
+              reasoning: 0.92,
+              coding: 0.95,
+              toolCalling: 0.96,
+              schemaAdherence: 0.96,
+              contextRetention: 0.9,
+              editFidelity: 0.92,
+              recovery: 0.9,
+              verification: 0.9,
+              speed: 1,
+            },
+          },
+        ],
+      ]);
+      const switched = decideModel({
+        prompt: "refactor concurrency issue across src/a.ts and src/b.ts",
+        mode: "agent",
+        models: [m1, m2],
+        machine: null,
+        benchByModel: benchMap,
+        previousModel: "model-a:7b",
+        adaptiveEnabled: true,
+      });
+      assert.equal(switched.chosenModel, "model-b:7b");
+    });
+
+    it("preserves non-destructive executionPolicy concurrency in buildPlan (S-9)", () => {
+      const strongLocal: ModelInfo = {
+        name: "qwen2.5-coder:32b",
+        provider: "ollama",
+        paramsB: 32,
+        tier: "large",
+        contextLength: 32768,
+        capabilities: ["tools"],
+        toolTrained: true,
+      };
+      const nonDestructive = buildPlan({
+        model: strongLocal,
+        machine: null,
+        mode: "agent",
+        prompt: "implement feature in src/app.ts",
+        intelligence: "auto",
+        reserveOutputTokens: 1024,
+        adaptiveEnabled: true,
+      });
+      assert.ok((nonDestructive.executionPolicy?.maxConcurrent ?? 1) > 1);
+      assert.equal(nonDestructive.allowParallelTools, true);
+
+      const destructive = buildPlan({
+        model: strongLocal,
+        machine: null,
+        mode: "agent",
+        prompt: "rm -rf build and drop table sessions",
+        intelligence: "auto",
+        reserveOutputTokens: 1024,
+        adaptiveEnabled: true,
+      });
+      assert.equal(destructive.executionPolicy?.maxConcurrent, 1);
+      assert.equal(destructive.allowParallelTools, false);
     });
   });
 });

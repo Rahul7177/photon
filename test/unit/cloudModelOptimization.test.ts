@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { runCloudTurn, cloudHistoryFromSession, normalizeCloudToolCall, type PendingCall, type CloudEmitter } from "../../src/core/agent/cloudEngine";
-import { cloudTools } from "../../src/core/tools/cloud/cloudTools";
+import { cloudTools, cloudWebSearch } from "../../src/core/tools/cloud/cloudTools";
+import { extractWeatherLocation } from "../../src/core/tools/builtin/web";
 import { buildCloudSystemPrompt } from "../../src/core/prompts/cloudSystem";
 import { CloudUsageTracker } from "../../src/core/telemetry/cloudUsage";
 import { redactSecretsFromError, classifyRuntimeError } from "../../src/core/agent/errorRecovery";
@@ -508,6 +509,116 @@ describe("Cloud Model Optimization & Native Speed", () => {
       });
       assert.ok(prompt.includes("# Retrieved Code Snippets"));
       assert.ok(prompt.includes("export class WorkspaceIndex"));
+    });
+
+    it("extractWeatherLocation handles both natural-language and keyword search queries while rejecting coding terms", () => {
+      assert.equal(extractWeatherLocation("Mysore current weather"), "Mysore");
+      assert.equal(extractWeatherLocation("weather Mysore India"), "Mysore India");
+      assert.equal(extractWeatherLocation("Mysore temperature today"), "Mysore");
+      assert.equal(extractWeatherLocation("current weather Mysore Karnataka"), "Mysore Karnataka");
+      assert.equal(extractWeatherLocation("Mysore weather forecast"), "Mysore");
+      assert.equal(extractWeatherLocation("weather in Mysore"), "Mysore");
+      assert.equal(extractWeatherLocation('"Mysore" weather'), "Mysore");
+      assert.equal(extractWeatherLocation("current temperature Mysore"), "Mysore");
+      assert.equal(extractWeatherLocation("weather.com Mysore"), "Mysore");
+      assert.equal(extractWeatherLocation('"Mysore" temperature'), "Mysore");
+      assert.equal(extractWeatherLocation("Mysore weather 2024"), "Mysore");
+      assert.equal(extractWeatherLocation("Mysore weather BBC"), "Mysore");
+      assert.equal(extractWeatherLocation("tell me the weather of mysore"), "mysore");
+
+      // Negative cases: bare weather word or coding/technical queries
+      assert.equal(extractWeatherLocation("weather"), undefined);
+      assert.equal(extractWeatherLocation("llm sampling temperature parameter"), undefined);
+      assert.equal(extractWeatherLocation("react weather app tutorial"), undefined);
+      assert.equal(extractWeatherLocation("python cpu temperature monitor"), undefined);
+    });
+
+    it("runCloudTurn breaks unproductive web_search loops by disabling tools and forcing a text conclusion", async () => {
+      let step = 0;
+      const requests: LLMChatRequest[] = [];
+      const mockWebSearch: Tool = {
+        spec: {
+          name: "web_search",
+          summary: "search",
+          params: [{ name: "query", type: "string", required: true, description: "" }],
+          sideEffecting: false,
+          priority: 11,
+        },
+        execute: async () => ({
+          ok: true,
+          output: "No results found.\n\n[Photon stopped repeated web searches for this turn. Do NOT call web_search again.]",
+        }),
+      };
+
+      const mockProvider: LLMProvider = {
+        id: "mock-cloud",
+        label: "Mock Cloud",
+        enabled: true,
+        isConfigured: () => true,
+        ping: async () => true,
+        listModels: async () => [],
+        async *chatStream(req: LLMChatRequest): AsyncGenerator<LLMChatChunk> {
+          requests.push(req);
+          step++;
+          if (req.tools && req.tools.length > 0) {
+            yield {
+              message: {
+                role: "assistant",
+                content: "",
+                tool_calls: [
+                  {
+                    id: `ws_${step}`,
+                    function: { name: "web_search", arguments: { query: `Mysore weather variant ${step}` } },
+                  },
+                ],
+              },
+              done: true,
+              done_reason: "tool_calls",
+            };
+          } else {
+            yield {
+              message: {
+                role: "assistant",
+                content: "Live web search results were unavailable right now.",
+              },
+              done: true,
+              done_reason: "stop",
+            };
+          }
+        },
+      };
+
+      const contents: string[] = [];
+      const emitter: CloudEmitter = {
+        onAssistantStart: () => {},
+        onDelta: (_id, d) => contents.push(d),
+        onContent: (_id, c) => contents.push(c),
+        onAssistantCancel: () => {},
+        onToolCall: () => {},
+        onToolUpdate: () => {},
+        onPhase: () => {},
+        onUsage: () => {},
+        onGenerationStats: () => {},
+        onDone: () => {},
+        onError: () => {},
+      };
+
+      await runCloudTurn({
+        provider: mockProvider,
+        model: "gpt-4o",
+        system: "You are an assistant.",
+        history: [{ role: "user", content: "tell me the weather of mysore" }],
+        tools: [mockWebSearch],
+        contextWindow: 128_000,
+        ctx: { capability: "max", todos: [], signal: new AbortController().signal, log: () => {} } as any,
+        emitter,
+        signal: new AbortController().signal,
+        mode: "chat",
+      });
+
+      assert.equal(step, 3, "Must stop capped web_search loop after 2 capped steps and conclude on step 3 with tools disabled");
+      assert.equal(requests[2].tools, undefined, "Tools must be disabled on the conclusion step");
+      assert.ok(contents.join("").includes("Live web search results were unavailable"));
     });
   });
 });

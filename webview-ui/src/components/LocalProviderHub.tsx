@@ -1,7 +1,6 @@
 import { useState } from "react";
 import type { AppState, Actions } from "../state/store";
 import {
-  CpuIcon,
   RefreshIcon,
   AlertTriangleIcon,
   ChevronDownIcon,
@@ -9,6 +8,7 @@ import {
   StopSquareIcon,
   BoltIcon,
 } from "./Icons";
+import { ProviderLogo } from "./ProviderLogos";
 
 export function LocalProviderHub({
   state,
@@ -53,8 +53,8 @@ export function LocalProviderHub({
     <div className={`local-provider-hub ${isRunning ? "running" : "needs-attention"}`}>
       <div className="hub-header">
         <div className="hub-header-left">
-          <span className="hub-icon">
-            <CpuIcon />
+          <span className="hub-icon" title={runtimeLabel}>
+            <ProviderLogo providerId={activeId} label={runtimeLabel} baseUrl={runtimeBaseUrl} size={18} />
           </span>
           <div className="hub-titles">
             <div className="hub-main-title">
@@ -68,7 +68,8 @@ export function LocalProviderHub({
                     className={`btn btn-xs ${activeId === "ollama" ? "primary" : "ghost"}`}
                     onClick={() => setSelectedRuntime("ollama")}
                   >
-                    Ollama
+                    <ProviderLogo providerId="ollama" label="Ollama" size={12} />
+                    <span>Ollama</span>
                   </button>
                   <button
                     type="button"
@@ -77,7 +78,8 @@ export function LocalProviderHub({
                     className={`btn btn-xs ${activeId === "llamacpp" ? "primary" : "ghost"}`}
                     onClick={() => setSelectedRuntime("llamacpp")}
                   >
-                    llama.cpp
+                    <ProviderLogo providerId="llamacpp" label="llama.cpp" size={12} />
+                    <span>llama.cpp</span>
                   </button>
                 </div>
               )}

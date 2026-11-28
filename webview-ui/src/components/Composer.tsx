@@ -202,23 +202,50 @@ function ModelDropdown({
     return Array.from(map.values());
   }, [state.config.interfaceMode, state.models, state.config.providers]);
 
+  const localGroups = useMemo(() => {
+    if (state.config.interfaceMode !== "local") return [];
+    const map = new Map<string, { id: string; label: string; models: typeof localModels }>();
+    for (const m of localModels) {
+      const pid = m.provider || "ollama";
+      const label =
+        pid === "llamacpp"
+          ? "llama.cpp"
+          : pid === "lmstudio"
+            ? "LM Studio"
+            : pid === "vllm"
+              ? "vLLM"
+              : "Ollama";
+      if (!map.has(pid)) {
+        map.set(pid, { id: pid, label, models: [] });
+      }
+      map.get(pid)!.models.push(m);
+    }
+    return Array.from(map.values());
+  }, [state.config.interfaceMode, localModels]);
+
   const activeCount = state.config.interfaceMode === "local" ? localModels.length : cloudGroups.length;
   const isDisabled =
     activeCount === 0 &&
     (!state.recommendations || state.recommendations.models.length === 0);
 
   const currentProviderId = useMemo(() => {
-    if (state.config.interfaceMode !== "cloud" || !state.selectedModel || state.config.autoSelectModel) {
+    if (!state.selectedModel || state.config.autoSelectModel) {
       return undefined;
+    }
+    if (state.config.interfaceMode === "local") {
+      const match = localModels.find((m) => m.name === state.selectedModel);
+      return match?.provider || "ollama";
     }
     if (state.selectedModel.includes(":")) {
       return state.selectedModel.split(":")[0];
     }
     return undefined;
-  }, [state.config.interfaceMode, state.selectedModel, state.config.autoSelectModel]);
+  }, [state.config.interfaceMode, state.selectedModel, state.config.autoSelectModel, localModels]);
 
   const currentProviderLabel = useMemo(() => {
     if (!currentProviderId) return undefined;
+    if (currentProviderId === "ollama") return "Ollama";
+    if (currentProviderId === "llamacpp") return "llama.cpp";
     const p = state.config.providers.find((prov) => prov.id === currentProviderId);
     return p?.label || currentProviderId;
   }, [currentProviderId, state.config.providers]);
@@ -290,72 +317,78 @@ function ModelDropdown({
 
           {state.config.interfaceMode === "local" ? (
             <>
-              {localModels.length > 0 && (
-                <div className="model-dropdown-section-header">Installed Local Models</div>
-              )}
-              {localModels.map((m) => {
-                const isSelected = !state.config.autoSelectModel && state.selectedModel === m.name;
-                const tps = benchTps(state.benchResults, m.name);
-                const isBestFit = state.recommendations?.bestInstalledName === m.name;
-                return (
-                  <button
-                    key={m.name}
-                    type="button"
-                    role="option"
-                    aria-selected={isSelected}
-                    className={`model-dropdown-item${isSelected ? " active" : ""}`}
-                    onClick={() => {
-                      actions.setModel(m.name);
-                      setOpen(false);
-                    }}
-                    title={m.name}
-                  >
-                    <span className="model-dropdown-item-title">
-                      {m.name}
-                      {isBestFit ? " ★" : ""}
-                    </span>
-                    {(m.tier || tps || isBestFit) && (
-                      <span className="model-dropdown-item-meta">
-                        {isBestFit ? " Best Fit" : ""}
-                        {isBestFit && (m.tier || tps) ? " · " : ""}
-                        {m.tier ? `${m.tier}` : ""}
-                        {m.tier && tps ? " · " : ""}
-                        {tps ? `${tps} tok/s` : ""}
-                      </span>
-                    )}
-                  </button>
-                );
-              })}
-
-              {(() => {
-                const installedNames = localModels.map((m) => m.name);
-                const uninstalled = (state.recommendations?.models || []).filter(
-                  (rec) => !rec.installed && !matchInstalledModelName(rec.name, installedNames)
-                );
-                if (uninstalled.length === 0) return null;
-                return (
-                  <>
-                    <div className="model-dropdown-section-header">Recommended to Install</div>
-                    {uninstalled.map((rec) => (
+              {localGroups.map((group) => (
+                <div key={group.id} className="model-dropdown-group">
+                  <div className="model-dropdown-provider-header">
+                    <ProviderLogo providerId={group.id} label={group.label} size={13} />
+                    <span className="model-dropdown-provider-name">{group.label}</span>
+                  </div>
+                  {group.models.map((m) => {
+                    const isSelected = !state.config.autoSelectModel && state.selectedModel === m.name;
+                    const tps = benchTps(state.benchResults, m.name);
+                    const isBestFit = state.recommendations?.bestInstalledName === m.name;
+                    return (
                       <button
-                        key={`PULL:${rec.name}`}
+                        key={m.name}
                         type="button"
-                        className="model-dropdown-item pull"
+                        role="option"
+                        aria-selected={isSelected}
+                        className={`model-dropdown-item${isSelected ? " active" : ""}`}
                         onClick={() => {
-                          onPullModel(rec.name);
+                          actions.setModel(m.name);
                           setOpen(false);
                         }}
-                        title={`${rec.name} — ${rec.fit.label}`}
+                        title={m.name}
                       >
-                        <span className="model-dropdown-item-title">+ {rec.name}</span>
-                        <span className="model-dropdown-item-meta">
-                          {rec.sizeGb} GB · {rec.recommended ? "Recommended" : rec.fit.badge}
+                        <span className="model-dropdown-item-title">
+                          {m.name}
+                          {isBestFit ? " ★" : ""}
                         </span>
+                        {(m.tier || tps || isBestFit) && (
+                          <span className="model-dropdown-item-meta">
+                            {isBestFit ? " Best Fit" : ""}
+                            {isBestFit && (m.tier || tps) ? " · " : ""}
+                            {m.tier ? `${m.tier}` : ""}
+                            {m.tier && tps ? " · " : ""}
+                            {tps ? `${tps} tok/s` : ""}
+                          </span>
+                        )}
                       </button>
-                    ))}
-                  </>
-                );
-              })()}
+                    );
+                  })}
+                </div>
+              ))}
+
+              {localModels.length === 0 &&
+                (() => {
+                  const installedNames = localModels.map((m) => m.name);
+                  const uninstalled = (state.recommendations?.models || []).filter(
+                    (rec) => !rec.installed && !matchInstalledModelName(rec.name, installedNames)
+                  );
+                  if (uninstalled.length === 0) return null;
+                  return (
+                    <>
+                      <div className="model-dropdown-section-header">Recommended to Install</div>
+                      {uninstalled.map((rec) => (
+                        <button
+                          key={`PULL:${rec.name}`}
+                          type="button"
+                          className="model-dropdown-item pull"
+                          onClick={() => {
+                            onPullModel(rec.name);
+                            setOpen(false);
+                          }}
+                          title={`${rec.name} — ${rec.fit.label}`}
+                        >
+                          <span className="model-dropdown-item-title">+ {rec.name}</span>
+                          <span className="model-dropdown-item-meta">
+                            {rec.sizeGb} GB · {rec.recommended ? "Recommended" : rec.fit.badge}
+                          </span>
+                        </button>
+                      ))}
+                    </>
+                  );
+                })()}
             </>
           ) : (
             <>
@@ -1001,7 +1034,17 @@ export function Composer({
             <ModelDropdown
               state={state}
               actions={actions}
-              onPullModel={(model) => setConfirmInstallModel(model)}
+              onPullModel={(modelName) => {
+                const alreadyInstalled = matchInstalledModelName(
+                  modelName,
+                  state.models.filter(isLocalModel).map((m) => m.name)
+                );
+                if (alreadyInstalled) {
+                  actions.setModel(alreadyInstalled);
+                } else {
+                  setConfirmInstallModel(modelName);
+                }
+              }}
             />
           </div>
 

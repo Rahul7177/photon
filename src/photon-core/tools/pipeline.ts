@@ -66,6 +66,9 @@ function validateToolArgs(tool: Tool, args: Record<string, unknown>): { valid: b
     if (val !== undefined && val !== null) {
       switch (p.type) {
         case "string":
+          if (tool.spec.name === "todo_write" && p.name === "items" && Array.isArray(val)) {
+            break;
+          }
           if (typeof val !== "string") {
             return { valid: false, error: `Parameter "${p.name}" must be a string, got ${typeof val}.` };
           }

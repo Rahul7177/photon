@@ -17,11 +17,20 @@ export function computeContextMetrics(
   const pct = window > 0 ? Math.min(100, (used / window) * 100) : 0;
   const warn = pct > 80;
   const breakdown = usage?.breakdown ?? [];
+  const promptSections = usage?.promptReport?.sections ?? [];
+  const promptSectionText = promptSections.length
+    ? `\nPrompt sections (${fmtTokens(usage!.promptReport!.totalTokens)}): ` +
+      promptSections
+        .filter((s) => s.tokens > 0 || s.status !== "kept")
+        .map((s) => `${s.label} ${fmtTokens(s.tokens)}${s.status !== "kept" ? ` (${s.status})` : ""}`)
+        .join(" · ")
+    : "";
   const tooltip = breakdown.length
     ? breakdown.map((b) => `${b.label}: ${fmtTokens(b.tokens)}`).join("\n") +
+      promptSectionText +
       `\n─────────────` +
       `\nContext: ${fmtTokens(used)} / ${fmtTokens(window)} (${pct.toFixed(0)}%)`
-    : `Context window: ${fmtTokens(used)} / ${fmtTokens(window)} tokens (${pct.toFixed(0)}%)`;
+    : `Context window: ${fmtTokens(used)} / ${fmtTokens(window)} tokens (${pct.toFixed(0)}%)` + promptSectionText;
 
   return { used, window, pct, warn, tooltip };
 }
@@ -118,6 +127,19 @@ export function ContextMeter({
       <div className="meter-bar" title={tooltip}>
         <div className={`meter-fill ${warn ? "warn" : ""}`} style={{ width: `${pct}%` }} />
       </div>
+      {usage?.promptReport && usage.promptReport.sections.length > 0 && (
+        <div className="prompt-breakdown-strip" title={tooltip}>
+          <span>
+            Prompt {fmtTokens(usage.promptReport.totalTokens)}
+            {usage.promptReport.budgetTokens ? `/${fmtTokens(usage.promptReport.budgetTokens)}` : ""}:{" "}
+            {usage.promptReport.sections
+              .filter((s) => s.tokens > 0 || s.status !== "kept")
+              .slice(0, 5)
+              .map((s) => `${s.id} ${fmtTokens(s.tokens)}${s.status !== "kept" ? ` (${s.status})` : ""}`)
+              .join(" · ")}
+          </span>
+        </div>
+      )}
     </div>
   );
 }

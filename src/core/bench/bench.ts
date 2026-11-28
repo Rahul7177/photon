@@ -1,12 +1,15 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import type { BenchResult, BenchTaskOutcome, ModelCapabilityProfile, ToolSpec } from "../../shared/types";
+import type { AdaptivePlan, BenchResult, BenchTaskOutcome, ModelCapabilityProfile, ToolSpec } from "../../shared/types";
 import type { LLMProvider, LLMChatChunk, LLMMessage } from "../llm/types";
-import { parsePhotonBlocks } from "../protocol/parse";
+import { parsePhotonBlocks, validateAgainstSpec } from "../protocol/parse";
+import { renderToolInstructions, toNativeTools } from "../protocol/serialize";
+import { buildSystemPrompt } from "../prompts/system";
 import { estimateTokens } from "../adaptive/tokens";
 
-export const BENCH_VERSION = 4;
+export const BENCH_VERSION = 5;
+export const BENCH_TOOLCALL_SAMPLES = 5;
 const BENCH_OPTS = { temperature: 0, top_p: 1, num_ctx: 4096, num_predict: 260, seed: 7 };
 
 const PROBE_READ_TOOL: ToolSpec = {
@@ -47,13 +50,13 @@ const PROBE_SEARCH_TOOLS: ToolSpec[] = [
   },
 ];
 
-const TOOLCALL_ATTEMPTS = 3;
-
 export interface BenchOptions {
   hardwareClass: string;
   quantization?: string;
   signal?: AbortSignal;
   onProgress?: (message: string) => void;
+  /** Samples per protocol probe (Bench v5 defaults to 5). */
+  samplesPerSkill?: number;
 }
 
 export interface CodingOutcomeMetrics {
@@ -510,14 +513,40 @@ export async function runBench(client: LLMProvider, model: string, opts: BenchOp
     detail: `capability_probe:throughput: ${Math.round(speed.tokensPerSec)} tok/s, first token ${Math.round(speed.firstTokenMs)} ms`,
   });
 
-  opts.onProgress?.("Measuring tool-call reliability…");
-  let toolPasses = 0;
-  for (let i = 0; i < TOOLCALL_ATTEMPTS; i++) {
+  const samples = Math.max(1, opts.samplesPerSkill ?? BENCH_TOOLCALL_SAMPLES);
+  const baseBenchPlan = (toolProtocol: "photon-block" | "native"): AdaptivePlan => ({
+    model,
+    mode: "agent",
+    contextWindow: 4096,
+    numCtx: 4096,
+    temperature: 0,
+    topP: 1,
+    maxOutputTokens: 260,
+    toolProtocol,
+    maxTools: 10,
+    allowParallelTools: false,
+    intelligence: "high",
+    intelligenceAuto: false,
+    rationale: [],
+  });
+
+  // Bench v5: evaluate block-protocol tool calling under the REAL Photon system prompt + tool instructions.
+  const blockPlan = baseBenchPlan("photon-block");
+  const blockSystem = buildSystemPrompt({
+    mode: "agent",
+    plan: blockPlan,
+    toolInstructions: renderToolInstructions([PROBE_READ_TOOL], blockPlan),
+    workspaceName: "BenchWorkspace",
+    toolSpecs: [PROBE_READ_TOOL],
+  });
+  opts.onProgress?.(`Measuring Photon block tool-call reliability (${samples} samples)…`);
+  let blockPasses = 0;
+  for (let i = 0; i < samples; i++) {
     const out = await generate(
       client,
       model,
       [
-        { role: "system", content: "Emit exactly one Photon tool block and nothing else. Use read_file with path src/index.ts." },
+        { role: "system", content: blockSystem },
         { role: "user", content: "Read src/index.ts using the tool." },
       ],
       opts.signal
@@ -527,12 +556,63 @@ export async function runBench(client: LLMProvider, model: string, opts: BenchOp
         (c) => c.name === "read_file" && !c.errors.length && c.args.path === "src/index.ts"
       )
     ) {
-      toolPasses++;
+      blockPasses++;
     }
   }
-  const toolReliability = toolPasses / TOOLCALL_ATTEMPTS;
-  tasks.push({ id: "toolcall", passed: toolReliability >= 0.67, detail: `capability_probe:toolcall: ${toolPasses}/${TOOLCALL_ATTEMPTS} well-formed calls` });
-  tasks.push({ id: "schema", passed: toolReliability >= 0.67, detail: `capability_probe:schema: adherence ${Math.round(toolReliability * 100)}%` });
+  const blockReliability = Math.round((blockPasses / samples) * 1000) / 1000;
+
+  // Bench v5: separate provider-native function-calling probe under the REAL native system prompt.
+  const nativePlan = baseBenchPlan("native");
+  const nativeSystem = buildSystemPrompt({
+    mode: "agent",
+    plan: nativePlan,
+    toolInstructions: "",
+    workspaceName: "BenchWorkspace",
+    toolSpecs: [PROBE_READ_TOOL],
+  });
+  const nativeTools = toNativeTools([PROBE_READ_TOOL]);
+  opts.onProgress?.(`Measuring native tool-call reliability (${samples} samples)…`);
+  let nativePasses = 0;
+  for (let i = 0; i < samples; i++) {
+    try {
+      const out = await generate(
+        client,
+        model,
+        [
+          { role: "system", content: nativeSystem },
+          { role: "user", content: "Call the native read_file function with path src/index.ts." },
+        ],
+        opts.signal,
+        nativeTools
+      );
+      const validNative = out.toolCalls.some((tc) => {
+        if (tc.name !== "read_file") return false;
+        const checked = validateAgainstSpec("read_file", tc.args, [PROBE_READ_TOOL]);
+        return checked.errors.length === 0 && checked.args.path === "src/index.ts";
+      });
+      if (validNative) nativePasses++;
+    } catch {
+      // Provider/model rejected native tools schema; count as 0 for this sample.
+    }
+  }
+  const nativeReliability = Math.round((nativePasses / samples) * 1000) / 1000;
+  const toolReliability = Math.max(blockReliability, nativeReliability);
+
+  tasks.push({
+    id: "toolcall",
+    passed: blockReliability >= 0.67,
+    detail: `capability_probe:toolcall(block): ${blockPasses}/${samples} well-formed calls under real prompt`,
+  });
+  tasks.push({
+    id: "native_toolcall",
+    passed: nativeReliability >= 0.8,
+    detail: `capability_probe:toolcall(native): ${nativePasses}/${samples} valid native function calls`,
+  });
+  tasks.push({
+    id: "schema",
+    passed: toolReliability >= 0.67,
+    detail: `capability_probe:schema: adherence ${Math.round(toolReliability * 100)}% (block=${Math.round(blockReliability * 100)}%, native=${Math.round(nativeReliability * 100)}%)`,
+  });
 
   opts.onProgress?.("Checking file & tool selection and recovery…");
   const select = await generate(
@@ -691,6 +771,9 @@ export async function runBench(client: LLMProvider, model: string, opts: BenchOp
     tokensPerSec: Math.round(speed.tokensPerSec * 10) / 10,
     firstTokenMs: Math.round(speed.firstTokenMs),
     toolCallReliability: toolReliability,
+    blockToolCallReliability: blockReliability,
+    nativeToolCallReliability: nativeReliability,
+    sampleCount: samples,
     reasoningPass,
     tasks,
     ranAt: Date.now(),
@@ -700,6 +783,7 @@ export async function runBench(client: LLMProvider, model: string, opts: BenchOp
 
 interface GenResult {
   text: string;
+  toolCalls: { name: string; args: Record<string, unknown> }[];
   tokensPerSec: number;
   firstTokenMs: number;
 }
@@ -708,16 +792,28 @@ async function generate(
   client: LLMProvider,
   model: string,
   messages: LLMMessage[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  tools?: unknown[]
 ): Promise<GenResult> {
   const start = Date.now();
   let firstAt = 0;
   let text = "";
+  const toolCalls: { name: string; args: Record<string, unknown> }[] = [];
   let last: LLMChatChunk | undefined;
-  for await (const chunk of client.chatStream({ model, messages, options: BENCH_OPTS }, signal)) {
+  for await (const chunk of client.chatStream(
+    { model, messages, options: BENCH_OPTS, ...(tools ? { tools } : {}) },
+    signal
+  )) {
     if (chunk.message?.content) {
       if (!firstAt) firstAt = Date.now();
       text += chunk.message.content;
+    }
+    for (const tc of chunk.message?.tool_calls ?? []) {
+      if (!firstAt) firstAt = Date.now();
+      toolCalls.push({
+        name: tc.function.name,
+        args: (tc.function.arguments ?? {}) as Record<string, unknown>,
+      });
     }
     last = chunk;
   }
@@ -729,5 +825,5 @@ async function generate(
     const genMs = Math.max(1, end - (firstAt || start));
     tokensPerSec = (estimateTokens(text) / genMs) * 1000;
   }
-  return { text, tokensPerSec, firstTokenMs: (firstAt || end) - start };
+  return { text, toolCalls, tokensPerSec, firstTokenMs: (firstAt || end) - start };
 }

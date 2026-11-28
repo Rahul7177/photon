@@ -19,6 +19,12 @@ photon_engineering_improvement_checklist.md
 PHOTON_ENGINEERING_CLOSURE_PLAN.md
 PHOTON_PROJECT_OVERVIEW.md
 FEATURES_TREE.md
+PHOTON_CODEBASE_AUDIT.md
+PHOTON_FEATURE_INVENTORY.md
+DOCUMENTATION.md
+testing_report.md
+jokes.md
+scripts/**
 .github/**
 *.log
 *.tmp

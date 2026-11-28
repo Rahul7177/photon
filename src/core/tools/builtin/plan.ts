@@ -41,28 +41,38 @@ export const todoWriteTool: Tool = {
     }
     // action === "set"
     let raw = args.items as unknown;
-    // Also support legacy: items as string checklist
+    // Also support legacy: items as string checklist or JSON array string
     if (typeof raw === "string") {
-      const items = parseTodoLines(raw);
-      if (items.length === 0) {
-        // Try JSON parse
+      const trimmedRaw = raw.trim();
+      if (trimmedRaw.startsWith("[")) {
         try {
-          const parsed = JSON.parse(raw);
+          const parsed = JSON.parse(trimmedRaw);
           if (Array.isArray(parsed)) {
-            const mapped = parsed.map((it: any, idx: number) => ({
-              id: Number(it.id) || idx + 1,
-              task: String(it.task || it.text || ""),
-              status: normalizeStatus(String(it.status || "pending")),
-              reason: it.reason ? String(it.reason) : undefined,
-            })).filter((i: TodoItem) => i.task.trim());
+            const mapped = parsed
+              .map((it: any, idx: number) => ({
+                id: Number(it.id) || idx + 1,
+                task: String(it.task || it.text || ""),
+                status: normalizeStatus(String(it.status || "pending")),
+                reason: it.reason ? String(it.reason) : undefined,
+              }))
+              .filter((i: TodoItem) => i.task.trim());
             if (mapped.length) {
               ctx.todos.length = 0;
               ctx.todos.push(...mapped);
-              return ok(renderTodos(ctx.todos) + `\n(${mapped.filter(i=>i.status==="done").length}/${mapped.length} done). Keep this list updated as you complete steps.`);
+              return ok(
+                renderTodos(ctx.todos) +
+                  `\n(${mapped.filter((i) => i.status === "done").length}/${mapped.length} done). Keep this list updated as you complete steps.`
+              );
             }
           }
         } catch {}
-        return toolError("invalid_args", `No checklist items found. Provide a JSON array like [{"id":1,"task":"...","status":"pending"}] or checklist lines with [ ]/[>]/[x].`);
+      }
+      const items = parseTodoLines(raw);
+      if (items.length === 0) {
+        return toolError(
+          "invalid_args",
+          `No checklist items found. Provide a JSON array like [{"id":1,"task":"...","status":"pending"}] or checklist lines with [ ]/[>]/[x].`
+        );
       }
       // Map legacy TodoItem (text) to spec TodoItem (task)
       const mapped: TodoItem[] = items.map((it, idx) => ({

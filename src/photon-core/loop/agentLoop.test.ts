@@ -237,11 +237,106 @@ test("harness 12: isFreshInfoRequest identifies real-time and search queries", a
 
 test("harness 13: webSearchTool returns results via duckduckgo and google fallback", async () => {
   const { webSearchTool } = await import("../../core/tools/builtin/web.js");
-  const res = await webSearchTool.execute({ query: "nodejs express tutorial" }, {
-    signal: new AbortController().signal,
-    webSearchProvider: "google",
-    capability: "medium",
-  } as any);
-  assert.equal(res.ok, true);
-  assert.ok(res.output.includes("Express") || res.output.includes("Node"));
+  const origFetch = globalThis.fetch;
+  const seenUrls: string[] = [];
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    seenUrls.push(url);
+    if (url.includes("google.com")) {
+      // Empty Google HTML forces DuckDuckGo fallback path
+      return new Response("<html><body></body></html>", { status: 200, headers: { "content-type": "text/html" } });
+    }
+    if (url.includes("html.duckduckgo.com")) {
+      const ddgHtml = `<html><body>
+        <a class="result__a" href="https://expressjs.com/en/starter/hello-world.html">Express Node.js Tutorial</a>
+        <a class="result__snippet">Build fast Node.js web apps with Express.</a>
+      </body></html>`;
+      return new Response(ddgHtml, { status: 200, headers: { "content-type": "text/html" } });
+    }
+    return new Response("", { status: 404 });
+  }) as typeof fetch;
+  try {
+    const res = await webSearchTool.execute({ query: "nodejs express tutorial" }, {
+      signal: new AbortController().signal,
+      webSearchProvider: "google",
+      capability: "medium",
+    } as any);
+    assert.equal(res.ok, true);
+    assert.ok(seenUrls.some((u) => u.includes("google.com")));
+    assert.ok(seenUrls.some((u) => u.includes("duckduckgo.com")));
+    assert.ok(res.output.includes("Express") || res.output.includes("Node"));
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test("harness 14: webSearchTool falls back to DuckDuckGo Lite and Wikipedia extracts when primary DDG returns 202", async () => {
+  const { webSearchTool, extractCurrencyQuery } = await import("../../core/tools/builtin/web.js");
+  assert.deepEqual(extractCurrencyQuery("USD to INR conversion rate today"), {
+    amount: 1,
+    from: "USD",
+    to: "INR",
+  });
+  assert.deepEqual(extractCurrencyQuery("current USD to INR exchange rate"), {
+    amount: 1,
+    from: "USD",
+    to: "INR",
+  });
+  assert.deepEqual(extractCurrencyQuery("whats the USD conversion rate to INR today?"), {
+    amount: 1,
+    from: "USD",
+    to: "INR",
+  });
+  assert.equal(extractCurrencyQuery("current president of India"), undefined);
+
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (url.includes("html.duckduckgo.com")) {
+      return new Response("<html><body>202 anomaly challenge</body></html>", {
+        status: 202,
+        headers: { "content-type": "text/html" },
+      });
+    }
+    if (url.includes("lite.duckduckgo.com")) {
+      const liteHtml = `<html><body>
+        <table>
+          <tr><td><a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fen.wikipedia.org%2Fwiki%2FDroupadi_Murmu&amp;rut=123" class='result-link'>Droupadi Murmu - Wikipedia</a></td></tr>
+          <tr><td class='result-snippet'>Droupadi Murmu is an Indian politician who has served as the 15th president of India since 2022.</td></tr>
+        </table>
+      </body></html>`;
+      return new Response(liteHtml, { status: 200, headers: { "content-type": "text/html" } });
+    }
+    if (url.includes("open.er-api.com")) {
+      return new Response(
+        JSON.stringify({
+          result: "success",
+          time_last_update_utc: "Fri, 27 Nov 2026 00:00:01 +0000",
+          rates: { INR: 84.5 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+    return new Response("", { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    const presRes = await webSearchTool.execute({ query: "current president of India" }, {
+      signal: new AbortController().signal,
+      webSearchProvider: "duckduckgo",
+      capability: "medium",
+    } as any);
+    assert.equal(presRes.ok, true);
+    assert.ok(presRes.output.includes("Droupadi Murmu"));
+
+    const fxRes = await webSearchTool.execute({ query: "USD to INR conversion rate today" }, {
+      signal: new AbortController().signal,
+      webSearchProvider: "duckduckgo",
+      capability: "medium",
+    } as any);
+    assert.equal(fxRes.ok, true);
+    assert.ok(fxRes.output.includes("1 USD = 84.5 INR"));
+  } finally {
+    globalThis.fetch = origFetch;
+  }
 });

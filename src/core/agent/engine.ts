@@ -12,11 +12,13 @@ export interface TurnEmitter {
   onContent(messageId: string, content: string): void;
   onAssistantCancel(messageId: string): void;
   onPhase(phase: "thinking" | "working", detail?: string): void;
+  onCompacting?(active: boolean): void;
   onToolCall(messageId: string, call: ToolCall): void;
   onToolUpdate(messageId: string, call: ToolCall): void;
   onQueuedTools?(calls: ToolCall[]): void;
   onUsage(usage: import("../../shared/types").TokenUsage): void;
   onGenerationStats(stats: import("../../shared/types").GenerationStats | null): void;
+  onTurnTelemetry?(summary: import("../../shared/types").TurnReliabilitySummary): void;
   onDone(messageId: string, notice?: string): void;
   onError(message: string): void;
 }

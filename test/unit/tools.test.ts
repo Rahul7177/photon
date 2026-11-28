@@ -667,27 +667,72 @@ describe("Built-in Workspace Tools", () => {
       }
     });
 
-    it("verifies todoWriteTool updates todos contract cleanly", async () => {
+    it("verifies todoWriteTool updates todos contract cleanly via both direct array and JSON string in ToolPipeline", async () => {
       const testCtx: ToolContext = {
         ...ctx,
         todos: [{ id: 1, task: "Initial task", status: "pending" }],
       };
 
-      const res = await todoWriteTool.execute(
+      const pipeline = new ToolPipeline();
+      pipeline.register(todoWriteTool);
+      pipeline.register(listDirTool);
+
+      // 1. Array items through ToolPipeline
+      const resArr = await pipeline.execute(
         {
-          action: "set",
-          items: [
-            { id: 1, task: "Initial task", status: "done" },
-            { id: 2, task: "Second task", status: "in_progress" },
-          ],
+          id: "call-todo-arr",
+          name: "todo_write",
+          args: {
+            action: "set",
+            items: [
+              { id: 1, task: "Initial task", status: "done" },
+              { id: 2, task: "Second task", status: "in_progress" },
+            ],
+          },
+          status: "proposed",
         },
         testCtx
       );
 
-      assert.equal(res.ok, true);
+      assert.equal(resArr.ok, true);
       assert.equal(testCtx.todos.length, 2);
       assert.equal(testCtx.todos[0].status, "done");
       assert.equal(testCtx.todos[1].task, "Second task");
+
+      // 2. JSON string items through ToolPipeline (must parse JSON, not treat as raw pending line)
+      const resJsonStr = await pipeline.execute(
+        {
+          id: "call-todo-json",
+          name: "todo_write",
+          args: {
+            action: "set",
+            items: JSON.stringify([
+              { id: 1, task: "JSON task one", status: "done" },
+              { id: 2, task: "JSON task two", status: "done" },
+            ]),
+          },
+          status: "proposed",
+        },
+        testCtx
+      );
+      assert.equal(resJsonStr.ok, true);
+      assert.equal(testCtx.todos.length, 2);
+      assert.equal(testCtx.todos[0].task, "JSON task one");
+      assert.equal(testCtx.todos[0].status, "done");
+      assert.ok(resJsonStr.output.includes("(2/2 done)"));
+
+      // 3. Recursive list_dir must not emit double slashes (e.g. "src/nested/", not "src//nested/")
+      const resList = await pipeline.execute(
+        {
+          id: "call-listdir-rec",
+          name: "list_dir",
+          args: { path: ".", depth: 2 },
+          status: "proposed",
+        },
+        testCtx
+      );
+      assert.equal(resList.ok, true);
+      assert.ok(!resList.output.includes("//"), `Unexpected double slash in list_dir output: ${resList.output}`);
     });
 
     it("verifies thinkTool records thoughts cleanly", async () => {

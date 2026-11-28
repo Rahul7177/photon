@@ -1,4 +1,4 @@
-import type { TokenUsage } from "../../shared/types";
+import type { PromptTokenReport, TokenUsage } from "../../shared/types";
 import type { LLMMessage } from "../llm/types";
 import { estimateTokensForModel, TOKENS_PER_IMAGE } from "../adaptive/tokens";
 import { sanitizeToolPairing } from "./errorRecovery";
@@ -18,6 +18,8 @@ export interface FitOptions {
   runtimeCapacity?: number;
   /** Max characters for intermediate tool outputs before structured clamping. Defaults to 2400. */
   maxIntermediateToolChars?: number;
+  /** Optional per-section breakdown of the system prompt for observability. */
+  promptReport?: PromptTokenReport;
 }
 
 export interface FitResult {
@@ -247,6 +249,7 @@ export function fitToWindow(
           ? [{ label: "Provider framing", tokens: providerFramingTokens }]
           : []),
       ],
+      ...(options.promptReport ? { promptReport: options.promptReport } : {}),
     };
     return { messages: [systemMsg], droppedCount: 0, usage };
   }
@@ -355,6 +358,7 @@ export function fitToWindow(
     used: totalUsed,
     window: effectiveWindow,
     breakdown,
+    ...(options.promptReport ? { promptReport: options.promptReport } : {}),
   };
 
   return {
