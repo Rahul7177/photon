@@ -5,6 +5,7 @@
   "version": "0.1.0",
   "publisher": "photon",
   "license": "MIT",
+  "icon": "media/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/Rahul7177/photon"
@@ -88,6 +89,15 @@
         }
       ]
     },
+    "chatParticipants": [
+      {
+        "id": "photon",
+        "name": "photon",
+        "fullName": "Photon",
+        "description": "Agentic coding with local LLMs and BYOK cloud models",
+        "isSticky": true
+      }
+    ],
     "configuration": {
       "title": "Photon",
       "properties": {
@@ -254,11 +264,6 @@
           "default": false,
           "description": "Enable Blackbox AI cloud models. Set your API key in the Photon settings panel (stored securely in VS Code secrets)."
         },
-        "photon.experimental.harness": {
-          "type": "boolean",
-          "default": false,
-          "description": "Experimental: run turns through the harness AgentLoop + SessionRegistry (event-sourced) instead of the legacy AgentEngine. Keeps the same tools, plan, and webview. Restart required."
-        },
         "photon.providers.custom": {
           "type": "array",
           "default": [],
@@ -314,7 +319,7 @@
     }
   },
   "scripts": {
-    "test": "tsx --test src/**/*.test.ts test/**/*.test.ts",
+    "test": "tsx --test \"src/**/*.test.ts\" \"test/**/*.test.ts\"",
     "eval:baseline": "tsx test/eval/runner.ts",
     "eval:ablation": "tsx test/eval/ablation.ts",
     "eval:gate": "tsx test/eval/releaseGate.ts",

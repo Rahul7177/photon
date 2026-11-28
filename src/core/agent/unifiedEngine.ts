@@ -317,7 +317,19 @@ export async function runUnifiedTurn(session:{messages:ChatMessage[]},plan:Adapt
     });
     promptReport=built.report;
     systemMsg={role:"system",content:built.text};
-    nativeTools=plan.toolProtocol==="native"&&specs.length?toNativeTools(specs):undefined;
+    const compactNative = Boolean(
+      plan.scaffoldProfile &&
+      plan.scaffoldOptimizations !== false &&
+      plan.scaffoldProfile.toolCards !== "full"
+    );
+    nativeTools =
+      plan.toolProtocol === "native" && specs.length
+        ? toNativeTools(specs, compactNative ? {
+            compact: true,
+            shortlistSize: plan.scaffoldProfile?.shortlistSize,
+            failingTools: failedTool ? [failedTool] : undefined,
+          } : undefined)
+        : undefined;
     renderedPhase=phase;
     renderedFailedTool=failedTool;
     if(initial){

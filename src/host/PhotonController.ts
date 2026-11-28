@@ -1152,6 +1152,7 @@ export class PhotonController {
         this.recomputePlan();
         this.pushPlan();
         this.pushConfig();
+        this.updateStatusBar();
         return;
       case "setAutoSelect":
         this.autoSelect = msg.payload.enabled;
@@ -1166,6 +1167,7 @@ export class PhotonController {
         this.recomputePlan();
         this.pushPlan();
         this.pushConfig();
+        this.updateStatusBar();
         return;
       case "runBench":
         if (msg.payload.model) await this.runBenchFor(msg.payload.model);

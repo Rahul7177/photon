@@ -7,7 +7,7 @@ const WORKBENCH_URL = process.env.PHOTON_WORKBENCH_URL || "http://127.0.0.1:4321
 const CDP_PORT = Number(process.env.PHOTON_CDP_PORT || 9345);
 const OUT_DIR =
   process.env.PHOTON_SCREENSHOT_DIR ||
-  "C:\\Users\\rahul\\.gemini\\antigravity\\brain\\04418ff8-d38e-40db-b4b5-063c19129fca";
+  path.join(os.tmpdir(), "photon-live-screenshots");
 
 function findBrowserBinary(): string {
   const candidates = [

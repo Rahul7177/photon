@@ -175,7 +175,7 @@ export function SettingsPanel({
   return (
     <div className="settings">
       <div className="settings-head">
-        <button className="icon-btn" onClick={onClose} title="Back">
+        <button className="icon-btn" onClick={onClose} title="Back" aria-label="Back">
           <BackIcon />
         </button>
         <span className="settings-title">Settings</span>

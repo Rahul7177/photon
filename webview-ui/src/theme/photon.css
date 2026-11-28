@@ -3695,10 +3695,24 @@ select option:focus,
   cursor: pointer;
   font-family: var(--font);
   white-space: nowrap;
+  flex-shrink: 0;
   position: relative;
   transition: color 0.12s;
   border-bottom: 2px solid transparent;
   margin-bottom: -1px;
+}
+
+@media (max-width: 380px) {
+  .settings-tabs {
+    padding: 0 6px;
+    gap: 0;
+  }
+
+  .settings-tab {
+    padding: 8px 6px;
+    gap: 4px;
+    font-size: 11px;
+  }
 }
 
 .settings-tab:hover {
@@ -9120,6 +9134,8 @@ button.revert-file-tag {
   align-items: center;
   gap: 6px;
   min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
   flex: 1;
 }
 
@@ -9133,6 +9149,8 @@ button.revert-file-tag {
   color: var(--text, #EDEDEF);
   font-family: var(--mono);
   font-size: 10.5px;
+  min-width: 0;
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -9914,6 +9932,11 @@ button.revert-file-tag {
     gap: 4px;
   }
 
+  .onboarding-hw-left {
+    width: 100%;
+    flex: 0 0 auto;
+  }
+
   .onboarding-active-pill {
     margin-left: 0;
   }
@@ -10080,7 +10103,7 @@ body[data-theme="light"] {
   --accent-pill-fg: #F7F5F1;
   --scrollbar-thumb: rgba(28, 31, 38, 0.22);
   --scrollbar-thumb-hover: rgba(28, 31, 38, 0.40);
-  --hero-bg: transparent;
+  --hero-bg: #EDEAE4;
   --hero-emblem-fg: #1F232C;
   --hero-title-bg: linear-gradient(180deg, #16181F 0%, #2C303D 65%, rgba(44, 48, 61, 0.80) 100%);
   --hero-vignette-mid: rgba(235, 232, 226, 0.20);
@@ -10089,6 +10112,14 @@ body[data-theme="light"] {
   --inset-bg: rgba(235, 232, 226, 0.60);
   --modal-backdrop: rgba(232, 229, 223, 0.72);
   --shadow-elevated: 0 12px 32px rgba(28, 31, 38, 0.12), 0 0 16px rgba(217, 84, 30, 0.05);
+}
+
+:is(body.vscode-light:not([data-theme="dark"]), body.vscode-high-contrast-light:not([data-theme="dark"]), body[data-theme="light"]) ::selection,
+body.vscode-light:not([data-theme="dark"])::selection,
+body.vscode-high-contrast-light:not([data-theme="dark"])::selection,
+body[data-theme="light"]::selection {
+  background: #262A34 !important;
+  color: #F7F5F1 !important;
 }
 
 /* Component polarity overrides when Soft Light Mode is active */

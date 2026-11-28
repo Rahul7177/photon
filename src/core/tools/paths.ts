@@ -21,7 +21,13 @@ export function resolveInWorkspace(
     return { error: "No path was provided." };
   }
   const cleaned = rel.replace(/^["']|["']$/g, "").trim();
-  const abs = path.resolve(workspaceRoot, cleaned);
+  // Reject UNC / network-share paths (\\server\share or //server/share) on all OSes,
+  // and reject Windows drive-letter roots when running on POSIX hosts.
+  if (/^(?:\\\\|\/\/)/.test(cleaned) || (process.platform !== "win32" && /^[a-zA-Z]:[\\/]/.test(cleaned))) {
+    return { error: `Path "${rel}" is outside the workspace.` };
+  }
+  const normalizedRel = process.platform === "win32" ? cleaned : cleaned.replace(/\\/g, "/");
+  const abs = path.resolve(workspaceRoot, normalizedRel);
 
   // Compare REAL paths (symlinks resolved) so a link out of the workspace is
   // caught, not just lexical `..` traversal. Root is cached.

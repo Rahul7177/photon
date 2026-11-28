@@ -50,8 +50,8 @@ jobs:
       - run: npm ci
       - name: Verify zero uncommitted secrets
         run: |
-          # Ensure no hardcoded secret keys in tracked codebase
-          ! git grep -i -E "(sk-[a-zA-Z0-9]{20,}|AIza[-_0-9A-Za-z]{35}|xox[baprs]-[-0-9a-zA-Z]{10,}|BEGIN PRIVATE KEY)" -- ':!test/unit/cloudModelOptimization.test.ts'
+          # Ensure no hardcoded secret keys in tracked production codebase
+          ! git grep -i -E "(sk-[a-zA-Z0-9]{20,}|AIza[-_0-9A-Za-z]{35}|xox[baprs]-[-0-9a-zA-Z]{10,}|BEGIN PRIVATE KEY)" -- ':(exclude).github/**' ':(exclude)test/**'
       - name: Build & Package VSIX
         run: npm run package
       - name: Inspect VSIX Contents

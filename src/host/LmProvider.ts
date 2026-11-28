@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import type { Attachment } from "../shared/types";
 import { PhotonController } from "./PhotonController";
@@ -7,17 +8,16 @@ import { PhotonController } from "./PhotonController";
  */
 export function registerChatParticipant(
   context: vscode.ExtensionContext,
-  controller: PhotonController
+  controller: PhotonController,
+  output?: vscode.OutputChannel
 ): vscode.Disposable {
-  function randomUUID(): string {
-    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
-      const r = (Math.random() * 16) | 0;
-      const v = c === "x" ? r : (r & 0x3) | 0x8;
-      return v.toString(16);
-    });
+  if (!vscode.chat || typeof vscode.chat.createChatParticipant !== "function") {
+    output?.appendLine("[chatParticipant] vscode.chat API unavailable in this host; skipping @photon participant.");
+    return { dispose: () => {} };
   }
 
-  const participant = vscode.chat.createChatParticipant("photon", async (request, _context, stream, _token) => {
+  try {
+    const participant = vscode.chat.createChatParticipant("photon", async (request, _context, stream, _token) => {
     const text = request.prompt;
     // Files dragged into VS Code's native Chat input arrive as #file
     // references whose value is a Uri (or Location). Read them here with the
@@ -119,12 +119,8 @@ export function registerChatParticipant(
   );
 
   return participant;
-}
-
-function randomUUID(): string {
-  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    const v = c === "x" ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
+  } catch (err) {
+    output?.appendLine(`[chatParticipant] Failed to register @photon participant: ${(err as Error).message}`);
+    return { dispose: () => {} };
+  }
 }

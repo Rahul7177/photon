@@ -141,7 +141,7 @@ describe("Phase 11 & 12: Packaging, Documentation Truth & Final Release Gates", 
       assert.ok(content.includes("esbuild.mjs"), "Must ignore esbuild.mjs");
       assert.ok(content.includes("vite.config.ts"), "Must ignore vite.config.ts");
       assert.ok(content.includes(".github/**"), "Must ignore .github/**");
-      assert.ok(content.includes("PHOTON_ENGINEERING_CLOSURE_PLAN.md"), "Must ignore internal plans");
+      assert.ok(content.includes("PRODUCT_OVERVIEW.md"), "Must ignore internal product overview");
     });
 
     it("verifies .gitignore preserves shareable configs while ignoring runtime caches", () => {

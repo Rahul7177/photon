@@ -253,24 +253,69 @@ function renderExampleCall(t: ToolSpec, terse: boolean): string {
     .join("\n");
 }
 
-export function toNativeTools(tools: ToolSpec[]): unknown[] {
-  return tools.map((t) => ({
-    type: "function",
-    function: {
-      name: t.name,
-      description: t.summary,
-      parameters: {
-        type: "object",
-        properties: Object.fromEntries(
-          t.params.map((p) => [
-            p.name,
-            { type: p.type, description: p.description },
-          ])
-        ),
-        required: t.params.filter((p) => p.required).map((p) => p.name),
+export interface NativeToolsOptions {
+  compact?: boolean;
+  shortlistSize?: number;
+  failingTools?: readonly string[];
+}
+
+export function toNativeTools(tools: ToolSpec[], options?: NativeToolsOptions): unknown[] {
+  if (!options?.compact) {
+    return tools.map((t) => ({
+      type: "function",
+      function: {
+        name: t.name,
+        description: t.summary,
+        parameters: {
+          type: "object",
+          properties: Object.fromEntries(
+            t.params.map((p) => [
+              p.name,
+              { type: p.type, description: p.description },
+            ])
+          ),
+          required: t.params.filter((p) => p.required).map((p) => p.name),
+        },
       },
-    },
-  }));
+    }));
+  }
+
+  const isMcp = (t: ToolSpec) => Boolean(t.tags?.includes("mcp") || t.name.startsWith("mcp_"));
+  const shortlistCap = Math.max(1, options.shortlistSize ?? 5);
+  const failingSet = new Set(options.failingTools ?? []);
+  const primarySet = new Set<string>();
+  for (const t of tools) {
+    if (primarySet.size >= shortlistCap) break;
+    if (isMcp(t)) continue;
+    primarySet.add(t.name);
+  }
+  for (const t of tools) {
+    if (failingSet.has(t.name)) primarySet.add(t.name);
+  }
+
+  return tools.map((t) => {
+    const isPrimary = primarySet.has(t.name);
+    return {
+      type: "function",
+      function: {
+        name: t.name,
+        description: compactSentence(t.summary, isPrimary ? 120 : 60),
+        parameters: {
+          type: "object",
+          properties: Object.fromEntries(
+            t.params.map((p) => {
+              const desc = isPrimary && p.description ? compactSentence(p.description, 75) : undefined;
+              return [
+                p.name,
+                desc ? { type: p.type, description: desc } : { type: p.type },
+              ];
+            })
+          ),
+          required: t.params.filter((p) => p.required).map((p) => p.name),
+        },
+      },
+    };
+  });
 }
 
 /** Spec §3.1: Photon result envelope */

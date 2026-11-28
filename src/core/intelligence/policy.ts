@@ -267,6 +267,13 @@ export function looksLikeNarration(text:string):boolean{
   if(t.endsWith("?")||lines.some(l=>l.endsWith("?")&&!/^(?:let me|i['’]?ll|i will)\b/i.test(l)))return false;
   // Narration is a short burst of prose; anything long is a real answer.
   if(t.length>420||lines.length>6)return false;
+  // Gerund/participle narration ("Calling edit_file...", "Using write_file...", "Updating src/math.ts with edit_file...")
+  if (
+    /^(?:now\s+|next[,:\s]+)?(?:calling|invoking|running|executing|using|applying|updating|editing|modifying|writing|creating|reading|inspecting|checking|searching|fetching)\b/i.test(t) &&
+    /\b(?:read_file|edit_file|write_file|append_file|move_path|list_dir|find_files|search_code|code_outline|run_command|get_diagnostics|web_search|web_fetch|todo_write|replace_in_file|write_to_file|execute_command|old_str|new_str|BEGIN_ARG|TOOL_NAME)\b/i.test(t)
+  ) {
+    return true;
+  }
   if(!/\b(?:i['’](?:ll|m going to)|i will|i am going to|let me|let['’]s|going to|now (?:i|let)|next,? i|then i)\b/i.test(t))return false;
   if(!/\b(?:search|look(?: up| for| into)?|check|read|open|find|list|inspect|review|examine|run|execute|create|write|edit|modify|update|fix|add|remove|delete|move|copy|browse|fetch|start|proceed|try|use|go to|navigate|grab|pull)\b/i.test(t))return false;
   // Future/intent framing rather than a completed statement.

@@ -29,9 +29,6 @@ export function activate(context: vscode.ExtensionContext): void {
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
 
-  const participant = registerChatParticipant(context, provider.controller);
-  context.subscriptions.push(participant);
-
   context.subscriptions.push(
     vscode.commands.registerCommand("photon.openChat", async () => {
       await vscode.commands.executeCommand("photon.chat.focus");
@@ -49,6 +46,9 @@ export function activate(context: vscode.ExtensionContext): void {
       void provider.controller.runDiagnostics();
     })
   );
+
+  const participant = registerChatParticipant(context, provider.controller, output);
+  context.subscriptions.push(participant);
 
   output.appendLine("Photon activated.");
 }

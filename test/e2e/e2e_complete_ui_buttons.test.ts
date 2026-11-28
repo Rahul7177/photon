@@ -787,7 +787,9 @@ describe("Complete UI & Every-Button E2E Suite", () => {
       tree.click(tree.findButton(/llama3\.2:3b/));
       assert.deepEqual(posted.find((m) => m.type === "setModel"), { type: "setModel", payload: { model: "llama3.2:3b" } });
 
-      // Uninstalled recommended model triggers confirm banner -> test Cancel then Install Now
+      // Uninstalled recommended model triggers confirm banner when no local models are installed -> test Cancel then Install Now
+      const cloudOnly = makeModels().filter((m) => m.provider === "claude");
+      sendHost({ type: "models", payload: { models: cloudOnly, selected: "" } }, tree);
       tree.click(tree.findByClass("model-dropdown-trigger", "button"));
       tree.click(tree.findButton(/\+ qwen3:8b/));
       assert.ok(tree.findByClass("model-install-prompt-banner"));
@@ -799,6 +801,7 @@ describe("Complete UI & Every-Button E2E Suite", () => {
       posted.length = 0;
       tree.click(tree.findButton("Install Now"));
       assert.deepEqual(posted.find((m) => m.type === "pullModel"), { type: "pullModel", payload: { model: "qwen3:8b" } });
+      sendHost({ type: "models", payload: { models: makeModels(), selected: "llama3.2:3b" } }, tree);
 
       // Switch to Cloud interface mode and select Cloud model
       posted.length = 0;
@@ -1039,7 +1042,7 @@ describe("Complete UI & Every-Button E2E Suite", () => {
 
       // Project Configuration: Create -> Loaded Edit File -> Error Fix Config File
       posted.length = 0;
-      tree.click(tree.findButton("Create .photon/config.json"));
+      tree.click(tree.findButton("Create Config"));
       assert.ok(posted.some((m) => m.type === "createProjectConfig"));
 
       sendHost({
@@ -1143,10 +1146,10 @@ describe("Complete UI & Every-Button E2E Suite", () => {
         payload: { model: "llamacpp:deepseek-r1.gguf" },
       });
 
-      // Benchmarks expand -> Run Bench + Re-run
-      tree.click(tree.findByText("Benchmarks", "button"));
+      // Speed & Reliability Test expand -> Run Test + Re-run
+      tree.click(tree.findByText("Speed & Reliability Test", "button"));
       posted.length = 0;
-      tree.click(tree.findButton("Run Bench"));
+      tree.click(tree.findButton("Run Test"));
       assert.ok(posted.some((m) => m.type === "runBench"));
       posted.length = 0;
       tree.click(tree.findByTitle("Re-run benchmark", "button"));
@@ -1334,8 +1337,8 @@ describe("Complete UI & Every-Button E2E Suite", () => {
         payload: { provider: "none" },
       });
 
-      // Expand Registered Tools
-      tree.click(tree.findByText(/Registered Tools/, "button"));
+      // Expand Built-in Tools
+      tree.click(tree.findByText(/Built-in Tools/, "button"));
       assert.ok(tree.findByText("write_file"));
 
       // Verify Customizations tab & mentions are completely hidden from Settings
@@ -1387,10 +1390,10 @@ describe("Complete UI & Every-Button E2E Suite", () => {
         payload: { id: "docs-http" },
       });
 
-      // Expand Diagnostics -> Open Output Diagnostics
+      // Expand Diagnostics -> Open Logs
       tree.click(tree.findByText("Diagnostics", "button"));
       posted.length = 0;
-      tree.click(tree.findButton("Open Output Diagnostics"));
+      tree.click(tree.findButton("Open Logs"));
       assert.ok(posted.some((m) => m.type === "openDiagnostics"));
     } finally {
       tree.unmount();
