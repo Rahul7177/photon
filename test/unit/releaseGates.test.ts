@@ -46,12 +46,23 @@ describe("Phase 11 & 12: Packaging, Documentation Truth & Final Release Gates", 
         MY_CUSTOM_VAR: "custom_value",
       };
 
-      const safeEnv = buildSafeMcpEnv(dirtyHostEnv, { APPROVED_MCP_KEY: "permitted" });
+      const safeEnv = buildSafeMcpEnv(dirtyHostEnv, { APPROVED_MCP_KEY: "permitted" }, "win32");
 
-      // Permitted standard system variables
+      // Permitted standard system variables (Windows)
       assert.equal(safeEnv.PATH, "C:\\Windows;C:\\Program Files");
       assert.equal(safeEnv.SYSTEMROOT, "C:\\Windows");
       assert.equal(safeEnv.APPROVED_MCP_KEY, "permitted");
+
+      // Permitted standard system variables (POSIX)
+      const posixEnv = buildSafeMcpEnv(
+        { PATH: "/usr/local/bin:/usr/bin", HOME: "/home/dev", SYSTEMROOT: "C:\\Windows", OPENAI_API_KEY: "sk-secret" },
+        { APPROVED_MCP_KEY: "permitted" },
+        "linux"
+      );
+      assert.equal(posixEnv.PATH, "/usr/local/bin:/usr/bin");
+      assert.equal(posixEnv.HOME, "/home/dev");
+      assert.equal(posixEnv.SYSTEMROOT, undefined);
+      assert.equal(posixEnv.OPENAI_API_KEY, undefined);
 
       // Host secrets MUST NOT leak
       assert.equal(safeEnv.OPENAI_API_KEY, undefined);

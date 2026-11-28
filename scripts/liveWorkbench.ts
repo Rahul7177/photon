@@ -106,7 +106,8 @@ function createLiveVscodeHost(workspaceRoot: string, extensionRoot: string) {
     }
     static parse(str: string) {
       if (str.startsWith("file://")) {
-        return Uri.file(str.replace(/^file:\/+/, ""));
+        const raw = decodeURIComponent(str.replace(/^file:\/\//, ""));
+        return Uri.file(/^\/[a-zA-Z]:/.test(raw) ? raw.slice(1) : raw);
       }
       return new Uri("https", str);
     }
